@@ -1,0 +1,3 @@
+# Text files always use LF, in the repository and in every working copy, whatever
+# the Git settings of the machine (core.autocrlf on Windows). Antigrafa runs on Linux.
+* text=auto eol=lf

@@ -19,28 +19,15 @@ without removing it.
 
 ## How Antigrafa works: capture and transfer are separate
 
-```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 20, "rankSpacing": 25, "padding": 6}}}%%
-flowchart TB
-    subgraph node["Proxmox node"]
-        direction LR
-        vm["VM"] -- "snapshot ≈ 1 s" --> snap[("snapshot")]
-        iowait(["iowait"])
-    end
-
-    subgraph agf["Antigrafa machine"]
-        direction LR
-        hash["chunk + SHA-256"] --> known{"known?"}
-        known -- no --> write["zstd + write"]
-        known -- yes --> skip["skip"]
-    end
-
-    store[("Destination<br/>disk / NFS")]
-
-    snap -- "SSH, low priority" --> hash
-    iowait -. throttles .-> hash
-    write --> store
-    store -. "latency throttles" .-> write
+```
+ Proxmox node                               Antigrafa machine                  Destination
+ ┌───────────────────────┐   SSH (dd, rbd   ┌──────────────────────────┐       ┌──────────────┐
+ │ VM ──writes──▶ disk   │   export, tar)   │ 4 MiB chunks ─▶ SHA-256  │       │ local disk   │
+ │          │            │ ───────────────▶ │ already known? ─▶ skip   │ ────▶ │ or NFS       │
+ │   snapshot (≈1 s) ──▶ read at its own    │ new ─▶ zstd ─▶ write     │       │ .chunks/     │
+ │          pace, at low priority           │ (adaptive concurrency)   │       │ vm/ ct/      │
+ └───────────────────────┘                  └──────────────────────────┘       └──────────────┘
+        ▲ node iowait (API) ─── throttles reads             ▲ write latency ─── throttles writes
 ```
 
 1. **Capture**: snapshot through the Proxmox API, consistent across all disks.
