@@ -170,7 +170,8 @@ class ZfsDatasetSource(VolumeSource):
         return None
 
     def stream_command(self) -> str:
-        assert self.snapdir, "prepare() must be called first"
+        if not self.snapdir:
+            raise RuntimeError("prepare() must be called first")
         return (
             "tar --numeric-owner --xattrs --acls --one-file-system --sparse "
             f"-cf - -C {shlex.quote(self.snapdir)} ."

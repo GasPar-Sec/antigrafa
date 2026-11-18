@@ -106,9 +106,13 @@ antigrafa restore --target nas vm/100/2026-11-17T22-30-00Z scsi0 /tmp/scsi0.raw
 ## Development
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -e '.[test]'
-.venv/bin/pytest
+python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
+.venv/bin/pytest                        # tests + coverage (coverage.xml)
+.venv/bin/bandit -c pyproject.toml -r src   # security analysis
 ```
+
+A full SonarQube analysis (tests, bandit, quality and security) runs in a throwaway
+Docker instance: see [tools/sonarqube/README.md](tools/sonarqube/README.md).
 
 ## Roadmap
 

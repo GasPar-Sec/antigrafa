@@ -129,3 +129,10 @@ def test_low_priority_prefix(monkeypatch):
     src = RbdSource(SSH(), {"type": "rbd"}, Disk("scsi0", "ceph:vm-1-disk-0"), "s")
     src.open_stream()
     assert streamed[0].startswith("ionice -c 2 -n 7 nice -n 10 rbd export")
+
+
+def test_dataset_stream_requires_prepare():
+    disk = Disk(key="rootfs", volid="local-zfs:subvol-200-disk-0", options={})
+    src = ZfsDatasetSource(FakeSSH(), {"type": "zfspool", "pool": "rpool/data"}, disk, "antigrafa_1")
+    with pytest.raises(RuntimeError, match="prepare"):
+        src.stream_command()

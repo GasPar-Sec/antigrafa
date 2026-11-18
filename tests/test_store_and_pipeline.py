@@ -92,8 +92,29 @@ def test_backup_and_restore_roundtrip(store, tmp_path):
     with open(out, "wb") as f:
         restore_stream(store, digests, f, len(image))
     assert out.read_bytes() == image
-    # Zero regions are restored as holes (sparse file).
-    assert os.stat(out).st_blocks * 512 < len(image)
+    # Zero regions are skipped, not written: only the non-zero chunks reach the file
+    # (checked on every platform).
+    written = io.BytesIO()
+    restore_stream(store, digests, written, len(image))
+    recorder = _WriteRecorder()
+    restore_stream(store, digests, recorder, len(image))
+    assert recorder.written == len(image) - 6 * CHUNK
+    assert written.getvalue() == image
+    # Zero regions are restored as holes (sparse file), where the OS reports blocks.
+    if hasattr(os.stat_result, "st_blocks"):
+        assert os.stat(out).st_blocks * 512 < len(image)
+
+
+class _WriteRecorder(io.BytesIO):
+    """Seekable output that counts the bytes actually written."""
+
+    def __init__(self):
+        super().__init__()
+        self.written = 0
+
+    def write(self, data):
+        self.written += len(data)
+        return super().write(data)
 
 
 def test_backup_propagates_writer_errors(store):
@@ -106,3 +127,99 @@ def test_backup_propagates_writer_errors(store):
     with ThreadPoolExecutor(2) as pool, pytest.raises(OSError, match="disk full"):
         backup_stream(io.BytesIO(os.urandom(CHUNK * 4)), broken, ctl, pool, chunk_size=CHUNK)
     assert ctl.limiter.active == 0
+
+
+@pytest.mark.parametrize(
+    ("blob", "message"),
+    [
+        (b"short", "truncated chunk"),
+        (b"NOTCHUNK\x00data", "invalid chunk header"),
+        (b"AGCHUNK1\x07data", "unknown encoding: 7"),
+    ],
+)
+def test_decode_rejects_damaged_chunks(blob, message):
+    with pytest.raises(ChunkCorrupted, match=message):
+        decode_chunk(blob)
+
+
+def test_write_blob_existing_chunk_writes_nothing(store):
+    digest = store.insert(b"once")
+    assert store.write_blob(digest, encode_chunk(b"once", 3)) == 0
+
+
+def test_write_blob_with_fsync(tmp_path):
+    synced = ChunkStore(tmp_path, sync_each=True)
+    synced.init()
+    digest = synced.insert(b"durable")
+    assert synced.read(digest) == b"durable"
+
+
+def test_concurrent_writer_of_same_chunk_wins_the_race(store, monkeypatch):
+    """Windows refuses os.replace onto a chunk another writer just stored."""
+    from antigrafa import chunkstore
+
+    data = b"shared by two guests"
+    blob = encode_chunk(data, 3)
+    digest = chunkstore.digest_of(data)
+    path = store.path_for(digest)
+
+    def other_writer_first(src, dst):
+        with open(dst, "wb") as f:
+            f.write(blob)
+        raise PermissionError(13, "Access is denied", str(dst))
+
+    monkeypatch.setattr(chunkstore.os, "replace", other_writer_first)
+    assert store.write_blob(digest, blob) == 0
+    monkeypatch.undo()
+    assert store.read(digest) == data
+    assert [p.name for p in path.parent.iterdir()] == [path.name]  # temp file removed
+
+
+def test_permission_error_without_chunk_is_raised(store, monkeypatch):
+    from antigrafa import chunkstore
+
+    def denied(src, dst):
+        raise PermissionError(13, "Access is denied", str(dst))
+
+    monkeypatch.setattr(chunkstore.os, "replace", denied)
+    digest = chunkstore.digest_of(b"x")
+    with pytest.raises(PermissionError):
+        store.write_blob(digest, encode_chunk(b"x", 3))
+    monkeypatch.undo()
+    assert list(store.path_for(digest).parent.iterdir()) == []  # temp file removed
+
+
+def test_other_write_errors_remove_temp_file(store, monkeypatch):
+    from antigrafa import chunkstore
+
+    def disk_full(src, dst):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(chunkstore.os, "replace", disk_full)
+    digest = chunkstore.digest_of(b"y")
+    with pytest.raises(OSError, match="No space"):
+        store.write_blob(digest, encode_chunk(b"y", 3))
+    monkeypatch.undo()
+    assert list(store.path_for(digest).parent.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (b"tiny", "truncated index"),
+        (b"NOTINDEX" + bytes(12), "not an Antigrafa index"),
+        (b"AGFIDX01" + bytes(12) + b"odd", "invalid length"),
+    ],
+)
+def test_read_index_rejects_damaged_files(tmp_path, raw, message):
+    from antigrafa.index import IndexCorrupted
+
+    path = tmp_path / "bad.fidx"
+    path.write_bytes(raw)
+    with pytest.raises(IndexCorrupted, match=message):
+        read_index(path)
+
+
+def test_write_index_rejects_bad_digests(tmp_path):
+    with pytest.raises(ValueError, match="invalid digest size"):
+        write_index(tmp_path / "x.fidx", 10, CHUNK, [b"short"])

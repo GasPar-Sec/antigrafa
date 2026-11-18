@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import errno
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -64,10 +65,29 @@ def mount_fstype(path: str, mounts_file: str = "/proc/mounts") -> str | None:
     return best_type
 
 
+def _libc() -> ctypes.CDLL | None:
+    """The C library, or None where there is none to load (Windows)."""
+    if os.name != "posix":
+        return None
+    try:
+        # find_library() may return None (no ldconfig): CDLL(None) is then the
+        # running process, which links the C library anyway.
+        return ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    except OSError:
+        return None
+
+
+def filesystem_sync_supported() -> bool:
+    """True when the whole filesystem can be flushed at once (syncfs or sync)."""
+    return hasattr(os, "sync")
+
+
 def syncfs(path: Path) -> None:
     """Flush the filesystem containing ``path`` to stable storage (local or NFS)."""
-    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-    if not hasattr(libc, "syncfs"):
+    libc = _libc()
+    if libc is None or not hasattr(libc, "syncfs"):
+        if not filesystem_sync_supported():
+            raise OSError(errno.ENOSYS, "no filesystem-wide sync on this platform", str(path))
         os.sync()
         return
     fd = os.open(path, os.O_RDONLY)
@@ -83,7 +103,11 @@ class Repository:
     def __init__(self, cfg: TargetConfig) -> None:
         self.cfg = cfg
         self.root = Path(cfg.path)
-        self.store = ChunkStore(self.root, sync_each=cfg.sync == "file")
+        # Without a filesystem-wide flush (Windows), "filesystem" falls back to an
+        # fsync per chunk: slower, but chunks are still on disk before the manifest.
+        self._flush_at_end = cfg.sync != "none" and filesystem_sync_supported()
+        sync_each = cfg.sync == "file" or (cfg.sync == "filesystem" and not self._flush_at_end)
+        self.store = ChunkStore(self.root, sync_each=sync_each)
 
     def open(self) -> None:
         """Check that the destination is usable before writing anything."""
@@ -99,7 +123,7 @@ class Repository:
         self.store.init()
 
     def sync(self) -> None:
-        if self.cfg.sync != "none":
+        if self._flush_at_end:
             syncfs(self.root)
 
     def create_snapshot_dir(self, guest_type: str, vmid: int, when: datetime) -> Path:

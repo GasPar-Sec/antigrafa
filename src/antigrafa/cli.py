@@ -20,7 +20,7 @@ def _api(cfg: Config) -> ProxmoxAPI:
     if cfg.proxmox is None:
         raise ConfigError("a [proxmox] section is required for this command")
     p = cfg.proxmox
-    return ProxmoxAPI(p.url, p.token_id, p.secret(), verify_tls=p.verify_tls, ca_file=p.ca_file)
+    return ProxmoxAPI(p.url, p.token_id, p.secret(), ca_file=p.ca_file)
 
 
 def _repo(cfg: Config, name: str | None) -> Repository:

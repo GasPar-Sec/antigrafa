@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import subprocess
+# subprocess runs the system ssh client (argument lists, never a shell)
+import subprocess  # nosec B404
 import tempfile
 from dataclasses import dataclass, field
 from typing import BinaryIO
@@ -70,14 +71,16 @@ class SSHHost:
         return argv + [f"{self.user}@{self.host}", command]
 
     def run(self, command: str, timeout: float = 120.0) -> str:
-        res = subprocess.run(self._argv(command), capture_output=True, timeout=timeout)
+        # Argument list without a shell: the remote command is a single ssh argument
+        res = subprocess.run(self._argv(command), capture_output=True, timeout=timeout)  # nosec B603
         if res.returncode != 0:
             raise RemoteCommandError(self.host, command, res.returncode, res.stderr.decode(errors="replace"))
         return res.stdout.decode()
 
     def stream(self, command: str) -> RemoteStream:
         stderr_file = tempfile.TemporaryFile()
-        proc = subprocess.Popen(
-            self._argv(command), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=stderr_file, bufsize=0
-        )
+        argv = self._argv(command)
+        pipes = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": stderr_file}
+        # Argument list without a shell, as in run()
+        proc = subprocess.Popen(argv, bufsize=0, **pipes)  # nosec B603
         return RemoteStream(self.host, command, proc, stderr_file)

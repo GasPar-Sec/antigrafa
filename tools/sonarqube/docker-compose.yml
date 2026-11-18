@@ -1,0 +1,44 @@
+# SonarQube Community Build, created fresh for each analysis and then removed.
+# Do not start it by hand: use scan.py (see README.md).
+#
+# No PostgreSQL database and no volumes: nothing is kept between analyses, so
+# SonarQube uses its embedded database (H2), which is enough for a throwaway instance.
+
+services:
+  sonarqube:
+    # "community" tag: always the latest version (scan.py pulls it each time)
+    image: sonarqube:community
+    environment:
+      # Local, throwaway instance: disable Elasticsearch system checks
+      # (vm.max_map_count...) so it starts as is on Docker Desktop and on Linux.
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    ports:
+      # 127.0.0.1: reachable from your machine only.
+      # Host port picked at random by Docker: never a conflict (scan.py looks it up).
+      - "127.0.0.1::9000"
+    healthcheck:
+      # Healthy when the status API answers "status":"UP" (the image has curl, not wget)
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/api/system/status | grep -q '\"status\":\"UP\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  scanner:
+    # "latest" tag: always the latest scanner version
+    image: sonarsource/sonar-scanner-cli:latest
+    # Not started by "up": only by "run --rm scanner"
+    profiles: ["scan"]
+    depends_on:
+      sonarqube:
+        condition: service_healthy
+    environment:
+      SONAR_HOST_URL: http://sonarqube:9000
+      # Token created by scan.py for this instance, destroyed with it
+      SONAR_TOKEN: ${SONAR_TOKEN:-}
+    volumes:
+      # The whole repository, read-only: the scanner reads the code and the git history
+      # (it writes its working files to /tmp, inside the container)
+      - ../..:/usr/src:ro
+    # Directory the analysis runs from: the one holding sonar-project.properties
+    working_dir: /usr/src

@@ -81,6 +81,13 @@ class ChunkStore:
                     f.flush()
                     os.fsync(f.fileno())
             os.replace(tmp, path)  # atomic: a chunk is either complete or absent
+        except PermissionError:
+            tmp.unlink(missing_ok=True)
+            # Windows refuses to replace a file that another writer has just put in
+            # place (two guests sharing a chunk): same content, so it is already stored.
+            if path.exists():
+                return 0
+            raise
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise

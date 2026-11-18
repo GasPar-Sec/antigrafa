@@ -20,7 +20,6 @@ class ProxmoxConfig:
     token_id: str
     token_secret: str = ""
     token_secret_file: str | None = None
-    verify_tls: bool = True
     ca_file: str | None = None
 
     def secret(self) -> str:
@@ -98,6 +97,18 @@ def _build(cls, data: dict, section: str, **extra):
         raise ConfigError(f"[{section}]: {exc}") from None
 
 
+def _proxmox(data: dict) -> ProxmoxConfig:
+    if "verify_tls" in data:
+        # Removed: an unverified connection would hand the API token to anyone on
+        # the path. The cluster's own CA makes verification work out of the box.
+        raise ConfigError(
+            "[proxmox]: verify_tls is no longer supported, the certificate is always "
+            "verified: set ca_file = \"/etc/antigrafa/pve-root-ca.pem\" (copy of "
+            "/etc/pve/pve-root-ca.pem from a node)"
+        )
+    return _build(ProxmoxConfig, data, "proxmox")
+
+
 def load_config(path: str | Path) -> Config:
     try:
         raw = tomllib.loads(Path(path).read_text())
@@ -117,7 +128,7 @@ def load_config(path: str | Path) -> Config:
         raise ConfigError("at least one [target.<name>] section is required")
 
     return Config(
-        proxmox=_build(ProxmoxConfig, raw["proxmox"], "proxmox") if "proxmox" in raw else None,
+        proxmox=_proxmox(raw["proxmox"]) if "proxmox" in raw else None,
         ssh=_build(SSHConfig, raw.get("ssh", {}), "ssh"),
         nodes={n: _build(NodeConfig, d, f"nodes.{n}") for n, d in raw.get("nodes", {}).items()},
         targets=targets,

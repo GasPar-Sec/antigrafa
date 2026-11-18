@@ -4,8 +4,9 @@
 url = "https://pve1.example.lan:8006"
 token_id = "antigrafa@pve!backup"
 token_secret_file = "/etc/antigrafa/token"   # or token_secret = "..."
-verify_tls = true
-# ca_file = "/etc/antigrafa/pve-root-ca.pem"
+# The certificate is always verified. Proxmox uses its own CA: copy
+# /etc/pve/pve-root-ca.pem from a node and point ca_file at it.
+ca_file = "/etc/antigrafa/pve-root-ca.pem"
 
 [ssh]
 user = "root"

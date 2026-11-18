@@ -35,17 +35,19 @@ class ProxmoxAPI:
         url: str,
         token_id: str,
         token_secret: str,
-        verify_tls: bool = True,
         ca_file: str | None = None,
         timeout: float = 30.0,
     ) -> None:
+        # HTTPS only: the API token travels in every request. This also rules out
+        # file:// and other schemes urllib would otherwise accept.
+        if urllib.parse.urlsplit(url).scheme != "https":
+            raise ProxmoxError(f"the Proxmox URL must start with https:// (got {url!r})")
         self.base = url.rstrip("/") + "/api2/json"
         self._auth = f"PVEAPIToken={token_id}={token_secret}"
         self.timeout = timeout
-        if not verify_tls:
-            self._ctx = ssl._create_unverified_context()
-        else:
-            self._ctx = ssl.create_default_context(cafile=ca_file)
+        # The certificate is always verified. For the self-signed certificate of a
+        # Proxmox cluster, point ca_file at its CA (/etc/pve/pve-root-ca.pem).
+        self._ctx = ssl.create_default_context(cafile=ca_file)
 
     def _request(self, method: str, path: str, params: dict | None = None):
         url = self.base + path
@@ -61,7 +63,8 @@ class ProxmoxAPI:
         if body is not None:
             req.add_header("Content-Type", "application/x-www-form-urlencoded")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ctx) as resp:
+            # Scheme checked in __init__: always https:// (see above)
+            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ctx) as resp:  # nosec B310
                 return json.load(resp).get("data")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace").strip()
