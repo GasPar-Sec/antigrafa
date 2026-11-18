@@ -19,15 +19,32 @@ without removing it.
 
 ## How Antigrafa works: capture and transfer are separate
 
-```
- Proxmox node                               Antigrafa machine                  Destination
- ┌───────────────────────┐   SSH (dd, rbd   ┌──────────────────────────┐       ┌──────────────┐
- │ VM ──writes──▶ disk   │   export, tar)   │ 4 MiB chunks ─▶ SHA-256  │       │ local disk   │
- │          │            │ ───────────────▶ │ already known? ─▶ skip   │ ────▶ │ or NFS       │
- │   snapshot (≈1 s) ──▶ read at its own    │ new ─▶ zstd ─▶ write     │       │ .chunks/     │
- │          pace, at low priority           │ (adaptive concurrency)   │       │ vm/ ct/      │
- └───────────────────────┘                  └──────────────────────────┘       └──────────────┘
-        ▲ node iowait (API) ─── throttles reads             ▲ write latency ─── throttles writes
+```mermaid
+flowchart LR
+    subgraph node["Proxmox node"]
+        vm["VM"] -- writes --> disk[("disk")]
+        disk -- "snapshot (≈ 1 s)" --> snap[("snapshot")]
+        snap --> read["read at its own pace,<br/>low priority (ionice / nice)"]
+        iowait(["node iowait<br/>(Proxmox API)"])
+    end
+
+    subgraph agf["Antigrafa machine"]
+        chunk["4 MiB chunks"] --> hash["SHA-256"]
+        hash --> known{"already<br/>known?"}
+        known -- yes --> skip["skip"]
+        known -- no --> zstd["zstd"]
+        zstd --> write["write<br/>(adaptive concurrency)"]
+    end
+
+    subgraph dest["Destination"]
+        store[("local disk or NFS<br/>.chunks/ · vm/ · ct/")]
+    end
+
+    read -- "SSH (dd, rbd export, tar)" --> chunk
+    write --> store
+
+    iowait -. "throttles reads" .-> read
+    store -. "write latency<br/>throttles writes" .-> write
 ```
 
 1. **Capture**: snapshot through the Proxmox API, consistent across all disks.
