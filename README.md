@@ -1,5 +1,10 @@
 # Antigrafa
 
+> [!WARNING]
+> **Work in progress — not ready for production.** Antigrafa is under active development
+> and has not yet been tested against a real Proxmox cluster. Do not rely on it as your
+> only backup. See [ROADMAP.md](ROADMAP.md) for known limitations.
+
 Backups of Proxmox VE virtual machines and containers, run from a separate machine,
 that **never slow down the guests**, with a throughput that adapts to the destination
 and to the load on the nodes.
@@ -107,10 +112,4 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[test]'
 
 ## Roadmap
 
-- [ ] Native incrementals (`zfs send -i`, `rbd export-diff`) to read only changed blocks
-- [ ] Retention (prune) and garbage collection of orphaned chunks
-- [ ] Content-defined chunking (CDC) for container tar archives
-- [ ] qcow2 (through `qemu-nbd` on the snapshot)
-- [ ] Automatic abort when the snapshot grows too large on the source storage
-- [ ] Scheduling, notifications, client-side encryption
-- [ ] Direct restore to Proxmox
+See [ROADMAP.md](ROADMAP.md).
