@@ -20,33 +20,27 @@ without removing it.
 ## How Antigrafa works: capture and transfer are separate
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 20, "rankSpacing": 25, "padding": 6}}}%%
 flowchart TB
     subgraph node["Proxmox node"]
         direction LR
-        vm["VM"] -- writes --> disk[("disk")]
-        disk -- "snapshot ≈ 1 s" --> snap[("snapshot")]
-        snap --> read["low-priority read"]
-        iowait(["iowait"]) -. throttles .-> read
+        vm["VM"] -- "snapshot ≈ 1 s" --> snap[("snapshot")]
+        iowait(["iowait"])
     end
 
     subgraph agf["Antigrafa machine"]
         direction LR
-        chunk["4 MiB chunks"] --> hash["SHA-256"]
-        hash --> known{"known?"}
+        hash["chunk + SHA-256"] --> known{"known?"}
+        known -- no --> write["zstd + write"]
         known -- yes --> skip["skip"]
-        known -- no --> zstd["zstd"]
-        zstd --> write["parallel writes"]
     end
 
-    subgraph dest["Destination"]
-        direction LR
-        store[("local disk / NFS")]
-        latency(["write latency"])
-    end
+    store[("Destination<br/>disk / NFS")]
 
-    read -- "SSH: dd, rbd export, tar" --> chunk
+    snap -- "SSH, low priority" --> hash
+    iowait -. throttles .-> hash
     write --> store
-    latency -. throttles .-> write
+    store -. "latency throttles" .-> write
 ```
 
 1. **Capture**: snapshot through the Proxmox API, consistent across all disks.
