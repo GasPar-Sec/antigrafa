@@ -2,8 +2,8 @@
 
 > [!WARNING]
 > **Work in progress — not ready for production.** Antigrafa is under active development
-> and has not yet been tested against a real cluster. Do not rely on it as your only
-> backup. See [ROADMAP.md](ROADMAP.md) for known limitations.
+> and has not yet been tested against a real Proxmox cluster. Do not rely on it as your
+> only backup. See [ROADMAP.md](ROADMAP.md) for known limitations.
 
 Backups of virtual machines and containers, run from a separate machine, that
 **never slow down the guests**, with a throughput that adapts to the destination and

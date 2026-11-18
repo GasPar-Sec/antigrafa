@@ -8,7 +8,7 @@
       batch (a `hard` NFS mount can otherwise hang forever)
 - [ ] Stop the whole batch on the first destination error (`ENOSPC`, `EIO`, `ESTALE`)
       instead of snapshotting the remaining guests
-- [ ] Bounded retries for transient errors (SSH, platform API)
+- [ ] Bounded retries for transient errors (SSH, Proxmox API)
 - [ ] Keep the original error when snapshot deletion also fails
 - [ ] Clean error messages in `restore`/`verify`; remove the partial output file of a
       failed `restore`
@@ -38,29 +38,17 @@ of different sizes never deduplicate against each other.
 - [ ] Let garbage collection remove the old chunks once no index references them
       (depends on retention / GC)
 
-## Platforms
-
-Each platform implements the `Platform` interface (`src/antigrafa/platforms/base.py`).
-
-- [x] Proxmox VE (VMs and containers; ZFS, Ceph RBD, LVM-thin)
-- [ ] VMware vSphere (vCenter / ESXi snapshots, disks read through VDDK or NBD,
-      changed block tracking for incrementals)
-- [ ] Microsoft Hyper-V (production checkpoints, VHDX read from the checkpoint,
-      Resilient Change Tracking for incrementals)
-- [ ] Restore to another platform than the source (manifest records the platform)
-
 ## Features
 
-- [ ] Native incrementals (`zfs send -i`, `rbd export-diff` on Proxmox VE) to read only
-      changed blocks
+- [ ] Native incrementals (`zfs send -i`, `rbd export-diff`) to read only changed blocks
 - [ ] Retention (prune) and garbage collection of orphaned chunks
 - [ ] Content-defined chunking (CDC) for container tar archives
-- [ ] qcow2 on Proxmox VE (through `qemu-nbd` on the snapshot)
+- [ ] qcow2 (through `qemu-nbd` on the snapshot)
 - [ ] Automatic abort when the snapshot grows too large on the source storage
 - [ ] Scheduling, notifications, client-side encryption
-- [ ] Direct restore to the source platform
+- [ ] Direct restore to Proxmox
 
 ## Validation
 
-- [ ] Test against a real Proxmox VE cluster (ZFS, Ceph RBD, LVM-thin)
-- [ ] Confirm the minimum Proxmox VE API token permissions
+- [ ] Test against a real Proxmox cluster (ZFS, Ceph RBD, LVM-thin)
+- [ ] Confirm the minimum API token permissions
