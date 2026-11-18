@@ -107,10 +107,4 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[test]'
 
 ## Roadmap
 
-- [ ] Native incrementals (`zfs send -i`, `rbd export-diff`) to read only changed blocks
-- [ ] Retention (prune) and garbage collection of orphaned chunks
-- [ ] Content-defined chunking (CDC) for container tar archives
-- [ ] qcow2 (through `qemu-nbd` on the snapshot)
-- [ ] Automatic abort when the snapshot grows too large on the source storage
-- [ ] Scheduling, notifications, client-side encryption
-- [ ] Direct restore to Proxmox
+See [ROADMAP.md](ROADMAP.md).
