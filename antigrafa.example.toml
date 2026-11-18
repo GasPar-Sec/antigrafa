@@ -1,0 +1,51 @@
+# Antigrafa configuration: copy to /etc/antigrafa/antigrafa.toml
+
+[proxmox]
+url = "https://pve1.example.lan:8006"
+token_id = "antigrafa@pve!backup"
+token_secret_file = "/etc/antigrafa/token"   # or token_secret = "..."
+verify_tls = true
+# ca_file = "/etc/antigrafa/pve-root-ca.pem"
+
+[ssh]
+user = "root"
+identity_file = "/etc/antigrafa/id_ed25519"
+# Fast cipher, useful above ~500 MiB/s:
+# options = ["Ciphers=aes128-gcm@openssh.com"]
+
+# SSH address of each node (otherwise the node name is used as-is).
+[nodes.pve1]
+host = "10.0.0.11"
+
+[nodes.pve2]
+host = "10.0.0.12"
+
+[target.local]
+kind = "local"
+path = "/srv/antigrafa"
+
+[target.nas]
+kind = "nfs"              # refuses to write if the share is not mounted
+path = "/mnt/nas/antigrafa"
+sync = "filesystem"       # "file" (fsync per chunk) | "filesystem" | "none"
+
+[tuning]
+chunk_size_mib = 4
+max_parallel_guests = 4       # guests backed up at the same time (all nodes)
+max_parallel_per_node = 1     # on a single node
+
+# Destination: target write latency per chunk; above it, concurrency goes down.
+writer_min_concurrency = 1
+writer_max_concurrency = 8
+writer_start_concurrency = 2
+writer_target_latency_ms = 250
+compression_level = 3
+compression_min_level = 1
+compression_max_level = 9
+
+# Source: snapshot reads slow down when the node's iowait rises.
+source_max_mib_s = 0          # 0 = no fixed cap
+source_min_mib_s = 10
+node_iowait_high = 0.10
+node_iowait_low = 0.03
+low_priority = true           # ionice/nice on the node while reading
