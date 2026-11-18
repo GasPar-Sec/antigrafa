@@ -1,4 +1,4 @@
-"""Running commands on Proxmox nodes through the system ``ssh`` client."""
+"""Running commands on remote hosts through the system ``ssh`` client."""
 
 from __future__ import annotations
 

@@ -1,6 +1,6 @@
 import pytest
 
-from antigrafa.capture import (
+from antigrafa.platforms.proxmox.capture import (
     Disk,
     LvmThinSource,
     RbdSource,

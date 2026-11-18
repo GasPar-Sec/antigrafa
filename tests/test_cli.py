@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 from datetime import datetime, timezone
 
 import pytest
@@ -8,16 +9,18 @@ from antigrafa import cli, jobs
 from antigrafa.chunkstore import encode_chunk
 from antigrafa.index import write_index, write_manifest
 from antigrafa.pipeline import StreamStats
-from antigrafa.proxmox import Guest, ProxmoxError
+from antigrafa.platforms import proxmox as pve_platform
+from antigrafa.platforms.base import Guest
+from antigrafa.platforms.proxmox import ProxmoxError
 from antigrafa.targets import Repository, TargetConfig
 
 CHUNK = 64 * 1024
 WHEN = datetime(2026, 11, 17, 22, 30, tzinfo=timezone.utc)
-SNAP = "vm/100/2026-11-17T22-30-00Z"
+SNAP = "cluster1/vm/100/2026-11-17T22-30-00Z"
 GUESTS = [
-    Guest(100, "pve1", "qemu", "web", "running"),
-    Guest(101, "pve2", "qemu", "db", "running"),
-    Guest(200, "pve1", "lxc", "dns", "stopped"),
+    Guest("100", "vm", "web", "pve1", "running"),
+    Guest("101", "vm", "db", "pve2", "running"),
+    Guest("200", "ct", "dns", "pve1", "stopped"),
 ]
 
 
@@ -42,12 +45,13 @@ def config(tmp_path, repo_dir):
     path = tmp_path / "antigrafa.toml"
     path.write_text(
         f"""
-[proxmox]
+[source.cluster1]
+type = "proxmox"
 url = "https://pve1:8006"
 token_id = "antigrafa@pve!backup"
 token_secret = "s3cret"
 
-[nodes.pve1]
+[source.cluster1.nodes.pve1]
 host = "10.0.0.11"
 
 [target.local]
@@ -64,12 +68,12 @@ def backup(repo_dir):
     repo = Repository(TargetConfig(name="local", path=str(repo_dir)))
     repo.open()
     digests = [repo.store.insert(data[i : i + CHUNK]) for i in range(0, len(data), CHUNK)]
-    snap = repo.create_snapshot_dir("qemu", 100, WHEN)
+    snap = repo.create_snapshot_dir("cluster1", "vm", "100", WHEN)
     write_index(snap / "scsi0.img.fidx", len(data), CHUNK, digests)
     write_manifest(
         snap,
         {
-            "name": "web",
+            "guest": {"id": "100", "kind": "vm", "name": "web", "host": "pve1"},
             "disks": [{"key": "scsi0", "format": "raw", "size": len(data), "index": "scsi0.img.fidx"}],
         },
     )
@@ -79,8 +83,8 @@ def backup(repo_dir):
 class FakeAPI:
     instances = []
 
-    def __init__(self, url, token_id, token_secret, ca_file=None):
-        self.args = (url, token_id, token_secret, ca_file)
+    def __init__(self, url, token_id, token_secret, ca_file=None, verify_tls=True):
+        self.args = (url, token_id, token_secret, ca_file, verify_tls)
         FakeAPI.instances.append(self)
 
     def guests(self):
@@ -90,7 +94,7 @@ class FakeAPI:
 @pytest.fixture
 def fake_api(monkeypatch):
     FakeAPI.instances = []
-    monkeypatch.setattr(cli, "ProxmoxAPI", FakeAPI)
+    monkeypatch.setattr(pve_platform, "ProxmoxAPI", FakeAPI)
     return FakeAPI
 
 
@@ -103,14 +107,14 @@ class FakeController:
 
 
 class FakeRunner:
-    """Replaces BackupRunner: records the guests and the SSH hosts it would use."""
+    """Replaces BackupRunner: records the platform and the guests it would back up."""
 
     last = None
     fail = set()
     raw_bytes = 3 * 1024 * 1024
 
-    def __init__(self, tuning, api, repo, ssh_for_node):
-        self.ssh_for_node = ssh_for_node
+    def __init__(self, tuning, platform, repo):
+        self.platform = platform
         self.controller = FakeController(FakeRunner.raw_bytes)
         self.closed = False
         FakeRunner.last = self
@@ -120,9 +124,9 @@ class FakeRunner:
         return [
             jobs.GuestResult(
                 guest=g,
-                ok=g.vmid not in FakeRunner.fail,
-                error="dd: read error" if g.vmid in FakeRunner.fail else "",
-                snapshot=f"vm/{g.vmid}/x",
+                ok=g.id not in FakeRunner.fail,
+                error="dd: read error" if g.id in FakeRunner.fail else "",
+                snapshot=f"cluster1/vm/{g.id}/x",
                 duration=12.0,
             )
             for g in guests
@@ -167,18 +171,33 @@ def test_unavailable_target(tmp_path, caplog):
     assert "does not exist" in caplog.text
 
 
-def test_command_needing_proxmox_without_section(tmp_path, repo_dir, caplog):
+def test_command_needing_a_source_without_section(tmp_path, repo_dir, caplog):
     path = tmp_path / "antigrafa.toml"
     path.write_text(f'[target.local]\npath = "{repo_dir.as_posix()}"\n')
     assert cli.main(["-c", str(path), "guests"]) == 2
-    assert "[proxmox] section is required" in caplog.text
+    assert "[source.<name>] section is required" in caplog.text
+
+
+def test_several_sources_need_source_flag(tmp_path, repo_dir, fake_api, caplog, capsys):
+    path = tmp_path / "antigrafa.toml"
+    two = "".join(
+        f'[source.{name}]\ntype = "proxmox"\nurl = "https://{name}:8006"\ntoken_id = "a@pve!b"\ntoken_secret = "s"\n'
+        for name in ("east", "west")
+    )
+    path.write_text(two + f'[target.local]\npath = "{repo_dir.as_posix()}"\n')
+    assert cli.main(["-c", str(path), "guests"]) == 2
+    assert "several sources configured, use --source (east, west)" in caplog.text
+    assert cli.main(["-c", str(path), "guests", "--source", "west"]) == 0
+    assert fake_api.instances[-1].args[0] == "https://west:8006"
+    assert cli.main(["-c", str(path), "guests", "--source", "north"]) == 2
+    assert "unknown source: north" in caplog.text
 
 
 def test_proxmox_error(config, monkeypatch, caplog):
     def unreachable(*args, **kwargs):
         raise ProxmoxError("GET /cluster/resources: connection refused")
 
-    monkeypatch.setattr(cli, "ProxmoxAPI", unreachable)
+    monkeypatch.setattr(pve_platform, "ProxmoxAPI", unreachable)
     assert cli.main(["-c", config, "guests"]) == 1
     assert "connection refused" in caplog.text
 
@@ -206,8 +225,9 @@ def test_guests(config, fake_api, capsys):
     assert cli.main(["-c", config, "guests"]) == 0
     out = capsys.readouterr().out.splitlines()
     assert len(out) == 3
-    assert out[0].split() == ["100", "qemu", "pve1", "running", "web"]
-    assert fake_api.instances[0].args == ("https://pve1:8006", "antigrafa@pve!backup", "s3cret", None)
+    assert out[0].split() == ["100", "vm", "pve1", "running", "web"]
+    assert out[2].split() == ["200", "ct", "pve1", "stopped", "dns"]
+    assert fake_api.instances[0].args == ("https://pve1:8006", "antigrafa@pve!backup", "s3cret", None, True)
 
 
 # --------------------------------------------------------------------------- backup
@@ -216,25 +236,27 @@ def test_guests(config, fake_api, capsys):
 def test_backup_all_with_exclusion(config, fake_runner, capsys):
     assert cli.main(["-c", config, "backup", "--all", "--exclude", "101"]) == 0
     runner = fake_runner.last
-    assert [g.vmid for g in runner.guests] == [100, 200]
+    assert [g.id for g in runner.guests] == ["100", "200"]
     assert runner.closed
     out = capsys.readouterr().out
-    assert "OK" in out and "VM 100 (web)" in out and "vm/100/x" in out
+    assert "OK" in out and "VM 100 (web)" in out and "cluster1/vm/100/x" in out
     assert "New data: 3.0 MiB -> 1.5 MiB written (final zstd level 3, 2 parallel writes)" in out
 
 
 def test_backup_ssh_hosts_come_from_config(config, fake_runner):
-    assert cli.main(["-c", config, "backup", "--vmid", "100"]) == 0
-    ssh = fake_runner.last.ssh_for_node("pve1")
+    assert cli.main(["-c", config, "backup", "--guest", "100"]) == 0
+    platform = fake_runner.last.platform
+    assert (platform.type, platform.name) == ("proxmox", "cluster1")
+    ssh = platform.ssh_for_host("pve1")
     assert (ssh.host, ssh.user, ssh.port) == ("10.0.0.11", "root", 22)
-    assert fake_runner.last.ssh_for_node("pve2").host == "pve2"
+    assert platform.ssh_for_host("pve2").host == "pve2"
 
 
 def test_backup_selected_guests_with_failure(config, fake_runner, capsys):
-    fake_runner.fail = {101}
+    fake_runner.fail = {"101"}
     fake_runner.raw_bytes = 0
-    assert cli.main(["-c", config, "backup", "--vmid", "101", "100"]) == 1
-    assert [g.vmid for g in fake_runner.last.guests] == [100, 101]
+    assert cli.main(["-c", config, "backup", "--guest", "101", "100"]) == 1
+    assert [g.id for g in fake_runner.last.guests] == ["100", "101"]
     out = capsys.readouterr().out
     assert "FAILED VM 101 (db)" in out and "dd: read error" in out
     assert "New data" not in out  # nothing new written
@@ -242,12 +264,12 @@ def test_backup_selected_guests_with_failure(config, fake_runner, capsys):
 
 def test_backup_needs_a_selection(config, fake_runner, caplog):
     assert cli.main(["-c", config, "backup"]) == 2
-    assert "use --all or --vmid" in caplog.text
+    assert "use --all or --guest" in caplog.text
     assert fake_runner.last is None
 
 
 def test_backup_unknown_guest(config, fake_runner, caplog):
-    assert cli.main(["-c", config, "backup", "--vmid", "100", "999", "998"]) == 2
+    assert cli.main(["-c", config, "backup", "--guest", "100", "999", "998"]) == 2
     assert "guests not found: 998, 999" in caplog.text
 
 
@@ -305,4 +327,11 @@ def test_restore_unknown_disk(config, backup, tmp_path, caplog):
 
 
 def test_restore_unknown_snapshot(config, backup, tmp_path):
-    assert cli.main(["-c", config, "restore", "vm/100/nope", "scsi0", str(tmp_path / "x")]) == 1
+    assert cli.main(["-c", config, "restore", "cluster1/vm/100/nope", "scsi0", str(tmp_path / "x")]) == 1
+
+
+def test_verify_tls_reaches_the_api(config, fake_api):
+    path = Path(config)
+    path.write_text(path.read_text().replace('token_secret = "s3cret"', 'token_secret = "s3cret"\nverify_tls = false'))
+    assert cli.main(["-c", config, "guests"]) == 0
+    assert fake_api.instances[-1].args[-1] is False

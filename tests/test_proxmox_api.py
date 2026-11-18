@@ -5,8 +5,9 @@ import urllib.parse
 
 import pytest
 
-from antigrafa import proxmox
-from antigrafa.proxmox import Guest, ProxmoxAPI, ProxmoxError
+from antigrafa.platforms.base import Guest
+from antigrafa.platforms.proxmox import api as proxmox
+from antigrafa.platforms.proxmox.api import ProxmoxAPI, ProxmoxError
 
 URL = "https://pve1.example.lan:8006"
 
@@ -59,6 +60,20 @@ def test_tls_certificate_is_always_verified(api):
     assert api._ctx.check_hostname is True
 
 
+def test_verify_tls_false_skips_verification_and_warns(caplog):
+    import ssl
+
+    api = ProxmoxAPI(URL, "id", "secret", verify_tls=False)
+    assert api._ctx.verify_mode == ssl.CERT_NONE
+    assert api._ctx.check_hostname is False
+    assert "NOT verified" in caplog.text and URL in caplog.text
+
+
+def test_verify_tls_false_still_requires_https():
+    with pytest.raises(ProxmoxError, match="https://"):
+        ProxmoxAPI("http://pve1:8006", "id", "secret", verify_tls=False)
+
+
 def test_get_sends_token_and_query(server, api):
     fake = server({"wait": 0.25})
     assert api.node_iowait("pve 1") == 0.25
@@ -76,11 +91,16 @@ def test_guests_skips_templates_and_sorts(server, api):
             {"vmid": 100, "node": "pve1", "type": "qemu", "name": "web", "status": "stopped"},
             {"vmid": 9000, "node": "pve1", "type": "qemu", "template": 1},
             {"vmid": "150", "node": "pve1", "type": "qemu"},
+            {"vmid": 1000, "node": "pve2", "type": "qemu", "name": "big"},
+            {"vmid": 300, "node": "pve1", "type": "openvz"},  # unknown type: skipped
         ]
     )
     guests = api.guests()
-    assert [g.vmid for g in guests] == [100, 150, 200]
-    assert guests[1] == Guest(150, "pve1", "qemu", "", "")
+    # Sorted as numbers, not as text ("1000" would come before "150")
+    assert [g.id for g in guests] == ["100", "150", "200", "1000"]
+    assert guests[1] == Guest("150", "vm", "", "pve1", "")
+    # Proxmox types become generic kinds, nodes become hosts
+    assert (guests[2].kind, guests[2].host, guests[2].name) == ("ct", "pve2", "dns")
     assert _query(fake.requests[0]) == {"type": ["vm"]}
 
 
@@ -90,12 +110,12 @@ def test_guests_empty_cluster(server, api):
 
 
 def test_guest_label():
-    assert Guest(100, "pve1", "qemu", "web", "running").label == "VM 100 (web)"
-    assert Guest(200, "pve1", "lxc", "dns", "running").label == "CT 200 (dns)"
+    assert Guest("100", "vm", "web", "pve1", "running").label == "VM 100 (web)"
+    assert Guest("200", "ct", "dns", "pve1", "running").label == "CT 200 (dns)"
 
 
 def test_guest_config_and_snapshots(server, api):
-    g = Guest(100, "pve1", "qemu", "web", "running")
+    g = Guest("100", "vm", "web", "pve1", "running")
     fake = server({"scsi0": "local-zfs:vm-100-disk-0"}, [{"name": "current"}], None)
     assert api.guest_config(g) == {"scsi0": "local-zfs:vm-100-disk-0"}
     assert api.list_snapshots(g) == [{"name": "current"}]
@@ -106,7 +126,7 @@ def test_guest_config_and_snapshots(server, api):
 
 def test_create_snapshot_qemu_without_ram_and_waits(server, api, monkeypatch):
     monkeypatch.setattr(proxmox.time, "sleep", lambda s: None)
-    g = Guest(100, "pve1", "qemu", "web", "running")
+    g = Guest("100", "vm", "web", "pve1", "running")
     upid = "UPID:pve1:0001:snap"
     fake = server(upid, {"status": "running"}, {"status": "stopped", "exitstatus": "OK"})
     api.create_snapshot(g, "antigrafa_1", "temporary")
@@ -121,7 +141,7 @@ def test_create_snapshot_qemu_without_ram_and_waits(server, api, monkeypatch):
 
 
 def test_create_snapshot_container_has_no_vmstate(server, api):
-    g = Guest(200, "pve1", "lxc", "dns", "running")
+    g = Guest("200", "ct", "dns", "pve1", "running")
     fake = server(None)  # no task id: nothing to wait for
     api.create_snapshot(g, "antigrafa_1")
     body = urllib.parse.parse_qs(fake.requests[0].data.decode())
@@ -130,7 +150,7 @@ def test_create_snapshot_container_has_no_vmstate(server, api):
 
 
 def test_delete_snapshot(server, api):
-    g = Guest(100, "pve1", "qemu", "web", "running")
+    g = Guest("100", "vm", "web", "pve1", "running")
     fake = server("UPID:x", {"status": "stopped", "exitstatus": "OK"})
     api.delete_snapshot(g, "antigrafa 1")
     assert fake.requests[0].get_method() == "DELETE"

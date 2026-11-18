@@ -2,11 +2,14 @@
 
 Repository layout:
 
-    <root>/.chunks/...                        shared chunks (deduplication)
-    <root>/vm/<vmid>/<timestamp>/             one VM backup
-    <root>/ct/<vmid>/<timestamp>/             one container backup
-        manifest.json                         written last = backup is complete
-        <disk>.img.fidx | <disk>.tar.fidx     chunk index
+    <root>/.chunks/...                             shared chunks (deduplication)
+    <root>/<source>/vm/<guest id>/<timestamp>/     one VM backup
+    <root>/<source>/ct/<guest id>/<timestamp>/     one container backup
+        manifest.json                              written last = backup is complete
+        <disk>.img.fidx | <disk>.tar.fidx          chunk index
+
+``<source>`` is the name of the ``[source.<name>]`` section: guests of different
+clusters or platforms never mix, even when their ids are the same.
 """
 
 from __future__ import annotations
@@ -21,9 +24,9 @@ from pathlib import Path
 
 from .chunkstore import ChunkStore
 from .index import MANIFEST_NAME, read_manifest
+from .platforms.base import KINDS, check_name
 
 TS_FORMAT = "%Y-%m-%dT%H-%M-%SZ"
-GUEST_DIRS = {"qemu": "vm", "lxc": "ct"}
 
 
 class TargetUnavailable(Exception):
@@ -126,8 +129,12 @@ class Repository:
         if self._flush_at_end:
             syncfs(self.root)
 
-    def create_snapshot_dir(self, guest_type: str, vmid: int, when: datetime) -> Path:
-        path = self.root / GUEST_DIRS[guest_type] / str(vmid) / when.strftime(TS_FORMAT)
+    def create_snapshot_dir(self, source: str, kind: str, guest_id: str, when: datetime) -> Path:
+        if kind not in KINDS:
+            raise ValueError(f"unknown guest kind {kind!r}")
+        # Each part becomes one directory: never "..", never a separator
+        parts = (check_name(source, "source name"), kind, check_name(guest_id, "guest id"))
+        path = self.root.joinpath(*parts, when.strftime(TS_FORMAT))
         path.mkdir(parents=True, exist_ok=False)
         return path
 
@@ -140,11 +147,12 @@ class Repository:
     def list_snapshots(self) -> list[tuple[str, dict]]:
         """Complete backups (with a manifest), sorted by path."""
         found = []
-        for kind_dir in GUEST_DIRS.values():
-            base = self.root / kind_dir
-            if not base.is_dir():
-                continue
-            for manifest in sorted(base.glob(f"*/*/{MANIFEST_NAME}")):
-                snap = manifest.parent
-                found.append((str(snap.relative_to(self.root)), read_manifest(snap)))
+        for source in sorted(p for p in self.root.iterdir() if p.is_dir() and not p.name.startswith(".")):
+            for kind in KINDS:
+                base = source / kind
+                if not base.is_dir():
+                    continue
+                for manifest in sorted(base.glob(f"*/*/{MANIFEST_NAME}")):
+                    snap = manifest.parent
+                    found.append((str(snap.relative_to(self.root)), read_manifest(snap)))
         return found

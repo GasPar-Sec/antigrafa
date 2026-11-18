@@ -1,25 +1,37 @@
 # Antigrafa configuration: copy to /etc/antigrafa/antigrafa.toml
 
-[proxmox]
+# --------------------------------------------------------------------------- sources
+# One [source.<name>] section per cluster or host to back up. "type" picks the
+# platform; the other keys belong to that platform. The name is used on the command
+# line (--source) and as the top directory of its backups in each target.
+
+[source.cluster1]
+type = "proxmox"
 url = "https://pve1.example.lan:8006"
 token_id = "antigrafa@pve!backup"
 token_secret_file = "/etc/antigrafa/token"   # or token_secret = "..."
-# The certificate is always verified. Proxmox uses its own CA: copy
+# The certificate is verified. Proxmox uses its own CA: copy
 # /etc/pve/pve-root-ca.pem from a node and point ca_file at it.
 ca_file = "/etc/antigrafa/pve-root-ca.pem"
+# Labs only: skip certificate verification (remove ca_file). Anyone on the network
+# path can then intercept the API token.
+# verify_tls = false
 
-[ssh]
+# How Antigrafa reaches the nodes to read the snapshots.
+[source.cluster1.ssh]
 user = "root"
 identity_file = "/etc/antigrafa/id_ed25519"
 # Fast cipher, useful above ~500 MiB/s:
 # options = ["Ciphers=aes128-gcm@openssh.com"]
 
 # SSH address of each node (otherwise the node name is used as-is).
-[nodes.pve1]
+[source.cluster1.nodes.pve1]
 host = "10.0.0.11"
 
-[nodes.pve2]
+[source.cluster1.nodes.pve2]
 host = "10.0.0.12"
+
+# --------------------------------------------------------------------------- targets
 
 [target.local]
 kind = "local"
@@ -30,10 +42,12 @@ kind = "nfs"              # refuses to write if the share is not mounted
 path = "/mnt/nas/antigrafa"
 sync = "filesystem"       # "file" (fsync per chunk) | "filesystem" | "none"
 
+# --------------------------------------------------------------------------- tuning
+
 [tuning]
 chunk_size_mib = 4
-max_parallel_guests = 4       # guests backed up at the same time (all nodes)
-max_parallel_per_node = 1     # on a single node
+max_parallel_guests = 4       # guests backed up at the same time (all hosts)
+max_parallel_per_host = 1     # on a single host
 
 # Destination: target write latency per chunk; above it, concurrency goes down.
 writer_min_concurrency = 1
@@ -44,9 +58,9 @@ compression_level = 3
 compression_min_level = 1
 compression_max_level = 9
 
-# Source: snapshot reads slow down when the node's iowait rises.
+# Source: snapshot reads slow down when the host's iowait rises.
 source_max_mib_s = 0          # 0 = no fixed cap
 source_min_mib_s = 10
-node_iowait_high = 0.10
-node_iowait_low = 0.03
-low_priority = true           # ionice/nice on the node while reading
+host_iowait_high = 0.10
+host_iowait_low = 0.03
+low_priority = true           # read at low I/O and CPU priority on the host

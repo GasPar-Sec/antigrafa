@@ -3,30 +3,24 @@
 from __future__ import annotations
 
 import json
+import logging
 import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+
+from ..base import Guest, PlatformError
+
+log = logging.getLogger(__name__)
+
+# Generic guest kind -> Proxmox guest type
+PVE_TYPES = {"vm": "qemu", "ct": "lxc"}
+_KINDS = {pve: kind for kind, pve in PVE_TYPES.items()}
 
 
-class ProxmoxError(Exception):
+class ProxmoxError(PlatformError):
     pass
-
-
-@dataclass(frozen=True)
-class Guest:
-    vmid: int
-    node: str
-    type: str  # "qemu" or "lxc"
-    name: str
-    status: str
-
-    @property
-    def label(self) -> str:
-        kind = "VM" if self.type == "qemu" else "CT"
-        return f"{kind} {self.vmid} ({self.name})"
 
 
 class ProxmoxAPI:
@@ -37,6 +31,7 @@ class ProxmoxAPI:
         token_secret: str,
         ca_file: str | None = None,
         timeout: float = 30.0,
+        verify_tls: bool = True,
     ) -> None:
         # HTTPS only: the API token travels in every request. This also rules out
         # file:// and other schemes urllib would otherwise accept.
@@ -45,9 +40,19 @@ class ProxmoxAPI:
         self.base = url.rstrip("/") + "/api2/json"
         self._auth = f"PVEAPIToken={token_id}={token_secret}"
         self.timeout = timeout
-        # The certificate is always verified. For the self-signed certificate of a
-        # Proxmox cluster, point ca_file at its CA (/etc/pve/pve-root-ca.pem).
+        # For the self-signed certificate of a Proxmox cluster, point ca_file at its
+        # CA (/etc/pve/pve-root-ca.pem): the connection is then verified.
         self._ctx = ssl.create_default_context(cafile=ca_file)
+        if not verify_tls:
+            # Explicit opt-out (verify_tls = false, labs only): anyone on the network
+            # path can impersonate the API and capture the token. Loudly reported.
+            log.warning(
+                "TLS certificate of %s is NOT verified (verify_tls = false): "
+                "the API token can be intercepted, use ca_file instead",
+                url,
+            )
+            self._ctx.check_hostname = False  # NOSONAR: opt-in, see verify_tls
+            self._ctx.verify_mode = ssl.CERT_NONE  # NOSONAR: opt-in, see verify_tls
 
     def _request(self, method: str, path: str, params: dict | None = None):
         url = self.base + path
@@ -87,21 +92,21 @@ class ProxmoxAPI:
         """Every VM and container in the cluster, except templates."""
         out = []
         for r in self.get("/cluster/resources", {"type": "vm"}) or []:
-            if r.get("template"):
+            if r.get("template") or r.get("type") not in _KINDS:
                 continue
             out.append(
                 Guest(
-                    vmid=int(r["vmid"]),
-                    node=r["node"],
-                    type=r["type"],
+                    id=str(r["vmid"]),
+                    kind=_KINDS[r["type"]],
                     name=r.get("name", ""),
+                    host=r["node"],
                     status=r.get("status", ""),
                 )
             )
-        return sorted(out, key=lambda g: g.vmid)
+        return sorted(out, key=lambda g: int(g.id))
 
     def _guest_path(self, g: Guest) -> str:
-        return f"/nodes/{urllib.parse.quote(g.node)}/{g.type}/{g.vmid}"
+        return f"/nodes/{urllib.parse.quote(g.host)}/{PVE_TYPES[g.kind]}/{urllib.parse.quote(g.id)}"
 
     def guest_config(self, g: Guest) -> dict:
         return self.get(self._guest_path(g) + "/config")
@@ -113,13 +118,13 @@ class ProxmoxAPI:
         """Consistent snapshot of every disk. Proxmox freezes the filesystems through
         the qemu-guest-agent when it is enabled; RAM is not saved."""
         params = {"snapname": name, "description": description}
-        if g.type == "qemu":
+        if g.kind == "vm":
             params["vmstate"] = 0
-        self.wait_task(g.node, self.post(self._guest_path(g) + "/snapshot", params))
+        self.wait_task(g.host, self.post(self._guest_path(g) + "/snapshot", params))
 
     def delete_snapshot(self, g: Guest, name: str) -> None:
         upid = self.delete(self._guest_path(g) + f"/snapshot/{urllib.parse.quote(name)}")
-        self.wait_task(g.node, upid)
+        self.wait_task(g.host, upid)
 
     # --- Storage and nodes -------------------------------------------------
 

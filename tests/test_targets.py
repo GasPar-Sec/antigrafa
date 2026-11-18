@@ -83,19 +83,52 @@ def test_open_nfs_mounted(tmp_path, monkeypatch):
 
 
 def test_snapshot_dirs_and_listing(repo):
-    vm = repo.create_snapshot_dir("qemu", 100, WHEN)
-    ct = repo.create_snapshot_dir("lxc", 200, WHEN)
-    repo.create_snapshot_dir("qemu", 101, WHEN)  # no manifest: incomplete backup
-    assert vm == repo.root / "vm" / "100" / "2026-11-17T22-30-00Z"
+    vm = repo.create_snapshot_dir("cluster1", "vm", "100", WHEN)
+    ct = repo.create_snapshot_dir("cluster1", "ct", "200", WHEN)
+    repo.create_snapshot_dir("cluster1", "vm", "101", WHEN)  # no manifest: incomplete backup
+    assert vm == repo.root / "cluster1" / "vm" / "100" / "2026-11-17T22-30-00Z"
     with pytest.raises(FileExistsError):
-        repo.create_snapshot_dir("qemu", 100, WHEN)
+        repo.create_snapshot_dir("cluster1", "vm", "100", WHEN)
 
-    write_manifest(vm, {"vmid": 100})
-    write_manifest(ct, {"vmid": 200})
+    write_manifest(vm, {"id": "100"})
+    write_manifest(ct, {"id": "200"})
     assert repo.list_snapshots() == [
-        ("vm/100/2026-11-17T22-30-00Z".replace("/", os.sep), {"vmid": 100}),
-        ("ct/200/2026-11-17T22-30-00Z".replace("/", os.sep), {"vmid": 200}),
+        ("cluster1/vm/100/2026-11-17T22-30-00Z".replace("/", os.sep), {"id": "100"}),
+        ("cluster1/ct/200/2026-11-17T22-30-00Z".replace("/", os.sep), {"id": "200"}),
     ]
+
+
+def test_same_guest_id_in_two_sources_never_mixes(repo):
+    a = repo.create_snapshot_dir("east", "vm", "100", WHEN)
+    b = repo.create_snapshot_dir("west", "vm", "100", WHEN)  # same id, same time: no clash
+    write_manifest(a, {"source": "east"})
+    write_manifest(b, {"source": "west"})
+    assert [m["source"] for _, m in repo.list_snapshots()] == ["east", "west"]
+
+
+def test_listing_ignores_chunks_and_stray_files(repo):
+    snap = repo.create_snapshot_dir("cluster1", "vm", "100", WHEN)
+    write_manifest(snap, {"id": "100"})
+    (repo.root / "README.txt").write_text("not a backup")
+    (repo.root / "cluster1" / "iso").mkdir()  # not a guest kind
+    assert [p for p, _ in repo.list_snapshots()] == [str(snap.relative_to(repo.root))]
+
+
+@pytest.mark.parametrize(
+    ("source", "kind", "guest_id", "message"),
+    [
+        ("../up", "vm", "100", "invalid source name"),
+        ("a/b", "vm", "100", "invalid source name"),
+        ("cluster1", "vm", "..", "invalid guest id"),
+        ("cluster1", "vm", "1/2", "invalid guest id"),
+        ("cluster1", "vm", ".hidden", "invalid guest id"),
+        ("cluster1", "disk", "100", "unknown guest kind"),
+    ],
+)
+def test_snapshot_dir_refuses_unsafe_names(repo, source, kind, guest_id, message):
+    with pytest.raises(ValueError, match=message):
+        repo.create_snapshot_dir(source, kind, guest_id, WHEN)
+    assert list(repo.root.iterdir()) == [repo.root / ".chunks"]  # nothing created
 
 
 def test_list_snapshots_empty(repo):
