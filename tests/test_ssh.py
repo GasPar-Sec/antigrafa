@@ -1,9 +1,14 @@
 import subprocess
+import sys
 import tempfile
 
 import pytest
 
 from antigrafa.ssh import RemoteCommandError, RemoteStream, SSHHost
+
+# The RemoteStream tests run a local shell in place of ssh: sh on Linux, cmd on Windows.
+linux_only = pytest.mark.skipif(sys.platform != "linux", reason="needs a POSIX sh")
+windows_only = pytest.mark.skipif(sys.platform != "win32", reason="needs cmd.exe")
 
 
 def _local(cmd):
@@ -12,20 +17,54 @@ def _local(cmd):
     return RemoteStream("local", cmd, proc, err)
 
 
+def _local_windows(cmd):
+    err = tempfile.TemporaryFile()
+    # A command line string: cmd.exe parses its own quoting, unlike sh -c
+    proc = subprocess.Popen(f"cmd.exe /d /c {cmd}", stdout=subprocess.PIPE, stderr=err, bufsize=0)
+    return RemoteStream("local", cmd, proc, err)
+
+
+@linux_only
 def test_stream_ok():
     with _local("printf abc") as s:
         assert s.stdout.read() == b"abc"
 
 
+@windows_only
+def test_stream_ok_windows():
+    with _local_windows("echo abc") as s:
+        assert s.stdout.read() == b"abc\r\n"
+
+
+@linux_only
 def test_stream_failure_is_reported_with_stderr():
     with pytest.raises(RemoteCommandError, match="vanished"):
         with _local("echo vanished >&2; exit 3") as s:
             s.stdout.read()
 
 
+@windows_only
+def test_stream_failure_is_reported_with_stderr_windows():
+    with pytest.raises(RemoteCommandError, match="vanished") as exc:
+        with _local_windows("echo vanished 1>&2 & exit 3") as s:
+            s.stdout.read()
+    assert exc.value.returncode == 3
+
+
+@linux_only
 def test_stream_abort_kills_reader():
     with pytest.raises(ValueError):
         with _local("yes") as s:
+            s.stdout.read(10)
+            raise ValueError("destination down")
+    assert s.proc.returncode is not None
+
+
+@windows_only
+def test_stream_abort_kills_reader_windows():
+    with pytest.raises(ValueError):
+        # Endless output, like yes: only the kill can stop it
+        with _local_windows("for /l %i in (0,0,1) do @echo y") as s:
             s.stdout.read(10)
             raise ValueError("destination down")
     assert s.proc.returncode is not None
