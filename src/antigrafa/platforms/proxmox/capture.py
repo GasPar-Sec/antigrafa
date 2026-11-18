@@ -16,10 +16,11 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from dataclasses import dataclass, field
 
-from .ssh import RemoteStream, SSHHost
+from ...ssh import RemoteStream, SSHHost
+from ..base import DiskSource, PlatformError
 
 LOW_PRIORITY = "ionice -c 2 -n 7 nice -n 10 "
 
@@ -27,7 +28,7 @@ _QEMU_DISK = re.compile(r"^(ide|sata|scsi|virtio|efidisk|tpmstate)\d+$")
 _LXC_MP = re.compile(r"^mp\d+$")
 
 
-class UnsupportedStorage(Exception):
+class UnsupportedStorage(PlatformError):
     pass
 
 
@@ -87,8 +88,8 @@ def guest_disks(guest_type: str, config: dict) -> list[Disk]:
     return disks
 
 
-class VolumeSource(ABC):
-    format = "raw"  # "raw" (disk image) or "tar" (file tree)
+class VolumeSource(DiskSource):
+    """One Proxmox volume, read from its snapshot by a command run over SSH."""
 
     def __init__(self, ssh: SSHHost, storage_cfg: dict, disk: Disk, snapname: str, low_priority: bool = True):
         self.ssh = ssh
@@ -97,18 +98,16 @@ class VolumeSource(ABC):
         self.snapname = snapname
         self.prefix = LOW_PRIORITY if low_priority else ""
 
-    def prepare(self) -> None:
-        """Make the snapshot readable (device node, activation...)."""
+    @property
+    def key(self) -> str:
+        return self.disk.key
 
-    @abstractmethod
-    def size(self) -> int | None:
-        """Exact size of the stream, when known in advance."""
+    @property
+    def volume(self) -> str:
+        return self.disk.volid
 
     @abstractmethod
     def stream_command(self) -> str: ...
-
-    def cleanup(self) -> None:
-        """Undo what ``prepare`` did. Must be safe even if ``prepare`` failed."""
 
     def open_stream(self) -> RemoteStream:
         return self.ssh.stream(self.prefix + self.stream_command())
@@ -170,7 +169,8 @@ class ZfsDatasetSource(VolumeSource):
         return None
 
     def stream_command(self) -> str:
-        assert self.snapdir, "prepare() must be called first"
+        if not self.snapdir:
+            raise RuntimeError("prepare() must be called first")
         return (
             "tar --numeric-owner --xattrs --acls --one-file-system --sparse "
             f"-cf - -C {shlex.quote(self.snapdir)} ."

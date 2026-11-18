@@ -6,21 +6,21 @@ import argparse
 import logging
 import sys
 
+from . import platforms
 from .config import Config, ConfigError, load_config
 from .index import read_index, read_manifest
 from .pipeline import restore_stream
-from .proxmox import ProxmoxAPI, ProxmoxError
-from .ssh import SSHHost
+from .platforms.base import Platform, PlatformError
 from .targets import Repository, TargetUnavailable
 
 log = logging.getLogger("antigrafa")
 
 
-def _api(cfg: Config) -> ProxmoxAPI:
-    if cfg.proxmox is None:
-        raise ConfigError("a [proxmox] section is required for this command")
-    p = cfg.proxmox
-    return ProxmoxAPI(p.url, p.token_id, p.secret(), verify_tls=p.verify_tls, ca_file=p.ca_file)
+def _platform(cfg: Config, name: str | None) -> Platform:
+    if not cfg.sources:
+        raise ConfigError("a [source.<name>] section is required for this command")
+    source = cfg.source(name)
+    return platforms.create_platform(source.type, source.name, source.settings)
 
 
 def _repo(cfg: Config, name: str | None) -> Repository:
@@ -38,33 +38,29 @@ def _human(n: float) -> str:
 
 
 def cmd_guests(cfg: Config, args) -> int:
-    for g in _api(cfg).guests():
-        print(f"{g.vmid:>6}  {g.type:<5} {g.node:<12} {g.status:<8} {g.name}")
+    for g in _platform(cfg, args.source).guests():
+        print(f"{g.id:>6}  {g.kind:<3} {g.host:<12} {g.status:<8} {g.name}")
     return 0
 
 
 def cmd_backup(cfg: Config, args) -> int:
     from .jobs import BackupRunner
 
-    api = _api(cfg)
+    platform = _platform(cfg, args.source)
     repo = _repo(cfg, args.target)
-    guests = api.guests()
+    guests = platform.guests()
     if not args.all:
-        wanted = set(args.vmid or [])
+        wanted = set(args.guest or [])
         if not wanted:
-            raise ConfigError("use --all or --vmid")
-        missing = wanted - {g.vmid for g in guests}
+            raise ConfigError("use --all or --guest")
+        missing = wanted - {g.id for g in guests}
         if missing:
-            raise ConfigError(f"guests not found: {', '.join(map(str, sorted(missing)))}")
-        guests = [g for g in guests if g.vmid in wanted]
+            raise ConfigError(f"guests not found: {', '.join(sorted(missing))}")
+        guests = [g for g in guests if g.id in wanted]
     excluded = set(args.exclude or [])
-    guests = [g for g in guests if g.vmid not in excluded]
+    guests = [g for g in guests if g.id not in excluded]
 
-    def ssh_for(node: str) -> SSHHost:
-        s = cfg.ssh
-        return SSHHost(cfg.node_host(node), user=s.user, port=s.port, identity_file=s.identity_file, options=s.options)
-
-    runner = BackupRunner(cfg.tuning, api, repo, ssh_for)
+    runner = BackupRunner(cfg.tuning, platform, repo)
     try:
         results = runner.run(guests)
     finally:
@@ -88,7 +84,8 @@ def cmd_list(cfg: Config, args) -> int:
     repo = _repo(cfg, args.target)
     for path, m in repo.list_snapshots():
         total = sum(d["size"] for d in m["disks"])
-        print(f"{path:<40} {m.get('name', ''):<20} {len(m['disks'])} disk(s)  {_human(total)}")
+        name = m.get("guest", {}).get("name", "")
+        print(f"{path:<48} {name:<20} {len(m['disks'])} disk(s)  {_human(total)}")
     return 0
 
 
@@ -132,17 +129,20 @@ def cmd_restore(cfg: Config, args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="antigrafa", description="Backups for Proxmox VMs and containers")
+    p = argparse.ArgumentParser(prog="antigrafa", description="Backups for virtual machines and containers")
     p.add_argument("-c", "--config", default="/etc/antigrafa/antigrafa.toml")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("guests", help="list the cluster's VMs and containers").set_defaults(func=cmd_guests)
+    g = sub.add_parser("guests", help="list the VMs and containers of a source")
+    g.add_argument("--source", help="name of a [source.<name>] section")
+    g.set_defaults(func=cmd_guests)
 
     b = sub.add_parser("backup", help="back up guests")
-    b.add_argument("--all", action="store_true", help="every guest in the cluster")
-    b.add_argument("--vmid", type=int, nargs="+")
-    b.add_argument("--exclude", type=int, nargs="+")
+    b.add_argument("--source", help="name of a [source.<name>] section")
+    b.add_argument("--all", action="store_true", help="every guest of the source")
+    b.add_argument("--guest", nargs="+", metavar="ID", help="guest ids, as shown by 'guests'")
+    b.add_argument("--exclude", nargs="+", metavar="ID")
     b.add_argument("--target")
     b.set_defaults(func=cmd_backup)
 
@@ -157,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("restore", help="restore one disk to a file (raw image or tar)")
     r.add_argument("--target")
-    r.add_argument("snapshot", help="e.g. vm/100/2026-11-17T22-30-00Z")
+    r.add_argument("snapshot", help="e.g. cluster1/vm/100/2026-11-17T22-30-00Z")
     r.add_argument("disk", help="e.g. scsi0, rootfs")
     r.add_argument("output")
     r.set_defaults(func=cmd_restore)
@@ -176,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         log.error("%s", exc)
         return 2
-    except (TargetUnavailable, ProxmoxError, FileExistsError, FileNotFoundError) as exc:
+    except (TargetUnavailable, PlatformError, FileExistsError, FileNotFoundError) as exc:
         log.error("%s", exc)
         return 1
     except KeyboardInterrupt:

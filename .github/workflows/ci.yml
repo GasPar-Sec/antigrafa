@@ -1,0 +1,72 @@
+# Continuous integration: runs on every push, on every branch.
+#   1. Security: bandit on the source code
+#   2. Tests on Linux AND Windows, with Python 3.11 to 3.14
+#      (some tests only run on one OS, each with a twin on the other: see tests/test_ssh.py)
+#
+# The SonarQube analysis is not done here: SonarQube runs locally (Docker) and is
+# not reachable from GitHub. See tools/sonarqube/README.md.
+name: CI
+
+on:
+  push:
+  # Also lets you start the CI by hand from GitHub's "Actions" tab
+  workflow_dispatch:
+
+# The workflow only needs to read the code
+permissions:
+  contents: read
+
+# A new push on a branch cancels the CI still running on that branch
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    name: Security (bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Bandit
+        run: bandit -c pyproject.toml -r src
+
+  tests:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # If one combination fails, the others keep going: everything is visible at once
+      fail-fast: false
+      matrix:
+        # ubuntu-latest = Linux (Ubuntu), windows-latest = Windows Server
+        os: [ubuntu-latest, windows-latest]
+        # 3.11: oldest supported (requires-python); 3.14: zstd from the standard library
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      # -rs: list skipped tests with their reason (platform-only tests)
+      - name: Tests (pytest + coverage)
+        run: pytest -rs

@@ -5,9 +5,9 @@
   There is one controller per destination, shared by every running backup:
   the destination is the shared resource.
 
-* ``SourceThrottle`` (Proxmox node): caps the snapshot read rate based on the node's
-  iowait. Reading a snapshot loads the same disks the VMs use, so we slow down as
-  soon as the node shows signs of waiting on its disks.
+* ``SourceThrottle`` (host running the guests): caps the snapshot read rate based on
+  the host's iowait. Reading a snapshot loads the same disks the guests use, so we
+  slow down as soon as the host shows signs of waiting on its disks.
 
 Neither sits in the VMs' write path: at worst, the backup gets slower.
 """
@@ -163,9 +163,9 @@ class WriteController:
 
 
 class SourceThrottle:
-    """Token bucket whose rate follows the source node's iowait.
+    """Token bucket whose rate follows the source host's iowait.
 
-    ``max_rate=None``: no cap while the node is quiet. As soon as iowait exceeds
+    ``max_rate=None``: no cap while the host is quiet. As soon as iowait exceeds
     ``high``, the rate is capped at half the observed throughput, then halved again
     for as long as it does not come back down. Below ``low``, it grows by 25% per interval.
     """
@@ -231,7 +231,7 @@ class SourceThrottle:
         try:
             wait = float(self._probe())
         except Exception as exc:  # the API may be briefly unavailable
-            log.warning("node %s: cannot read iowait (%s), keeping current rate", self.name, exc)
+            log.warning("host %s: cannot read iowait (%s), keeping current rate", self.name, exc)
             return
         with self._lock:
             self._apply(wait, observed)
@@ -249,7 +249,7 @@ class SourceThrottle:
                 self.rate = min(new, self.max_rate) if self.max_rate is not None else new
         if self.rate != old:
             log.info(
-                "node %s: iowait %.1f%%, reads %s",
+                "host %s: iowait %.1f%%, reads %s",
                 self.name,
                 wait * 100,
                 "uncapped" if self.rate is None else f"capped at {self.rate / MiB:.0f} MiB/s",

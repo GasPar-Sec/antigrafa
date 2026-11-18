@@ -2,17 +2,21 @@
 
 Repository layout:
 
-    <root>/.chunks/...                        shared chunks (deduplication)
-    <root>/vm/<vmid>/<timestamp>/             one VM backup
-    <root>/ct/<vmid>/<timestamp>/             one container backup
-        manifest.json                         written last = backup is complete
-        <disk>.img.fidx | <disk>.tar.fidx     chunk index
+    <root>/.chunks/...                             shared chunks (deduplication)
+    <root>/<source>/vm/<guest id>/<timestamp>/     one VM backup
+    <root>/<source>/ct/<guest id>/<timestamp>/     one container backup
+        manifest.json                              written last = backup is complete
+        <disk>.img.fidx | <disk>.tar.fidx          chunk index
+
+``<source>`` is the name of the ``[source.<name>]`` section: guests of different
+clusters or platforms never mix, even when their ids are the same.
 """
 
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import errno
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,9 +24,9 @@ from pathlib import Path
 
 from .chunkstore import ChunkStore
 from .index import MANIFEST_NAME, read_manifest
+from .platforms.base import KINDS, check_name
 
 TS_FORMAT = "%Y-%m-%dT%H-%M-%SZ"
-GUEST_DIRS = {"qemu": "vm", "lxc": "ct"}
 
 
 class TargetUnavailable(Exception):
@@ -64,10 +68,29 @@ def mount_fstype(path: str, mounts_file: str = "/proc/mounts") -> str | None:
     return best_type
 
 
+def _libc() -> ctypes.CDLL | None:
+    """The C library, or None where there is none to load (Windows)."""
+    if os.name != "posix":
+        return None
+    try:
+        # find_library() may return None (no ldconfig): CDLL(None) is then the
+        # running process, which links the C library anyway.
+        return ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    except OSError:
+        return None
+
+
+def filesystem_sync_supported() -> bool:
+    """True when the whole filesystem can be flushed at once (syncfs or sync)."""
+    return hasattr(os, "sync")
+
+
 def syncfs(path: Path) -> None:
     """Flush the filesystem containing ``path`` to stable storage (local or NFS)."""
-    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-    if not hasattr(libc, "syncfs"):
+    libc = _libc()
+    if libc is None or not hasattr(libc, "syncfs"):
+        if not filesystem_sync_supported():
+            raise OSError(errno.ENOSYS, "no filesystem-wide sync on this platform", str(path))
         os.sync()
         return
     fd = os.open(path, os.O_RDONLY)
@@ -83,7 +106,11 @@ class Repository:
     def __init__(self, cfg: TargetConfig) -> None:
         self.cfg = cfg
         self.root = Path(cfg.path)
-        self.store = ChunkStore(self.root, sync_each=cfg.sync == "file")
+        # Without a filesystem-wide flush (Windows), "filesystem" falls back to an
+        # fsync per chunk: slower, but chunks are still on disk before the manifest.
+        self._flush_at_end = cfg.sync != "none" and filesystem_sync_supported()
+        sync_each = cfg.sync == "file" or (cfg.sync == "filesystem" and not self._flush_at_end)
+        self.store = ChunkStore(self.root, sync_each=sync_each)
 
     def open(self) -> None:
         """Check that the destination is usable before writing anything."""
@@ -99,11 +126,15 @@ class Repository:
         self.store.init()
 
     def sync(self) -> None:
-        if self.cfg.sync != "none":
+        if self._flush_at_end:
             syncfs(self.root)
 
-    def create_snapshot_dir(self, guest_type: str, vmid: int, when: datetime) -> Path:
-        path = self.root / GUEST_DIRS[guest_type] / str(vmid) / when.strftime(TS_FORMAT)
+    def create_snapshot_dir(self, source: str, kind: str, guest_id: str, when: datetime) -> Path:
+        if kind not in KINDS:
+            raise ValueError(f"unknown guest kind {kind!r}")
+        # Each part becomes one directory: never "..", never a separator
+        parts = (check_name(source, "source name"), kind, check_name(guest_id, "guest id"))
+        path = self.root.joinpath(*parts, when.strftime(TS_FORMAT))
         path.mkdir(parents=True, exist_ok=False)
         return path
 
@@ -116,11 +147,12 @@ class Repository:
     def list_snapshots(self) -> list[tuple[str, dict]]:
         """Complete backups (with a manifest), sorted by path."""
         found = []
-        for kind_dir in GUEST_DIRS.values():
-            base = self.root / kind_dir
-            if not base.is_dir():
-                continue
-            for manifest in sorted(base.glob(f"*/*/{MANIFEST_NAME}")):
-                snap = manifest.parent
-                found.append((str(snap.relative_to(self.root)), read_manifest(snap)))
+        for source in sorted(p for p in self.root.iterdir() if p.is_dir() and not p.name.startswith(".")):
+            for kind in KINDS:
+                base = source / kind
+                if not base.is_dir():
+                    continue
+                for manifest in sorted(base.glob(f"*/*/{MANIFEST_NAME}")):
+                    snap = manifest.parent
+                    found.append((str(snap.relative_to(self.root)), read_manifest(snap)))
         return found
