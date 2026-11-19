@@ -30,6 +30,10 @@ class PlatformError(Exception):
     """Error reported by a platform (API refused, unreachable host...)."""
 
 
+class AccessDenied(PlatformError):
+    """The credentials lack rights: checked before any action, nothing was done."""
+
+
 def check_name(value: str, what: str) -> str:
     """Refuse a name that is not a single, safe path component."""
     if not _SAFE_NAME.match(value):
@@ -79,6 +83,13 @@ class DiskSource(ABC):
     def size(self) -> int | None:
         """Exact size of the stream, when known in advance."""
 
+    def estimated_size(self) -> int | None:
+        """Approximate size when ``size`` is unknown (a file archive), for progress only.
+
+        Never used to check the backup. Must not raise: return None instead.
+        """
+        return None
+
     @abstractmethod
     def open_stream(self) -> Stream:
         """Start reading the snapshot of this disk."""
@@ -118,6 +129,14 @@ class Platform(ABC):
 
     @abstractmethod
     def delete_snapshot(self, guest: Guest, snapshot: str) -> None: ...
+
+    def check_access(self, guests: list[Guest]) -> None:
+        """Raise ``AccessDenied`` if the credentials cannot back up all of ``guests``.
+
+        Called before anything is done (no snapshot, no write): a missing right stops
+        the whole run with the list of what is missing, instead of failing halfway.
+        With an empty list, checks that guests can be listed at all.
+        """
 
     def leftover_snapshots(self, guest: Guest, prefix: str) -> list[str]:
         """Names of snapshots starting with ``prefix`` (left by an interrupted run)."""

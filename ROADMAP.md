@@ -47,6 +47,7 @@ of different sizes never deduplicate against each other.
 - [ ] Automatic abort when the snapshot grows too large on the source storage
 - [ ] Scheduling, notifications, client-side encryption
 - [ ] Direct restore to Proxmox
+- [ ] Replication between 2 antigrafa servers
 
 ## Validation
 

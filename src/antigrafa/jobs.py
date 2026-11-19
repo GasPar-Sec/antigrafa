@@ -10,6 +10,7 @@ Works with any platform (see ``antigrafa.platforms``). For each guest:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import threading
@@ -25,11 +26,15 @@ from .config import Tuning
 from .index import write_index, write_manifest
 from .pipeline import StreamStats, backup_stream
 from .platforms.base import DiskSource, Guest, Platform
+from .progress import Progress
 from .targets import Repository
 
 log = logging.getLogger(__name__)
 
 SNAP_PREFIX = "antigrafa_"
+
+# Phases of a guest backup, in order (keys of GuestResult.timings)
+PHASES = ("wait", "prepare", "snapshot", "transfer", "cleanup", "flush")
 
 
 class BackupError(Exception):
@@ -53,6 +58,18 @@ class GuestResult:
     snapshot: str = ""
     disks: list[DiskResult] = field(default_factory=list)
     duration: float = 0.0
+    # Seconds spent in each phase reached (see PHASES), even when the backup failed
+    timings: dict[str, float] = field(default_factory=dict)
+
+
+@contextlib.contextmanager
+def _timed(timings: dict[str, float], phase: str):
+    """Adds the time spent in the block to ``timings[phase]``, even on error."""
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        timings[phase] = timings.get(phase, 0.0) + time.monotonic() - start
 
 
 def write_tuning(t: Tuning) -> WriteTuning:
@@ -73,10 +90,14 @@ class BackupRunner:
         tuning: Tuning,
         platform: Platform,
         repo: Repository,
+        progress: Progress | None = None,
     ) -> None:
         self.tuning = tuning
         self.platform = platform
         self.repo = repo
+        self.progress = progress if progress is not None else Progress(enabled=False)
+        self._guests_total = 0
+        self._guests_done = 0
         self.chunk_size = tuning.chunk_size_mib * MiB
         # One controller and one writer pool for the destination,
         # shared by every concurrent backup.
@@ -115,52 +136,86 @@ class BackupRunner:
             return self._host_slots[host]
 
     def run(self, guests: list[Guest]) -> list[GuestResult]:
+        self._guests_total = len(guests)
+        self._guests_done = 0
+        self._update_status()
         with ThreadPoolExecutor(max_workers=self.tuning.max_parallel_guests, thread_name_prefix="guest") as pool:
             return list(pool.map(self._safe_backup, guests))
 
+    def _update_status(self) -> None:
+        self.progress.set_status(f"{self._guests_done}/{self._guests_total} guests")
+
     def _safe_backup(self, g: Guest) -> GuestResult:
         start = time.monotonic()
+        timings: dict[str, float] = {}
         try:
-            result = self.backup_guest(g)
+            result = self.backup_guest(g, timings)
         except Exception as exc:
             log.error("%s: failed: %s", g.label, exc)
-            result = GuestResult(guest=g, ok=False, error=str(exc))
+            result = GuestResult(guest=g, ok=False, error=str(exc), timings=timings)
         result.duration = time.monotonic() - start
+        with self._lock:
+            self._guests_done += 1
+            self._update_status()
         return result
 
-    def backup_guest(self, g: Guest) -> GuestResult:
-        with self._host_slot(g.host):
-            now = datetime.now(timezone.utc)
-            snapname = SNAP_PREFIX + now.strftime("%Y%m%dT%H%M%S")
-            plan = self.platform.plan_backup(g, snapname, self.tuning.low_priority)
-            if not plan.disks:
-                raise BackupError("no disk to back up")
-            self._warn_stale_snapshots(g)
-
-            dest = self.repo.create_snapshot_dir(self.platform.name, g.kind, g.id, now)
+    def backup_guest(self, g: Guest, timings: dict[str, float] | None = None) -> GuestResult:
+        timings = {} if timings is None else timings
+        slot = self._host_slot(g.host)
+        with _timed(timings, "wait"):  # other guests of the same host first
+            slot.acquire()
+        try:
+            with _timed(timings, "prepare"):
+                now = datetime.now(timezone.utc)
+                snapname = SNAP_PREFIX + now.strftime("%Y%m%dT%H%M%S")
+                plan = self.platform.plan_backup(g, snapname, self.tuning.low_priority)
+                if not plan.disks:
+                    raise BackupError("no disk to back up")
+                for src in plan.disks:
+                    log.debug("%s: %s: %s, read by %s (%s)", g.label, src.key, src.volume, type(src).__name__, src.format)
+                self._warn_stale_snapshots(g)
+                dest = self.repo.create_snapshot_dir(self.platform.name, g.kind, g.id, now)
             try:
                 log.info("%s: snapshot %s", g.label, snapname)
-                self.platform.create_snapshot(g, snapname)
+                with _timed(timings, "snapshot"):
+                    self.platform.create_snapshot(g, snapname)
                 try:
-                    results = [self._backup_disk(g, src, dest) for src in plan.disks]
+                    with _timed(timings, "transfer"):
+                        results = [self._backup_disk(g, src, dest) for src in plan.disks]
                 finally:
-                    self._delete_snapshot(g, snapname)
-                self.repo.sync()
-                write_manifest(dest, self._manifest(g, now, snapname, plan.config, results))
+                    with _timed(timings, "cleanup"):
+                        self._delete_snapshot(g, snapname)
+                with _timed(timings, "flush"):
+                    t0 = time.monotonic()
+                    self.repo.sync()
+                    log.debug("%s: destination flushed in %.1f s", g.label, time.monotonic() - t0)
+                    write_manifest(dest, self._manifest(g, now, snapname, plan.config, results))
             except BaseException:
                 shutil.rmtree(dest, ignore_errors=True)  # chunks stay, the incomplete index goes
                 raise
+        finally:
+            slot.release()
 
         rel = str(dest.relative_to(self.repo.root))
         log.info("%s: backup complete -> %s", g.label, rel)
-        return GuestResult(guest=g, ok=True, snapshot=rel, disks=results)
+        return GuestResult(guest=g, ok=True, snapshot=rel, disks=results, timings=timings)
 
     def _backup_disk(self, g: Guest, src: DiskSource, dest: Path) -> DiskResult:
         try:
             src.prepare()
             size = src.size()
             log.info("%s: %s (%s) -> reading", g.label, src.key, src.volume)
-            with src.open_stream() as stream:
+            estimate = src.estimated_size() if size is None else None
+            if size is not None:
+                log.debug("%s: %s: size %d bytes", g.label, src.key, size)
+            else:
+                log.debug("%s: %s: size unknown (archive), estimate %s", g.label, src.key, estimate)
+            task = self.progress.task(
+                size if size is not None else estimate,
+                name=f"{g.id}/{src.key}",
+                approximate=size is None,
+            )
+            with task, src.open_stream() as stream:
                 digests, stats = backup_stream(
                     stream.stdout,
                     self.repo.store,
@@ -168,6 +223,7 @@ class BackupRunner:
                     self._writers,
                     self._throttle(g.host),
                     self.chunk_size,
+                    on_read=task.advance,
                 )
         finally:
             try:

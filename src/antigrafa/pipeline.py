@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 from .adaptive import SourceThrottle, WriteController
 from .chunkstore import ChunkStore, digest_of, encode_chunk
@@ -73,7 +73,9 @@ def backup_stream(
     executor: Executor,
     throttle: SourceThrottle | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    on_read: Callable[[int], None] | None = None,
 ) -> tuple[list[bytes], StreamStats]:
+    """Back up ``stream``. ``on_read(n)`` is called after each chunk read (progress)."""
     stats = StreamStats()
     digests: list[bytes] = []
     seen: set[bytes] = set()
@@ -99,6 +101,8 @@ def backup_stream(
                 break
             if throttle is not None:
                 throttle.consume(len(data))
+            if on_read is not None:
+                on_read(len(data))
             digest = digest_of(data)
             digests.append(digest)
             stats.bytes_read += len(data)
@@ -126,8 +130,18 @@ def backup_stream(
 _ZEROS: dict[int, bytes] = {}
 
 
-def restore_stream(store: ChunkStore, digests: list[bytes], out: BinaryIO, size: int, sparse: bool = True) -> None:
-    """Rebuild the original stream. All-zero chunks become holes when the output allows it."""
+def restore_stream(
+    store: ChunkStore,
+    digests: list[bytes],
+    out: BinaryIO,
+    size: int,
+    sparse: bool = True,
+    on_chunk: Callable[[int], None] | None = None,
+) -> None:
+    """Rebuild the original stream. All-zero chunks become holes when the output allows it.
+
+    ``on_chunk(n)`` is called after each chunk, written or skipped (progress).
+    """
     sparse = sparse and out.seekable()
     for digest in digests:
         data = store.read(digest)
@@ -136,5 +150,7 @@ def restore_stream(store: ChunkStore, digests: list[bytes], out: BinaryIO, size:
             out.seek(len(data), 1)
         else:
             out.write(data)
+        if on_chunk is not None:
+            on_chunk(len(data))
     if sparse:
         out.truncate(size)

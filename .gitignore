@@ -11,3 +11,4 @@ dist/
 coverage.xml
 bandit-report.json
 .scannerwork/
+antigrafa.toml

@@ -136,3 +136,27 @@ def test_dataset_stream_requires_prepare():
     src = ZfsDatasetSource(FakeSSH(), {"type": "zfspool", "pool": "rpool/data"}, disk, "antigrafa_1")
     with pytest.raises(RuntimeError, match="prepare"):
         src.stream_command()
+
+
+def test_dataset_size_estimate_from_snapshot():
+    ssh = FakeSSH({"zfs get -Hp -o value logicalreferenced": "989855744\n"})
+    src = ZfsDatasetSource(ssh, {"type": "zfspool", "pool": "rpool/data"}, Disk("rootfs", "z:subvol-150-disk-0"), "antigrafa_1")
+    assert src.size() is None  # the exact size stays unknown: the backup is not checked against it
+    assert src.estimated_size() == 989855744
+    assert ssh.commands[-1] == "zfs get -Hp -o value logicalreferenced rpool/data/subvol-150-disk-0@antigrafa_1"
+
+
+def test_dataset_size_estimate_failure_is_harmless():
+    class Broken(FakeSSH):
+        def run(self, cmd, timeout=120):
+            raise RuntimeError("zfs: dataset busy")
+
+    src = ZfsDatasetSource(Broken(), {"type": "zfspool", "pool": "p"}, Disk("rootfs", "z:subvol-1-disk-0"), "s")
+    assert src.estimated_size() is None
+    garbage = ZfsDatasetSource(FakeSSH({"zfs get": "-\n"}), {"type": "zfspool", "pool": "p"}, Disk("rootfs", "z:subvol-1-disk-0"), "s")
+    assert garbage.estimated_size() is None
+
+
+def test_block_devices_need_no_estimate():
+    src = RbdSource(FakeSSH(), {"type": "rbd"}, Disk("scsi0", "ceph:vm-1-disk-0"), "s")
+    assert src.estimated_size() is None  # exact size known: default of DiskSource

@@ -84,15 +84,33 @@ flagged `backup=1` are backed up, matching Proxmox's behaviour.
 
 ### Requirements
 
-- an API token with at least `VM.Audit`, `VM.Snapshot` and `Sys.Audit`, plus read
-  access to the storage configuration (`/storage`). These permissions still need to be
-  validated on a real cluster;
+- an API token with these privileges (checked before anything is done, see below):
+
+  | Privilege | Path | Used for |
+  |---|---|---|
+  | `VM.Audit` | `/vms/<id>` | listing the guests, reading their configuration |
+  | `VM.Snapshot` | `/vms/<id>` | creating and deleting the temporary snapshot |
+  | `Sys.Audit` | `/nodes/<node>` | host load (iowait), to throttle reads |
+  | `Datastore.Audit` | `/storage/<id>` | how to read each disk (storage type, ZFS pool, Ceph pool...) |
+
+  ```sh
+  pveum role add AntigrafaBackup --privs "VM.Audit VM.Snapshot Sys.Audit Datastore.Audit"
+  pveum acl modify / --roles AntigrafaBackup --tokens 'antigrafa@pve!backup'
+  ```
+
+  With privilege separation (the default for a token), the token's user needs them too;
 - the cluster's CA certificate (`/etc/pve/pve-root-ca.pem`, copied from a node) for
   `ca_file`, so that the API certificate is verified. `verify_tls = false` skips the
   verification, for labs only: the API token can then be intercepted;
 - an SSH key from the Antigrafa machine in `/root/.ssh/authorized_keys` on every node.
 
 See the `[source.cluster1]` section of [antigrafa.example.toml](antigrafa.example.toml).
+
+Before the first snapshot, `backup` asks Proxmox for the token's effective rights
+(`/access/permissions`) on every selected guest, its node and its storages. If one is
+missing, nothing is done: the program lists every missing privilege and its path, and
+exits with code 3. `guests` does the same when it lists nothing, since Proxmox hides
+the guests a token cannot see.
 
 ## Installation
 
@@ -119,6 +137,58 @@ antigrafa list --target nas
 antigrafa verify --target nas             # re-read every chunk and check its digest
 antigrafa restore --target nas cluster1/vm/100/2026-11-17T22-30-00Z scsi0 /tmp/scsi0.raw
 ```
+
+Output, for every command (options go before the command name):
+
+| Option | Effect |
+|---|---|
+| `-q` | warnings and errors only (cron) |
+| *(none)* | main steps |
+| `-v` | details: SSH commands, API calls and their duration, disks found and how each one is read |
+| `-vv` | as `-v`, with milliseconds, thread (one per guest backed up in parallel) and module |
+| `--progress` / `--no-progress` | progress line for `backup`, `restore` and `verify`: percentage, amount, rate, ETA, and each disk being read with its guest id and its own percentage (`100/scsi0 63%`). Container archives (ZFS datasets) have no exact size: their percentage is estimated from the snapshot (`150/rootfs ~63%`) and stays below 100 % until the end. Shown by default on a terminal only, never with `-q` unless `--progress` |
+
+```sh
+antigrafa -v backup --all --target nas    # details, with the progress line
+antigrafa -q backup --all --target nas    # cron: silent unless something goes wrong
+```
+
+When several guests are backed up at once (`max_parallel_guests`), each disk being
+read gets its own bar, with its rate and ETA, above the overall line:
+
+```
+  100/scsi0   [############--------]  63%  12.6 GiB/20.0 GiB  140.2 MiB/s  ETA 54s
+  150/rootfs  [####----------------]~ 22%  1.2 GiB/~5.4 GiB  72.0 MiB/s  ETA 59s
+backup  [########------------]~ 54%  13.8 GiB/25.4 GiB  212.2 MiB/s  ETA 56s  1m 06s  0/3 guests
+```
+
+This needs a terminal that understands ANSI sequences (Linux, macOS, Windows 10 and
+later); otherwise, and when a single disk is being read, everything stays on one line.
+
+At the end, `backup` prints a report of where the time went: start and end, then
+for each guest its total, its phases and each disk (size, time, rate, chunks):
+
+```
+Backup report: 2026-11-19 22:30:00 -> 22:41:12 (11m 12s)
+
+OK     VM 100 (web)                    10m 02s  cluster1/vm/100/2026-11-19T22-30-00Z
+       waiting for host 0.0s, preparation 0.4s, snapshot 1.2s, transfer 9m 50s, snapshot removal 2.0s, flush 8.3s
+       scsi0          20.0 GiB    9m 48s    34.8 MiB/s  1200 new chunks, 3920 reused
+       efidisk0      528.0 KiB      0.1s     5.2 MiB/s  1 new chunks, 0 reused
+
+FAILED CT 150 (dns)                       6.8s  tar: read error
+       waiting for host 0.0s, preparation 0.3s, snapshot 0.5s, transfer 4.8s, snapshot removal 1.2s
+
+Total: 2 guest(s), 1 OK, 1 failed, in 11m 12s
+Read: 20.0 GiB, 30.5 MiB/s on average
+Longest: VM 100 (web) (10m 02s)
+New data: 4.7 GiB -> 2.1 GiB written (final zstd level 5, 6 parallel writes)
+```
+
+*Waiting for host*: time spent waiting for other guests on the same host
+(`max_parallel_per_host`). *Flush*: forcing the data onto the destination's disk,
+then writing the manifest. A failed guest shows the phases it reached. The report is
+printed even with `-q`.
 
 ## Repository format
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import errno
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,6 +28,8 @@ from .index import MANIFEST_NAME, read_manifest
 from .platforms.base import KINDS, check_name
 
 TS_FORMAT = "%Y-%m-%dT%H-%M-%SZ"
+
+log = logging.getLogger(__name__)
 
 
 class TargetUnavailable(Exception):
@@ -124,6 +127,7 @@ class Repository:
                     f"{self.cfg.name}: {self.root} is not on an NFS mount (type: {fstype})"
                 )
         self.store.init()
+        log.debug("target %s: %s (%s, sync=%s)", self.cfg.name, self.root, self.cfg.kind, self.cfg.sync)
 
     def sync(self) -> None:
         if self._flush_at_end:
