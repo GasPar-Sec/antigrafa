@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+
 # subprocess runs the system ssh client (argument lists, never a shell)
 import subprocess  # nosec B404
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import BinaryIO
+
+log = logging.getLogger(__name__)
 
 
 class RemoteCommandError(Exception):
@@ -72,7 +77,10 @@ class SSHHost:
 
     def run(self, command: str, timeout: float = 120.0) -> str:
         # Argument list without a shell: the remote command is a single ssh argument
+        log.debug("ssh %s@%s: %s", self.user, self.host, command)
+        t0 = time.monotonic()
         res = subprocess.run(self._argv(command), capture_output=True, timeout=timeout)  # nosec B603
+        log.debug("ssh %s: exit %d in %.2f s", self.host, res.returncode, time.monotonic() - t0)
         if res.returncode != 0:
             raise RemoteCommandError(self.host, command, res.returncode, res.stderr.decode(errors="replace"))
         return res.stdout.decode()
@@ -80,6 +88,7 @@ class SSHHost:
     def stream(self, command: str) -> RemoteStream:
         stderr_file = tempfile.TemporaryFile()
         argv = self._argv(command)
+        log.debug("ssh %s@%s (stream): %s", self.user, self.host, command)
         pipes = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": stderr_file}
         # Argument list without a shell, as in run()
         proc = subprocess.Popen(argv, bufsize=0, **pipes)  # nosec B603

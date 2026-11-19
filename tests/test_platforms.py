@@ -1,7 +1,7 @@
 import pytest
 
 from antigrafa import platforms
-from antigrafa.platforms.base import BackupPlan, DiskSource, Guest, Platform, check_name
+from antigrafa.platforms.base import AccessDenied, BackupPlan, DiskSource, Guest, Platform, check_name
 from antigrafa.platforms.proxmox import ProxmoxPlatform, ProxmoxSettings
 
 
@@ -78,6 +78,7 @@ def test_platform_defaults():
     assert platform.leftover_snapshots(guest, "antigrafa_") == []
     assert platform.host_iowait("h") is None  # cannot measure: no load throttling
     assert platform.plan_backup(guest, "s").disks == []
+    platform.check_access([guest])  # default: no rights to check
 
     disk = Disk()
     assert disk.format == "raw"
@@ -123,3 +124,77 @@ def test_proxmox_platform_passes_verify_tls_to_the_api(caplog):
     assert ProxmoxPlatform("lab", insecure).api._ctx.verify_mode == ssl.CERT_NONE
     secure = ProxmoxSettings(url="https://pve", token_id="a@pve!b", token_secret="s")
     assert ProxmoxPlatform("prod", secure).api._ctx.verify_mode == ssl.CERT_REQUIRED
+
+
+class PermAPI:
+    """Fake API with per-path privileges (every privilege everywhere by default)."""
+
+    ALL = {"VM.Audit", "VM.Snapshot", "Sys.Audit", "Datastore.Audit"}
+
+    def __init__(self, configs=None, denied=None):
+        self.configs = configs or {}
+        self.denied = denied or {}  # path -> privileges missing there
+        self.asked = []
+
+    def permissions(self, path):
+        self.asked.append(path)
+        return self.ALL - set(self.denied.get(path, ()))
+
+    def guest_config(self, g):
+        return self.configs[g.id]
+
+
+def _checked(api):
+    return ProxmoxPlatform("c1", ProxmoxSettings(url="https://pve", token_id="antigrafa@pve!backup"), api=api)
+
+
+VM = Guest("100", "vm", "web", "pve1")
+CT = Guest("200", "ct", "dns", "pve2")
+CONFIGS = {
+    "100": {"scsi0": "local-zfs:vm-100-disk-0", "scsi1": "ceph:vm-100-disk-1"},
+    "200": {"rootfs": "local-zfs:subvol-200-disk-0"},
+}
+
+
+def test_check_access_all_rights():
+    api = PermAPI(CONFIGS)
+    _checked(api).check_access([VM, CT])
+    assert api.asked == ["/vms/100", "/vms/200", "/nodes/pve1", "/nodes/pve2", "/storage/ceph", "/storage/local-zfs"]
+
+
+def test_check_access_lists_everything_missing():
+    api = PermAPI(CONFIGS, denied={"/vms/100": ["VM.Snapshot"], "/nodes/pve2": ["Sys.Audit"]})
+    with pytest.raises(AccessDenied) as err:
+        _checked(api).check_access([VM, CT])
+    text = str(err.value)
+    assert "API token antigrafa@pve!backup lacks permissions, nothing was done" in text
+    assert "  - VM.Snapshot on /vms/100 (VM 100 (web))" in text
+    assert "  - Sys.Audit on /nodes/pve2 (host load)" in text
+    assert "/vms/200" not in text  # that guest has every right
+    assert 'pveum role add AntigrafaBackup --privs "VM.Audit VM.Snapshot Sys.Audit Datastore.Audit"' in text
+    assert "--tokens 'antigrafa@pve!backup'" in text
+    # Configurations are not read without VM.Audit: storages checked only once that passed
+    assert not any(path.startswith("/storage") for path in api.asked)
+
+
+def test_check_access_storage_and_audit():
+    api = PermAPI(CONFIGS, denied={"/storage/ceph": ["Datastore.Audit"], "/vms/200": ["VM.Audit", "VM.Snapshot"]})
+    with pytest.raises(AccessDenied, match=r"VM.Audit, VM.Snapshot on /vms/200 \(CT 200 \(dns\)\)"):
+        _checked(api).check_access([VM, CT])
+    api = PermAPI(CONFIGS, denied={"/storage/ceph": ["Datastore.Audit"]})
+    with pytest.raises(AccessDenied, match=r"Datastore.Audit on /storage/ceph \(storage configuration\)"):
+        _checked(api).check_access([VM])
+
+
+def test_check_access_skips_unsupported_disks():
+    # A passthrough disk is that guest's own failure (with its reason), not a rights problem
+    api = PermAPI({"100": {"scsi0": "/dev/sdb"}, "200": CONFIGS["200"]})
+    _checked(api).check_access([VM, CT])
+    assert "/storage/local-zfs" in api.asked
+
+
+def test_check_access_without_guests_checks_listing():
+    api = PermAPI(denied={"/vms": ["VM.Audit"]})
+    with pytest.raises(AccessDenied, match=r"VM.Audit on /vms \(list the guests\)"):
+        _checked(api).check_access([])
+    _checked(PermAPI()).check_access([])  # rights, simply no guest

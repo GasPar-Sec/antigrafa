@@ -165,9 +165,36 @@ def test_delete_with_params_uses_query_string(server, api):
 
 
 def test_storage(server, api):
-    fake = server({"type": "zfspool", "pool": "rpool/data"})
+    # Read from the list: GET /storage/<id> would need Datastore.Allocate
+    fake = server([{"storage": "local", "type": "dir"}, {"storage": "local-zfs", "type": "zfspool", "pool": "rpool/data"}])
     assert api.storage("local-zfs")["type"] == "zfspool"
-    assert fake.requests[0].full_url.endswith("/storage/local-zfs")
+    assert fake.requests[0].full_url.endswith("/api2/json/storage")
+
+
+def test_storage_not_visible(server, api):
+    server([{"storage": "local", "type": "dir"}])
+    with pytest.raises(ProxmoxError, match="storage ceph: not found, or not visible to the token"):
+        api.storage("ceph")
+    server(None)
+    with pytest.raises(ProxmoxError, match="not found"):
+        api.storage("ceph")
+
+
+def test_permissions(server, api):
+    fake = server({"/vms/100": {"VM.Audit": 1, "VM.Snapshot": 0}})
+    assert api.permissions("/vms/100") == {"VM.Audit", "VM.Snapshot"}
+    assert fake.requests[0].full_url.split("?")[0].endswith("/access/permissions")
+    assert _query(fake.requests[0]) == {"path": ["/vms/100"]}
+    server({})  # no right at all on that path
+    assert api.permissions("/vms/101") == set()
+    server(None)
+    assert api.permissions("/nodes/pve1") == set()
+
+
+def test_rejected_token_says_so(server, api):
+    server(urllib.error.HTTPError(URL, 401, "authentication failure", {}, io.BytesIO(b"")))
+    with pytest.raises(ProxmoxError, match="HTTP 401 .*API token rejected: check token_id and its secret"):
+        api.guests()
 
 
 def test_failed_task_raises(server, api):
@@ -193,3 +220,12 @@ def test_network_error(server, api):
     server(urllib.error.URLError("connection refused"))
     with pytest.raises(ProxmoxError, match="GET /version: connection refused"):
         api.get("/version")
+
+
+def test_api_calls_are_logged_at_debug(server, api, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="antigrafa.platforms.proxmox.api")
+    server({"wait": 0.1})
+    api.node_iowait("pve1")
+    assert "API GET /nodes/pve1/status:" in caplog.text and " ms" in caplog.text

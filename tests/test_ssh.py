@@ -111,3 +111,17 @@ def test_stream_runs_the_ssh_command(monkeypatch):
     with host.stream("dd if=/dev/zvol/x") as s:
         assert s.host == "pve1" and s.command == "dd if=/dev/zvol/x"
         assert s.stdout.read() == b"chunk"
+
+
+def test_run_logs_command_at_debug(monkeypatch, caplog):
+    import logging
+
+    from antigrafa import ssh
+
+    caplog.set_level(logging.DEBUG, logger="antigrafa.ssh")
+    monkeypatch.setattr(
+        ssh.subprocess, "run", lambda argv, capture_output, timeout: subprocess.CompletedProcess(argv, 0, b"", b"")
+    )
+    SSHHost("pve1", user="backup").run("zfs list")
+    assert "ssh backup@pve1: zfs list" in caplog.text
+    assert "ssh pve1: exit 0 in" in caplog.text

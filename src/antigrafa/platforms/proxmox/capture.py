@@ -14,6 +14,7 @@ Supported storages:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shlex
 from abc import abstractmethod
@@ -21,6 +22,8 @@ from dataclasses import dataclass, field
 
 from ...ssh import RemoteStream, SSHHost
 from ..base import DiskSource, PlatformError
+
+log = logging.getLogger(__name__)
 
 LOW_PRIORITY = "ionice -c 2 -n 7 nice -n 10 "
 
@@ -167,6 +170,16 @@ class ZfsDatasetSource(VolumeSource):
 
     def size(self) -> None:
         return None
+
+    def estimated_size(self) -> int | None:
+        # Data held by the snapshot, uncompressed: the tar archive is about that size
+        # (plus headers). Progress only: a failure must not stop the backup.
+        snapshot = shlex.quote(f"{self.dataset}@{self.snapname}")
+        try:
+            return int(self.ssh.run(f"zfs get -Hp -o value logicalreferenced {snapshot}").strip())
+        except Exception as exc:
+            log.debug("%s: no size estimate (%s)", self.disk.key, exc)
+            return None
 
     def stream_command(self) -> str:
         if not self.snapdir:

@@ -26,11 +26,17 @@ from pathlib import Path
 
 from ...config import ConfigError, build_section
 from ...ssh import SSHHost
-from ..base import BackupPlan, Guest, Platform
+from ..base import AccessDenied, BackupPlan, Guest, Platform, PlatformError
 from .api import PVE_TYPES, ProxmoxAPI, ProxmoxError
 from .capture import UnsupportedStorage, guest_disks, make_source
 
 __all__ = ["ProxmoxAPI", "ProxmoxError", "ProxmoxPlatform", "ProxmoxSettings", "UnsupportedStorage"]
+
+# Privileges needed by a backup, and why (what fails without them)
+GUEST_PRIVS = ("VM.Audit", "VM.Snapshot")  # /vms/<id>: read the configuration, snapshot
+HOST_PRIVS = ("Sys.Audit",)  # /nodes/<node>: host load (iowait), to throttle reads
+STORAGE_PRIVS = ("Datastore.Audit",)  # /storage/<id>: how to read the disks
+ROLE_PRIVS = " ".join(GUEST_PRIVS + HOST_PRIVS + STORAGE_PRIVS)
 
 
 @dataclass
@@ -131,6 +137,43 @@ class ProxmoxPlatform(Platform):
 
     def delete_snapshot(self, guest: Guest, snapshot: str) -> None:
         self.api.delete_snapshot(guest, snapshot)
+
+    def check_access(self, guests: list[Guest]) -> None:
+        missing: list[str] = []
+
+        def need(path: str, privs: tuple[str, ...], why: str) -> None:
+            have = self.api.permissions(path)  # one API call per path
+            lacking = [p for p in privs if p not in have]
+            if lacking:
+                missing.append(f"{', '.join(lacking)} on {path} ({why})")
+
+        if not guests:
+            # The guest list silently hides what the token cannot see: an empty list
+            # may just mean "no right at all"
+            need("/vms", ("VM.Audit",), "list the guests")
+        for g in guests:
+            need(f"/vms/{g.id}", GUEST_PRIVS, g.label)
+        for host in sorted({g.host for g in guests}):
+            need(f"/nodes/{host}", HOST_PRIVS, "host load")
+        if not missing:  # the configurations can be read: check their storages
+            storages = set()
+            for g in guests:
+                try:
+                    storages.update(d.storage for d in guest_disks(PVE_TYPES[g.kind], self.api.guest_config(g)))
+                except PlatformError:
+                    continue  # unsupported disk: that guest fails on its own, with its reason
+            for storage in sorted(storages):
+                need(f"/storage/{storage}", STORAGE_PRIVS, "storage configuration")
+        if missing:
+            token = self.settings.token_id
+            raise AccessDenied(
+                f"API token {token} lacks permissions, nothing was done:\n"
+                + "".join(f"  - {m}\n" for m in missing)
+                + "Grant them on the cluster, for example:\n"
+                f'  pveum role add AntigrafaBackup --privs "{ROLE_PRIVS}"\n'
+                f"  pveum acl modify / --roles AntigrafaBackup --tokens '{token}'\n"
+                "With privilege separation, the token's user needs them too."
+            )
 
     def leftover_snapshots(self, guest: Guest, prefix: str) -> list[str]:
         return [s["name"] for s in self.api.list_snapshots(guest) if s.get("name", "").startswith(prefix)]

@@ -67,12 +67,17 @@ class ProxmoxAPI:
         req.add_header("Authorization", self._auth)
         if body is not None:
             req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        t0 = time.monotonic()
         try:
             # Scheme checked in __init__: always https:// (see above)
             with urllib.request.urlopen(req, timeout=self.timeout, context=self._ctx) as resp:  # nosec B310
-                return json.load(resp).get("data")
+                data = json.load(resp).get("data")
+            log.debug("API %s %s: %.0f ms", method, path, (time.monotonic() - t0) * 1000)
+            return data
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace").strip()
+            if exc.code == 401:
+                detail += " (API token rejected: check token_id and its secret)"
             raise ProxmoxError(f"{method} {path}: HTTP {exc.code} {exc.reason} {detail}") from None
         except urllib.error.URLError as exc:
             raise ProxmoxError(f"{method} {path}: {exc.reason}") from None
@@ -129,7 +134,19 @@ class ProxmoxAPI:
     # --- Storage and nodes -------------------------------------------------
 
     def storage(self, storage_id: str) -> dict:
-        return self.get(f"/storage/{urllib.parse.quote(storage_id)}")
+        # The list, not GET /storage/<id>: that one requires Datastore.Allocate (the
+        # right to change storages), the list only Datastore.Audit (read-only).
+        for entry in self.get("/storage") or []:
+            if entry.get("storage") == storage_id:
+                return entry
+        raise ProxmoxError(f"storage {storage_id}: not found, or not visible to the token (Datastore.Audit)")
+
+    # --- Permissions -------------------------------------------------------
+
+    def permissions(self, path: str) -> set[str]:
+        """Privileges the token has on ``path``, inheritance and privilege separation included."""
+        data = self.get("/access/permissions", {"path": path}) or {}
+        return set(data.get(path) or {})
 
     def node_iowait(self, node: str) -> float:
         """Fraction of CPU time spent waiting on disks (0.0 to 1.0)."""

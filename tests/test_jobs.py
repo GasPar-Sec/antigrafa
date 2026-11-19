@@ -5,7 +5,7 @@ import pytest
 
 from antigrafa.config import Tuning
 from antigrafa.index import read_index, read_manifest
-from antigrafa.jobs import BackupRunner
+from antigrafa.jobs import PHASES, BackupRunner
 from antigrafa.pipeline import restore_stream
 from antigrafa.platforms.base import BackupPlan, DiskSource, Guest, Platform
 from antigrafa.platforms.proxmox import ProxmoxPlatform, ProxmoxSettings
@@ -339,3 +339,146 @@ def test_host_load_drives_the_throttle(repo):
     finally:
         runner.close()
         quiet.close()
+
+
+def test_backup_progress_and_debug_details(repo, caplog):
+    import io as _io
+    import logging
+
+    from antigrafa.progress import Progress
+
+    caplog.set_level(logging.DEBUG)
+    a = MemoryDisk("disk0", os.urandom(DISK_SIZE))
+    b = MemoryDisk("root", os.urandom(3000), size_known=False)
+    guests = [Guest("1", "vm", "web", "h1"), Guest("2", "ct", "dns", "h2")]
+    platform = MemoryPlatform(guests, {"1": [a], "2": [b]})
+    progress = Progress(label="backup", enabled=True, stream=_io.StringIO(), interval=0)
+    runner = BackupRunner(Tuning(chunk_size_mib=1), platform, repo, progress=progress)
+    try:
+        results = runner.run(guests)
+    finally:
+        runner.close()
+    assert all(r.ok for r in results)
+    # Every byte read is counted; only the disk of known size is in the total
+    assert progress.done == DISK_SIZE + 3000
+    assert progress.total == progress.done_known == DISK_SIZE
+    assert progress.unknown_open == 0
+    assert progress.status == "2/2 guests"
+    assert "0/2 guests" in progress.stream.getvalue()
+    # -v details
+    assert "disk0: memory:disk0, read by MemoryDisk (raw)" in caplog.text
+    assert "root: size unknown (archive)" in caplog.text
+    assert f"disk0: size {DISK_SIZE} bytes" in caplog.text
+    assert "destination flushed in" in caplog.text
+
+
+def test_progress_lists_the_disk_being_read_with_the_guest_id(repo):
+    import io as _io
+
+    from antigrafa.progress import Progress
+
+    seen = []
+
+    class Watched(MemoryDisk):
+        def open_stream(self):
+            seen.append([t.name for t in progress.running])  # while this disk is read
+            return super().open_stream()
+
+    guest = Guest("vm-42", "vm", "web", "esx1")
+    platform = MemoryPlatform([guest], {"vm-42": [Watched("disk0", b"a" * 5000), Watched("disk1", b"b" * 3000)]})
+    progress = Progress(label="backup", enabled=True, stream=_io.StringIO(), interval=0)
+    runner = BackupRunner(Tuning(chunk_size_mib=1), platform, repo, progress=progress)
+    try:
+        [result] = runner.run([guest])
+    finally:
+        runner.close()
+    assert result.ok
+    assert seen == [["vm-42/disk0"], ["vm-42/disk1"]]  # one disk after the other
+    assert progress.running == []  # all finished
+    assert "vm-42/disk0 100%" in progress.stream.getvalue()
+
+
+def test_every_phase_is_timed(repo):
+    guest = Guest("1", "vm", "web", "h1")
+    platform = MemoryPlatform([guest], {"1": [MemoryDisk("disk0", b"a" * 5000), MemoryDisk("disk1", b"b" * 3000)]})
+    [result] = _run(platform, repo, [guest])
+    assert result.ok
+    assert list(result.timings) == list(PHASES)  # in the order they ran
+    assert all(t >= 0 for t in result.timings.values())
+    assert sum(result.timings.values()) <= result.duration
+    assert [d.key for d in result.disks] == ["disk0", "disk1"]
+
+
+def test_failed_backup_keeps_the_timings_of_the_phases_reached(repo):
+    guest = Guest("1", "vm", "web", "h1")
+
+    class Broken(MemoryDisk):
+        def open_stream(self):
+            raise RuntimeError("dd: read error")
+
+    platform = MemoryPlatform([guest], {"1": [Broken("disk0", b"x" * 1000)]})
+    [result] = _run(platform, repo, [guest])
+    assert not result.ok
+    # Transfer failed, the snapshot was still removed, nothing flushed
+    assert list(result.timings) == ["wait", "prepare", "snapshot", "transfer", "cleanup"]
+
+    empty = MemoryPlatform([guest], {"1": []})
+    [result] = _run(empty, repo, [guest])
+    assert list(result.timings) == ["wait", "prepare"]  # failed before any snapshot
+
+
+def test_waiting_for_the_host_is_timed_and_the_slot_released(repo):
+    import threading
+
+    release = threading.Event()
+
+    class Slow(MemoryDisk):
+        def open_stream(self):
+            release.wait(5)
+            return super().open_stream()
+
+    guests = [Guest("1", "vm", "a", "h1"), Guest("2", "vm", "b", "h1")]  # same host
+    platform = MemoryPlatform(guests, {"1": [Slow("disk0", b"a" * 100)], "2": [Slow("disk0", b"b" * 100)]})
+    timer = threading.Timer(0.3, release.set)
+    timer.start()
+    results = _run(platform, repo, guests, max_parallel_guests=2, max_parallel_per_host=1)
+    timer.join()
+    assert all(r.ok for r in results)
+    # One guest per host at a time: the second waited for the first
+    assert max(r.timings["wait"] for r in results) >= 0.2
+
+
+def test_archive_estimate_drives_the_progress(repo):
+    import io as _io
+
+    from antigrafa.progress import Progress
+
+    class Archive(MemoryDisk):
+        format = "tar"
+
+        def estimated_size(self):
+            return 4000  # the real archive is 5000 bytes
+
+    seen = []
+
+    class Watched(Archive):
+        def open_stream(self):
+            [task] = progress.running
+            seen.append((task.total, task.approximate))
+            return super().open_stream()
+
+    guest = Guest("150", "ct", "dns", "pve1")
+    platform = MemoryPlatform([guest], {"150": [Watched("rootfs", b"t" * 5000, size_known=False)]})
+    progress = Progress(label="backup", enabled=True, stream=_io.StringIO(), interval=0)
+    runner = BackupRunner(Tuning(chunk_size_mib=1), platform, repo, progress=progress)
+    try:
+        [result] = runner.run([guest])
+    finally:
+        runner.close()
+    assert result.ok
+    assert seen == [(4000, True)]  # estimated while reading
+    assert progress.total == progress.done == 5000  # corrected to the real size at the end
+    assert "150/rootfs ~99%" in progress.stream.getvalue()
+    # The estimate never replaces the exact size check: the manifest has the real size
+    [(path, manifest)] = repo.list_snapshots()
+    assert manifest["disks"][0]["size"] == 5000
