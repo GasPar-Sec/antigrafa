@@ -23,8 +23,8 @@ from pathlib import Path
 from . import __version__
 from .adaptive import MiB, SourceThrottle, WriteController, WriteTuning
 from .config import Tuning
-from .index import write_index, write_manifest
-from .pipeline import StreamStats, backup_stream
+from .index import IndexCorrupted, read_index, read_manifest, write_index, write_manifest
+from .pipeline import StreamStats, backup_delta, backup_stream
 from .platforms.base import DiskSource, Guest, Platform
 from .progress import Progress
 from .targets import Repository
@@ -215,16 +215,24 @@ class BackupRunner:
                 name=f"{g.id}/{src.key}",
                 approximate=size is None,
             )
-            with task, src.open_stream() as stream:
-                digests, stats = backup_stream(
-                    stream.stdout,
-                    self.repo.store,
-                    self.controller,
-                    self._writers,
-                    self._throttle(g.host),
-                    self.chunk_size,
-                    on_read=task.advance,
-                )
+            reference = self._reference(g, src)
+            with task:
+                hashed = src.open_hashed_stream(reference, self.chunk_size) if reference else None
+                if hashed is not None:
+                    log.debug("%s: %s: hashed on the source, %d chunks of reference", g.label, src.key, len(reference))
+                else:
+                    log.debug("%s: %s: every chunk sent", g.label, src.key)
+                with hashed or src.open_stream() as stream:
+                    store, throttle = self.repo.store, self._throttle(g.host)
+                    if hashed is not None:
+                        digests, stats = backup_delta(
+                            stream.stdout, reference, store, self.controller, self._writers, throttle, task.advance
+                        )
+                    else:
+                        digests, stats = backup_stream(
+                            stream.stdout, store, self.controller, self._writers, throttle, self.chunk_size,
+                            on_read=task.advance,
+                        )
         finally:
             try:
                 src.cleanup()
@@ -238,10 +246,27 @@ class BackupRunner:
         write_index(dest / f"{src.key}.{ext}.fidx", size, self.chunk_size, digests)
         rate = stats.bytes_read / MiB / stats.elapsed if stats.elapsed else 0.0
         log.info(
-            "%s: %s: %.0f MiB in %.0f s (%.0f MiB/s), %d new chunks, %d reused",
+            "%s: %s: %.0f MiB in %.0f s (%.0f MiB/s), %d new chunks, %d reused, %.0f MiB sent",
             g.label, src.key, size / MiB, stats.elapsed, rate, stats.new_chunks, stats.reused_chunks,
+            stats.sent_bytes / MiB,
         )
         return DiskResult(key=src.key, volume=src.volume, format=src.format, size=size, stats=stats)
+
+    def _reference(self, g: Guest, src: DiskSource) -> list[bytes]:
+        """Digests of the same disk in the previous complete backup ([]: none usable)."""
+        previous = self.repo.latest_backup(self.platform.name, g.kind, g.id)
+        if previous is None:
+            return []
+        try:
+            disks = read_manifest(previous)["disks"]
+            entry = next((d for d in disks if d["key"] == src.key and d["format"] == src.format), None)
+            if entry is None:
+                return []
+            _, chunk_size, digests = read_index(previous / entry["index"])
+        except (OSError, ValueError, KeyError, TypeError, IndexCorrupted) as exc:
+            log.warning("%s: %s: previous backup unreadable (%s): every chunk sent", g.label, src.key, exc)
+            return []
+        return digests if chunk_size == self.chunk_size else []
 
     def _delete_snapshot(self, g: Guest, snapname: str) -> None:
         try:

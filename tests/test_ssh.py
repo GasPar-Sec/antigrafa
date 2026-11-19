@@ -125,3 +125,53 @@ def test_run_logs_command_at_debug(monkeypatch, caplog):
     SSHHost("pve1", user="backup").run("zfs list")
     assert "ssh backup@pve1: zfs list" in caplog.text
     assert "ssh pve1: exit 0 in" in caplog.text
+
+
+def test_stream_sends_input_first(monkeypatch):
+    # A local python in place of ssh: the same on every platform
+    echo = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read()[::-1])"]
+    monkeypatch.setattr(SSHHost, "_argv", lambda self, command: echo)
+    with SSHHost("pve1").stream("reverse", input=b"abc" * 100000) as s:
+        assert s.stdout.read() == (b"abc" * 100000)[::-1]
+
+
+def test_send_writes_everything_even_in_small_pieces():
+    from antigrafa.ssh import _send
+
+    class Slow:
+        def __init__(self):
+            self.data, self.closed = b"", False
+
+        def write(self, view):
+            self.data += bytes(view[:3])
+            return min(3, len(view))
+
+        def close(self):
+            self.closed = True
+
+    pipe = Slow()
+    _send(pipe, b"0123456789")
+    assert pipe.data == b"0123456789" and pipe.closed
+
+
+def test_send_to_a_command_that_already_ended():
+    from antigrafa.ssh import _send
+
+    class Gone:
+        def write(self, view):
+            raise BrokenPipeError
+
+        def close(self):
+            raise BrokenPipeError
+
+    _send(Gone(), b"data")  # no error here: the exit status of the command reports it
+
+
+def test_long_commands_are_shortened_in_messages():
+    from antigrafa.ssh import _short
+
+    assert _short("zfs list") == "zfs list"
+    long = "python3 -c '" + "x" * 1000 + "'"
+    assert _short(long).endswith(f"... ({len(long)} characters)") and len(_short(long)) < 340
+    err = RemoteCommandError("pve1", long, 1, "boom")
+    assert len(str(err)) < 400 and "boom" in str(err)

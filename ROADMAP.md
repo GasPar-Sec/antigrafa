@@ -40,7 +40,11 @@ of different sizes never deduplicate against each other.
 
 ## Features
 
-- [ ] Native incrementals (`zfs send -i`, `rbd export-diff`) to read only changed blocks
+- [x] Chunks hashed on the source host (`remote_hash`): only changed chunks cross the network
+- [ ] Native incrementals (`zfs send -i`, `rbd export-diff`) to also *read* only changed blocks
+- [ ] Repair: `verify` removes a damaged chunk and the next backup sends it again (with
+      `remote_hash`, a chunk unchanged on the source is never sent again, so a chunk
+      damaged at the destination stays damaged until then)
 - [ ] Retention (prune) and garbage collection of orphaned chunks
 - [ ] Content-defined chunking (CDC) for container tar archives
 - [ ] qcow2 (through `qemu-nbd` on the snapshot)

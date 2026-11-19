@@ -160,3 +160,34 @@ def test_dataset_size_estimate_failure_is_harmless():
 def test_block_devices_need_no_estimate():
     src = RbdSource(FakeSSH(), {"type": "rbd"}, Disk("scsi0", "ceph:vm-1-disk-0"), "s")
     assert src.estimated_size() is None  # exact size known: default of DiskSource
+
+
+class StreamingSSH(FakeSSH):
+    def stream(self, cmd, input=None):
+        self.streamed = (cmd, input)
+        return "stream"
+
+
+def test_hashed_stream_pipes_the_read_through_the_script():
+    import shlex
+
+    from antigrafa import delta
+
+    ssh = StreamingSSH()
+    zfs = {"type": "zfspool", "pool": "rpool/data"}
+    src = make_source(ssh, zfs, Disk("scsi0", "local-zfs:vm-100-disk-0"), "snap1", remote_hash=True)
+    reference = [b"a" * 32, b"b" * 32]
+    assert src.open_hashed_stream(reference, 4096) == "stream"
+    cmd, sent = ssh.streamed
+    assert sent == delta.encode_reference(reference)
+    argv = shlex.split(cmd)
+    # Same priority as a plain read, for the script and the read it runs
+    assert argv[:7] == ["ionice", "-c", "2", "-n", "7", "nice", "-n"]
+    assert "python3" in argv and argv[-2] == "4096"
+    assert argv[-1] == src.stream_command()
+
+
+def test_hashed_stream_disabled():
+    ssh = StreamingSSH()
+    src = make_source(ssh, {"type": "rbd", "pool": "vms"}, Disk("scsi0", "ceph:vm-1-disk-0"), "s")
+    assert src.open_hashed_stream([b"a" * 32], 4096) is None  # remote_hash off by default here

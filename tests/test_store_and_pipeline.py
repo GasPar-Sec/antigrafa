@@ -7,7 +7,7 @@ import pytest
 from antigrafa.adaptive import WriteController, WriteTuning
 from antigrafa.chunkstore import ChunkCorrupted, ChunkStore, decode_chunk, encode_chunk
 from antigrafa.index import read_index, write_index
-from antigrafa.pipeline import backup_stream, read_full, restore_stream
+from antigrafa.pipeline import backup_delta, backup_stream, read_full, restore_stream
 
 CHUNK = 64 * 1024
 
@@ -223,3 +223,39 @@ def test_read_index_rejects_damaged_files(tmp_path, raw, message):
 def test_write_index_rejects_bad_digests(tmp_path):
     with pytest.raises(ValueError, match="invalid digest size"):
         write_index(tmp_path / "x.fidx", 10, CHUNK, [b"short"])
+
+
+def test_delta_backup_sends_and_stores_only_changes(store, tmp_path):
+    from antigrafa.delta import MAGIC
+
+    old = os.urandom(CHUNK * 4)
+    ctl = WriteController(WriteTuning(max_concurrency=4))
+    with ThreadPoolExecutor(4) as pool:
+        reference, first = backup_stream(io.BytesIO(old), store, ctl, pool, chunk_size=CHUNK)
+        assert first.sent_bytes == len(old) and first.unchanged_chunks == 0
+
+        new = old[: 2 * CHUNK] + os.urandom(CHUNK) + old[3 * CHUNK :]
+        changed = new[2 * CHUNK : 3 * CHUNK]
+        from antigrafa.chunkstore import digest_of
+
+        wire = io.BytesIO(
+            MAGIC
+            + b"S" + CHUNK.to_bytes(4, "big")
+            + b"S" + CHUNK.to_bytes(4, "big")
+            + b"D" + digest_of(changed) + CHUNK.to_bytes(4, "big") + changed
+            + b"S" + CHUNK.to_bytes(4, "big")
+            + b"E"
+        )
+        seen = []
+        digests, stats = backup_delta(wire, reference, store, ctl, pool, on_read=seen.append)
+    assert ctl.limiter.active == 0
+    assert stats.bytes_read == len(new) and seen == [CHUNK] * 4
+    assert stats.unchanged_chunks == 3 and stats.reused_chunks == 3
+    assert stats.new_chunks == 1 and stats.sent_bytes == CHUNK
+    assert digests[:2] == reference[:2] and digests[3] == reference[3]
+
+    # A full image, as if every chunk had been read
+    out = tmp_path / "restored.img"
+    with open(out, "wb") as f:
+        restore_stream(store, digests, f, len(new))
+    assert out.read_bytes() == new

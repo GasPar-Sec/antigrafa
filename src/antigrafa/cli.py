@@ -123,7 +123,7 @@ def _backup_report(results, started: datetime, elapsed: float) -> None:
             rate = f"{_human(d.size / s.elapsed)}/s" if s.elapsed else "-"
             print(
                 f"       {d.key:<12} {_human(d.size):>10}  {_secs(s.elapsed):>8}  {rate:>12}  "
-                f"{s.new_chunks} new chunks, {s.reused_chunks} reused"
+                f"{s.new_chunks} new chunks, {s.reused_chunks} reused, {_human(s.sent_bytes)} sent"
             )
 
     ok = sum(1 for r in results if r.ok)
@@ -134,6 +134,8 @@ def _backup_report(results, started: datetime, elapsed: float) -> None:
     read = sum(d.size for r in results for d in r.disks)
     if read and elapsed:
         print(f"Read: {_human(read)}, {_human(read / elapsed)}/s on average")
+        sent = sum(d.stats.sent_bytes for r in results for d in r.disks)
+        print(f"Sent over the network: {_human(sent)} ({sent / read:.0%} of what was read)")
     if len(results) > 1:
         longest = max(results, key=lambda r: r.duration)
         print(f"Longest: {longest.guest.label} ({_secs(longest.duration)})")

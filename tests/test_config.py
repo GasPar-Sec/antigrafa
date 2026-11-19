@@ -162,3 +162,11 @@ def test_source_selection():
         both.source(None)
     with pytest.raises(ConfigError, match="unknown source: c"):
         both.source("c")
+
+
+def test_remote_hash_setting(tmp_path):
+    assert load_config(_write(tmp_path, MINIMAL + PROXMOX)).source("pve").settings.remote_hash is True
+    text = MINIMAL + PROXMOX + "remote_hash = false\n"
+    assert load_config(_write(tmp_path, text)).source("pve").settings.remote_hash is False
+    with pytest.raises(ConfigError, match="remote_hash must be true or false"):
+        load_config(_write(tmp_path, MINIMAL + PROXMOX + "remote_hash = 'yes'\n"))

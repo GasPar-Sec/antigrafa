@@ -482,3 +482,104 @@ def test_archive_estimate_drives_the_progress(repo):
     # The estimate never replaces the exact size check: the manifest has the real size
     [(path, manifest)] = repo.list_snapshots()
     assert manifest["disks"][0]["size"] == 5000
+
+
+
+# --------------------------------------------------------------------------- hashed on the source
+
+
+class HashedDisk(MemoryDisk):
+    """Hashed "on the source" by the real remote script, run in-process."""
+
+    def __init__(self, key, data, **kwargs):
+        super().__init__(key, data, **kwargs)
+        self.references = []
+
+    def open_hashed_stream(self, reference, chunk_size):
+        from antigrafa import delta
+
+        self.references.append(list(reference))
+        namespace = {"__name__": "remote"}
+        exec(compile(delta.REMOTE_SCRIPT, "remote", "exec"), namespace)  # noqa: S102 - our own script
+        out = io.BytesIO()
+        namespace["relay"](io.BytesIO(self.data), io.BytesIO(delta.encode_reference(reference)), out, chunk_size)
+        return FakeStream(out.getvalue())
+
+
+def test_second_backup_sends_only_what_changed(repo, tmp_path):
+    guest = Guest("1", "vm", "web", "h1")
+    data = os.urandom(DISK_SIZE)
+    disk = HashedDisk("disk0", data)
+    platform = MemoryPlatform([guest], {"1": [disk]})
+
+    [first] = _run(platform, repo, [guest])
+    assert first.ok and disk.references == []  # nothing to compare with: plain read
+    assert first.disks[0].stats.sent_bytes == DISK_SIZE
+
+    changed = bytearray(data)
+    changed[1024 * 1024 + 10] ^= 0xFF  # one byte in the second 1 MiB chunk
+    disk.data = bytes(changed)
+    import time as _time
+
+    _time.sleep(1.1)  # backups are named by the second
+    [second] = _run(platform, repo, [guest])
+    assert second.ok, second.error
+    stats = second.disks[0].stats
+    assert len(disk.references) == 1 and len(disk.references[0]) == 4  # previous index: 4 chunks
+    assert stats.unchanged_chunks == 3 and stats.new_chunks == 1
+    assert stats.sent_bytes == 1024 * 1024
+    assert stats.bytes_read == DISK_SIZE
+
+    # The new backup is a complete image
+    path, manifest = repo.list_snapshots()[-1]
+    entry = manifest["disks"][0]
+    assert entry["stats"]["unchanged_chunks"] == 3
+    size, _, digests = read_index(repo.resolve(path) / entry["index"])
+    out = tmp_path / "restored.img"
+    with open(out, "wb") as f:
+        restore_stream(repo.store, digests, f, size)
+    assert out.read_bytes() == disk.data
+
+
+def _backup_once(repo, guest, disk, chunk_mib=1):
+    platform = MemoryPlatform([guest], {guest.id: [disk]})
+    [result] = _run(platform, repo, [guest], **({"chunk_size_mib": chunk_mib} if chunk_mib != 1 else {}))
+    return result
+
+
+def test_no_usable_reference_means_a_plain_read(repo, caplog):
+    guest = Guest("1", "vm", "web", "h1")
+    runner = BackupRunner(Tuning(chunk_size_mib=1), MemoryPlatform([guest], {}), repo)
+    try:
+        disk = HashedDisk("disk0", b"x" * 1000)
+        assert runner._reference(guest, disk) == []  # never backed up
+
+        assert _backup_once(repo, guest, HashedDisk("disk0", b"x" * 1000)).ok
+        assert len(runner._reference(guest, disk)) == 1
+        assert runner._reference(guest, HashedDisk("other", b"")) == []  # another disk
+        archive = HashedDisk("disk0", b"")
+        archive.format = "tar"
+        assert runner._reference(guest, archive) == []  # same name, other format
+
+        bigger = BackupRunner(Tuning(chunk_size_mib=2), MemoryPlatform([guest], {}), repo)
+        try:
+            assert bigger._reference(guest, disk) == []  # other chunk size: positions differ
+        finally:
+            bigger.close()
+
+        [(path, manifest)] = repo.list_snapshots()
+        (repo.resolve(path) / manifest["disks"][0]["index"]).write_bytes(b"garbage")
+        assert runner._reference(guest, disk) == []
+        assert "previous backup unreadable" in caplog.text
+    finally:
+        runner.close()
+
+
+def test_source_without_hashing_falls_back_to_a_plain_read(repo):
+    guest = Guest("1", "vm", "web", "h1")
+    assert _backup_once(repo, guest, MemoryDisk("disk0", b"y" * 5000)).ok
+    import time as _time
+
+    _time.sleep(1.1)
+    result = _backup_once(repo, guest, MemoryDisk("disk0", b"y" * 5000))  # open_hashed_stream: None
+    assert result.ok and result.disks[0].stats.sent_bytes == 5000

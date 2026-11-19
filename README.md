@@ -41,7 +41,8 @@ read the disks: see [Adding a platform](#adding-a-platform).
    guest. The guest resumes right away.
 2. **Transfer**: Antigrafa reads the snapshot (over SSH for Proxmox VE: `dd`,
    `rbd export` or `tar`, depending on the storage). If the destination slows down,
-   only the backup slows down: the guest is never in the loop.
+   only the backup slows down: the guest is never in the loop. Only what changed
+   crosses the network (see [Only changes are sent](#only-changes-are-sent)).
 3. **Cleanup**: the snapshot is deleted in every case, success or failure.
 
 The trade-off: the snapshot takes space on the source storage for as long as the
@@ -58,6 +59,31 @@ transfer lasts.
 
 The destination is shared: a single controller drives every concurrent backup that
 writes to it.
+
+## Only changes are sent
+
+For a slow link (a remote site over the internet) or a slow destination, the chunks
+are hashed on the source host, before anything is sent:
+
+1. Antigrafa sends the digests of the previous backup of the disk to a small Python
+   script run on the host (standard library only, nothing to install);
+2. the script reads the snapshot chunk by chunk and hashes each chunk;
+3. a chunk with the same digest as before at the same position is not sent: only a
+   5-byte "unchanged" record is. A changed chunk is sent with its digest, checked
+   again on arrival;
+4. Antigrafa writes a complete index: every backup is still a full image, restored
+   on its own.
+
+| | Without (`remote_hash = false`) | With (default) |
+|---|---|---|
+| Network | every chunk | changed chunks only |
+| Destination | lookup of every chunk, writes of new ones | writes of changed chunks only |
+| Source host | reads the snapshot | reads the snapshot and hashes it (CPU, at low priority) |
+
+The first backup of a disk sends everything. The report shows what was sent
+(`Sent over the network: 1.2 GiB (3% of what was read)`). On Proxmox VE, without
+`python3` on a node, its chunks are all sent (a warning says so). Container archives
+gain less: a file that changes size shifts everything after it in the archive.
 
 ## Proxmox VE
 

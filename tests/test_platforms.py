@@ -198,3 +198,52 @@ def test_check_access_without_guests_checks_listing():
     with pytest.raises(AccessDenied, match=r"VM.Audit on /vms \(list the guests\)"):
         _checked(api).check_access([])
     _checked(PermAPI()).check_access([])  # rights, simply no guest
+
+
+class PlanAPI:
+    def guest_config(self, g):
+        return {"scsi0": "local-zfs:vm-100-disk-0"}
+
+    def storage(self, sid):
+        return {"type": "zfspool", "pool": "rpool/data"}
+
+
+class PythonSSH:
+    def __init__(self, reply="/usr/bin/python3\n", error=None):
+        self.reply, self.error, self.calls = reply, error, 0
+
+    def run(self, cmd, timeout=120):
+        assert cmd == "command -v python3"
+        self.calls += 1
+        if self.error:
+            raise self.error
+        return self.reply
+
+
+def _planner(ssh, **settings):
+    s = ProxmoxSettings(url="https://pve", token_id="a@pve!b", **settings)
+    return ProxmoxPlatform("c1", s, api=PlanAPI(), ssh_for_host=lambda node: ssh)
+
+
+def test_remote_hash_when_python3_is_on_the_node():
+    ssh = PythonSSH()
+    platform = _planner(ssh)
+    for _ in range(3):
+        [disk] = platform.plan_backup(VM, "s").disks
+        assert disk.remote_hash is True
+    assert ssh.calls == 1  # checked once per node
+
+
+def test_no_python3_on_the_node_sends_everything(caplog):
+    from antigrafa.ssh import RemoteCommandError
+
+    for ssh in (PythonSSH(reply=""), PythonSSH(error=RemoteCommandError("pve1", "command -v python3", 1, ""))):
+        [disk] = _planner(ssh).plan_backup(VM, "s").disks
+        assert disk.remote_hash is False
+    assert "pve1: python3 not found" in caplog.text
+
+
+def test_remote_hash_turned_off():
+    ssh = PythonSSH()
+    [disk] = _planner(ssh, remote_hash=False).plan_backup(VM, "s").disks
+    assert disk.remote_hash is False and ssh.calls == 0

@@ -285,8 +285,9 @@ def test_backup_report_shows_every_duration(config, fake_runner, capsys):
     assert "Longest: VM 100 (web) (12s)" in out
 
 
-def _disk(key, size, elapsed, new=3, reused=1):
-    stats = StreamStats(bytes_read=size, new_chunks=new, reused_chunks=reused, elapsed=elapsed)
+def _disk(key, size, elapsed, new=3, reused=1, sent=None):
+    sent = size if sent is None else sent
+    stats = StreamStats(bytes_read=size, new_chunks=new, reused_chunks=reused, elapsed=elapsed, sent_bytes=sent)
     return jobs.DiskResult(key=key, volume=f"local:{key}", format="raw", size=size, stats=stats)
 
 
@@ -295,7 +296,7 @@ def test_backup_report_details(capsys):
         guest=Guest("100", "vm", "web", "pve1"),
         ok=True,
         snapshot="cluster1/vm/100/x",
-        disks=[_disk("scsi0", 20 * 1024**3, 90.0), _disk("efidisk0", 4096, 0.0)],
+        disks=[_disk("scsi0", 20 * 1024**3, 90.0, sent=1024**3), _disk("efidisk0", 4096, 0.0)],
         duration=125.0,
         timings={"wait": 0.0, "prepare": 0.4, "snapshot": 1.2, "transfer": 120.0, "cleanup": 2.0, "flush": 1.4},
     )
@@ -316,7 +317,8 @@ def test_backup_report_details(capsys):
         "waiting for host 0.0s, preparation 0.4s, snapshot 1.2s, transfer 2m 00s, snapshot removal 2.0s, flush 1.4s"
     ) in out
     assert "scsi0" in out and "20.0 GiB" in out and "1m 30s" in out and "227.6 MiB/s" in out
-    assert "3 new chunks, 1 reused" in out
+    assert "3 new chunks, 1 reused, 1.0 GiB sent" in out
+    assert "Sent over the network: 1.0 GiB (5% of what was read)" in out
     efi = next(line for line in out.splitlines() if "efidisk0" in line)
     assert " - " in efi  # too fast to measure a rate
     assert "FAILED CT 150 (dns)" in out and "tar: read error" in out

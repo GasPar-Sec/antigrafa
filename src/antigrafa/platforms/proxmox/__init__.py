@@ -9,6 +9,7 @@ Configuration (``[source.<name>]`` with ``type = "proxmox"``)::
     token_secret_file = "/etc/antigrafa/token"
     ca_file = "/etc/antigrafa/pve-root-ca.pem"
     # verify_tls = false                  # labs only: do not verify the certificate
+    # remote_hash = false                 # send every chunk (default: only changed ones)
 
     [source.cluster1.ssh]                 # how to reach the nodes
     user = "root"
@@ -20,6 +21,7 @@ Configuration (``[source.<name>]`` with ``type = "proxmox"``)::
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +31,8 @@ from ...ssh import SSHHost
 from ..base import AccessDenied, BackupPlan, Guest, Platform, PlatformError
 from .api import PVE_TYPES, ProxmoxAPI, ProxmoxError
 from .capture import UnsupportedStorage, guest_disks, make_source
+
+log = logging.getLogger(__name__)
 
 __all__ = ["ProxmoxAPI", "ProxmoxError", "ProxmoxPlatform", "ProxmoxSettings", "UnsupportedStorage"]
 
@@ -61,6 +65,9 @@ class ProxmoxSettings:
     ca_file: str | None = None
     # false: do not verify the API certificate (labs only, the token can be intercepted)
     verify_tls: bool = True
+    # Hash the chunks on the node (python3): only the chunks that changed since the
+    # previous backup cross the network. Costs CPU on the node, at low priority.
+    remote_hash: bool = True
     ssh: SSHConfig = field(default_factory=SSHConfig)
     nodes: dict[str, NodeConfig] = field(default_factory=dict)
     section: str = "source"  # for error messages
@@ -78,9 +85,10 @@ class ProxmoxSettings:
 
 def parse_settings(name: str, data: dict) -> ProxmoxSettings:
     section = f"source.{name}"
+    for flag in ("verify_tls", "remote_hash"):
+        if not isinstance(data.get(flag, True), bool):
+            raise ConfigError(f"[{section}]: {flag} must be true or false")
     verify = data.get("verify_tls", True)
-    if not isinstance(verify, bool):
-        raise ConfigError(f"[{section}]: verify_tls must be true or false")
     if not verify and data.get("ca_file"):
         # Contradictory: a CA to verify against, and no verification
         raise ConfigError(f"[{section}]: ca_file and verify_tls = false cannot be used together")
@@ -115,6 +123,7 @@ class ProxmoxPlatform(Platform):
             )
         self.api = api
         self.ssh_for_host = ssh_for_host or self._ssh
+        self._python3: dict[str, bool] = {}  # node -> python3 available (remote hashing)
 
     def _ssh(self, node: str) -> SSHHost:
         s = self.settings.ssh
@@ -129,8 +138,22 @@ class ProxmoxPlatform(Platform):
         disks = guest_disks(PVE_TYPES[guest.kind], config)
         ssh = self.ssh_for_host(guest.host)
         storages = {d.storage: self.api.storage(d.storage) for d in disks}
-        sources = [make_source(ssh, storages[d.storage], d, snapshot, low_priority) for d in disks]
+        remote_hash = self.settings.remote_hash and self._has_python3(guest.host, ssh)
+        sources = [make_source(ssh, storages[d.storage], d, snapshot, low_priority, remote_hash) for d in disks]
         return BackupPlan(config=config, disks=sources)
+
+    def _has_python3(self, node: str, ssh: SSHHost) -> bool:
+        """Checked once per node. Without python3, every chunk is sent (as before)."""
+        if node not in self._python3:
+            try:
+                found = bool(ssh.run("command -v python3").strip())
+            except Exception as exc:
+                log.debug("%s: python3 check failed: %s", node, exc)
+                found = False
+            if not found:
+                log.warning("%s: python3 not found, chunks cannot be hashed there: every chunk is sent", node)
+            self._python3[node] = found
+        return self._python3[node]
 
     def create_snapshot(self, guest: Guest, snapshot: str) -> None:
         self.api.create_snapshot(guest, snapshot, "Temporary Antigrafa snapshot, deleted after the backup")

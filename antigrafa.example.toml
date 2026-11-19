@@ -16,6 +16,10 @@ ca_file = "/etc/antigrafa/pve-root-ca.pem"
 # Labs only: skip certificate verification (remove ca_file). Anyone on the network
 # path can then intercept the API token.
 # verify_tls = false
+# Chunks are hashed on the node (python3, present on Proxmox VE): only those that
+# changed since the previous backup cross the network. Costs CPU on the node, at low
+# priority. false: every chunk is sent, hashed here.
+# remote_hash = true
 
 # How Antigrafa reaches the nodes to read the snapshots.
 [source.cluster1.ssh]
