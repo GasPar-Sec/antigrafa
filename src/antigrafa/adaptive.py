@@ -248,7 +248,7 @@ class SourceThrottle:
                 new = self.rate * 1.25
                 self.rate = min(new, self.max_rate) if self.max_rate is not None else new
         if self.rate != old:
-            log.info(
+            log.debug(
                 "host %s: iowait %.1f%%, reads %s",
                 self.name,
                 wait * 100,
