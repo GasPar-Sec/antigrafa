@@ -178,7 +178,7 @@ Output, for every command (options go before the command name):
 |---|---|
 | `-q` | warnings and errors only (cron) |
 | *(none)* | main steps |
-| `-v` | details: SSH commands, API calls and their duration, disks found and how each one is read |
+| `-v` | details: SSH commands, API calls and their duration, disks found and how each one is read, adaptive control adjustments (parallel writes and their latency, zstd level, read cap from the host's iowait) |
 | `-vv` | as `-v`, with milliseconds, thread (one per guest backed up in parallel) and module |
 | `--progress` / `--no-progress` | progress line for `backup`, `restore` and `verify`: percentage, amount, rate, ETA, and each disk being read with its guest id and its own percentage (`100/scsi0 63%`). Container archives (ZFS datasets) have no exact size: their percentage is estimated from the snapshot (`150/rootfs ~63%`) and stays below 100 % until the end. Shown by default on a terminal only, never with `-q` unless `--progress` |
 
@@ -260,7 +260,7 @@ first, so that its snapshots are deleted.
 
 | Command | Effect |
 |---|---|
-| `antigrafa web serve` | start the web interface |
+| `antigrafa web serve` | start the web interface; `antigrafa -v web serve`: the details (`-v` above) in the console and in the page's log |
 | `antigrafa web adduser <name>` | create a user, or change its password (`--password-stdin` for scripts) |
 | `antigrafa web deluser <name>` | remove a user |
 

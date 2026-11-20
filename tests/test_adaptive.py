@@ -131,3 +131,33 @@ def test_source_throttle_survives_probe_errors():
     th = SourceThrottle(probe=boom, max_rate=20 * MiB)
     th.consume(1)
     assert th.rate == 20 * MiB
+
+
+def test_adjustments_are_details_shown_with_v_only(caplog):
+    """Concurrency, zstd level and read cap change often: debug (-v), never by default."""
+    import logging
+
+    clock = FakeClock()
+    ctl = WriteController(WriteTuning(start_concurrency=8, max_concurrency=8, start_level=3), clock=clock)
+    iowait = {"v": 0.0}
+    th = SourceThrottle(probe=lambda: iowait["v"], max_rate=None, min_rate=MiB, interval=5, clock=clock,
+                        sleep=clock.sleep, name="pve1")
+
+    def adjust():
+        _window(ctl, clock, write_s=2.0, compress_s=0.05, saturated=True)
+        clock.t += 5
+        th._window_bytes = 100 * MiB
+        iowait["v"] = 0.5 - iowait["v"]  # busy, then quiet: the cap changes every time
+        th.consume(MiB)
+
+    caplog.set_level(logging.INFO, logger="antigrafa")
+    adjust()
+    assert caplog.records == []  # nothing at the default level
+
+    caplog.set_level(logging.DEBUG, logger="antigrafa")
+    adjust()
+    messages = [r.getMessage() for r in caplog.records]
+    assert all(r.levelno == logging.DEBUG for r in caplog.records)
+    assert any("parallel writes" in m for m in messages)
+    assert any(m.startswith("zstd level") for m in messages)
+    assert any(m.startswith("host pve1: iowait") for m in messages)

@@ -141,16 +141,16 @@ class WriteController:
             new = conc
         if new != conc:
             self.limiter.set_limit(new)
-            log.info("destination: %d parallel writes (mean latency %.0f ms)", new, avg_write * 1000)
+            log.debug("destination: %d parallel writes (mean latency %.0f ms)", new, avg_write * 1000)
 
         # Compression: slow destination -> compress harder to write less;
         # CPU-bound -> compress less.
         if avg_write > 1.5 * avg_comp and self._level < self.t.max_level:
             self._level += 1
-            log.info("zstd level %d (destination slower than CPU)", self._level)
+            log.debug("zstd level %d (destination slower than CPU)", self._level)
         elif avg_comp > 1.5 * avg_write and self._level > self.t.min_level:
             self._level -= 1
-            log.info("zstd level %d (CPU slower than destination)", self._level)
+            log.debug("zstd level %d (CPU slower than destination)", self._level)
 
     def stats(self) -> dict:
         return {
@@ -248,7 +248,7 @@ class SourceThrottle:
                 new = self.rate * 1.25
                 self.rate = min(new, self.max_rate) if self.max_rate is not None else new
         if self.rate != old:
-            log.info(
+            log.debug(
                 "host %s: iowait %.1f%%, reads %s",
                 self.name,
                 wait * 100,
