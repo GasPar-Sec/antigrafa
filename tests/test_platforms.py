@@ -213,7 +213,7 @@ class PythonSSH:
         self.reply, self.error, self.calls = reply, error, 0
 
     def run(self, cmd, timeout=120):
-        assert cmd == "command -v python3"
+        assert cmd == "command -v python3 || true"
         self.calls += 1
         if self.error:
             raise self.error
@@ -235,12 +235,21 @@ def test_remote_hash_when_python3_is_on_the_node():
 
 
 def test_no_python3_on_the_node_sends_everything(caplog):
+    [disk] = _planner(PythonSSH(reply="")).plan_backup(VM, "s").disks
+    assert disk.remote_hash is False
+    assert "pve1: python3 not found" in caplog.text and "apt install python3" in caplog.text
+    assert "check failed" not in caplog.text
+
+
+def test_failed_python3_check_says_why(caplog):
     from antigrafa.ssh import RemoteCommandError
 
-    for ssh in (PythonSSH(reply=""), PythonSSH(error=RemoteCommandError("pve1", "command -v python3", 1, ""))):
-        [disk] = _planner(ssh).plan_backup(VM, "s").disks
-        assert disk.remote_hash is False
-    assert "pve1: python3 not found" in caplog.text
+    error = RemoteCommandError("pve1", "command -v python3 || true", 255, "Permission denied (publickey)")
+    [disk] = _planner(PythonSSH(error=error)).plan_backup(VM, "s").disks
+    assert disk.remote_hash is False
+    assert "pve1: python3 check failed, every chunk is sent" in caplog.text
+    assert "Permission denied (publickey)" in caplog.text  # shown without -v: a warning
+    assert "not found" not in caplog.text
 
 
 def test_remote_hash_turned_off():

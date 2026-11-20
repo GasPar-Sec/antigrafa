@@ -286,6 +286,7 @@ def test_manager_runs_a_backup_and_reports_it(lab, caplog):
     with pytest.raises(Busy):
         m.start(source="lab", target=None, every=True, user="bob")
 
+    _wait(lambda: len(run.results) == 1)  # the container ends while the VM is held
     lab.gate.go.set()
     _wait(lambda: not run.active)
     assert run.state == "ok"

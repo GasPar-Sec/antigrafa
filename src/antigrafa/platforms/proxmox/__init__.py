@@ -34,6 +34,9 @@ from .capture import UnsupportedStorage, guest_disks, make_source
 
 log = logging.getLogger(__name__)
 
+# Always succeeds: an empty answer means python3 is missing (remote hashing, see delta)
+PYTHON3_CHECK = "command -v python3 || true"
+
 __all__ = ["ProxmoxAPI", "ProxmoxError", "ProxmoxPlatform", "ProxmoxSettings", "UnsupportedStorage"]
 
 # Privileges needed by a backup, and why (what fails without them)
@@ -146,12 +149,18 @@ class ProxmoxPlatform(Platform):
         """Checked once per node. Without python3, every chunk is sent (as before)."""
         if node not in self._python3:
             try:
-                found = bool(ssh.run("command -v python3").strip())
+                # "|| true": an empty answer means missing; an error means the check itself failed
+                found = bool(ssh.run(PYTHON3_CHECK).strip())
             except Exception as exc:
-                log.debug("%s: python3 check failed: %s", node, exc)
+                log.warning("%s: python3 check failed, every chunk is sent: %s", node, exc)
                 found = False
-            if not found:
-                log.warning("%s: python3 not found, chunks cannot be hashed there: every chunk is sent", node)
+            else:
+                if not found:
+                    log.warning(
+                        "%s: python3 not found, chunks cannot be hashed there: every chunk is sent "
+                        "(install it on the node: apt install python3)",
+                        node,
+                    )
             self._python3[node] = found
         return self._python3[node]
 
