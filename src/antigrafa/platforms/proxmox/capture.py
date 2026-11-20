@@ -63,6 +63,16 @@ def parse_volume(value: str) -> tuple[str, dict]:
     return volume, options
 
 
+_SIZE = re.compile(r"^(\d+(?:\.\d+)?)([KMGT]?)$")
+_UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
+
+def parse_size(value: str) -> int | None:
+    """Proxmox size option (32G, 528K, 1.5T, 4096) in bytes; None if it is not one."""
+    m = _SIZE.match(value.strip())
+    return int(float(m.group(1)) * _UNITS[m.group(2)]) if m else None
+
+
 def guest_disks(guest_type: str, config: dict) -> list[Disk]:
     """Disks to back up, honouring Proxmox's ``backup`` flag."""
     disks = []

@@ -661,3 +661,53 @@ def test_a_failing_result_callback_never_fails_the_backup(repo, caplog):
         runner.close()
     assert result.ok
     assert "result not reported: display gone" in caplog.text
+
+
+def test_the_whole_run_is_in_the_progress_from_the_start(repo):
+    from antigrafa.progress import Progress
+
+    guests = [Guest("1", "vm", "a", "h1"), Guest("2", "vm", "b", "h1"), Guest("3", "vm", "c", "h1")]
+    seen = []
+
+    class Sized(MemoryPlatform):
+        def disk_sizes(self, guest):
+            if guest.id == "3":
+                raise RuntimeError("API down")  # progress only: the backup goes on
+            return {"disk0": 1000}
+
+    class Watched(MemoryDisk):
+        def open_stream(self):
+            seen.append(progress.snapshot()["total"])
+            return super().open_stream()
+
+    platform = Sized(guests, {g.id: [Watched("disk0", b"x" * 1000)] for g in guests})
+    progress = Progress(enabled=False)
+    runner = BackupRunner(Tuning(chunk_size_mib=1, max_parallel_guests=1), platform, repo, progress=progress)
+    try:
+        results = runner.run(guests)
+    finally:
+        runner.close()
+    assert all(r.ok for r in results)
+    # The first disk read already sees the second guest's disk in the total
+    assert seen[0] == 2000
+    assert progress.snapshot()["total"] == 3000 and not progress.snapshot()["approximate"]
+
+
+def test_a_failed_guest_leaves_nothing_announced(repo):
+    from antigrafa.progress import Progress
+
+    guest = Guest("1", "vm", "a", "h1")
+
+    class Sized(MemoryPlatform):
+        def disk_sizes(self, guest):
+            return {"disk0": 1000, "disk1": 5000}
+
+    platform = Sized([guest], {"1": []})  # no disk: fails before reading
+    progress = Progress(enabled=False)
+    runner = BackupRunner(Tuning(chunk_size_mib=1), platform, repo, progress=progress)
+    try:
+        [result] = runner.run([guest])
+    finally:
+        runner.close()
+    assert not result.ok
+    assert progress.snapshot()["total"] is None and not progress.snapshot()["approximate"]

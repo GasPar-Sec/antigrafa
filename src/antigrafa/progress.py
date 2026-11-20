@@ -127,6 +127,8 @@ class Progress:
         self.unknown_open = 0  # open tasks of unknown size
         self.approximate_open = 0  # open tasks whose size is an estimate
         self._running: list[Task] = []  # open named tasks, in start order
+        # Work announced but not started (disks of guests not reached yet): name -> size
+        self._expected: dict[str, int] = {}
 
     # ----------------------------------------------------------------- tasks
 
@@ -142,6 +144,25 @@ class Progress:
             if name:
                 self._running.append(task)
         return task
+
+    def expect(self, name: str, size: int) -> None:
+        """Count ``size`` in the overall total until the task ``name`` starts (estimate)."""
+        with self._lock:
+            self._expected[name] = max(int(size), 0)
+
+    def drop_expected(self, name: str, prefix: bool = False) -> None:
+        """The work ``name`` started (its task has the real size) or will not happen.
+
+        ``prefix``: every name starting with ``name`` (all the disks of a guest).
+        """
+        with self._lock:
+            for key in [k for k in self._expected if k == name or (prefix and k.startswith(name))]:
+                del self._expected[key]
+            self._maybe_draw(force=True)
+
+    def _overall(self) -> tuple[int, bool]:
+        """Total of the whole run (tasks plus what is announced), and whether it is an estimate."""
+        return self.total + sum(self._expected.values()), self.approximate_open > 0 or bool(self._expected)
 
     @property
     def running(self) -> list[Task]:
@@ -188,16 +209,16 @@ class Progress:
         with self._lock:
             elapsed = max(self._clock() - self._start, 1e-6)
             rate = self.done / elapsed
-            known = bool(self.total) and not self.unknown_open
-            left = self.total - self.done_known
-            approximate = self.approximate_open > 0
+            total, approximate = self._overall()
+            known = bool(total) and not self.unknown_open
+            left = total - self.done_known
             return {
                 "label": self.label,
                 "unit": self.unit,
                 "status": self.status,
                 "done": self.done,
-                "total": self.total if known else None,
-                "percent": _fraction(self.done_known, self.total, approximate) * 100 if known else None,
+                "total": total if known else None,
+                "percent": _fraction(self.done_known, total, approximate) * 100 if known else None,
                 "approximate": approximate,
                 "rate": rate,
                 "eta": left / rate if known and rate and left > 0 else None,
@@ -254,15 +275,17 @@ class Progress:
         elapsed = max(self._clock() - self._start, 1e-6)
         rate = self.done / elapsed
         fields = [(0, self.label)] if self.label else []
-        if self.total and not self.unknown_open:
-            fields.append((0, self._bar(self.done_known, self.total, self.approximate_open > 0)))
-            fields.append((5, f"{self._amount(self.done)}/{self._amount(self.total)}"))
+        total, approximate = self._overall()
+        if total and not self.unknown_open:
+            fields.append((0, self._bar(self.done_known, total, approximate)))
+            estimate = "~" if self._expected else ""
+            fields.append((5, f"{self._amount(self.done)}/{estimate}{self._amount(total)}"))
         else:
             fields.append((5, self._amount(self.done)))
         if self.done:
             fields.append((4, f"{self._amount(rate)}/s"))
-            left = self.total - self.done_known
-            if self.total and not self.unknown_open and left > 0:  # never when past the estimate
+            left = total - self.done_known
+            if total and not self.unknown_open and left > 0:  # never when past the estimate
                 fields.append((2, f"ETA {human_duration(left / rate)}"))
         fields.append((6, human_duration(elapsed)))
         if self.status:

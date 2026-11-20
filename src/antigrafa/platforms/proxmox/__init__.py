@@ -31,7 +31,7 @@ from ...config import ConfigError, build_section
 from ...ssh import SSHHost
 from ..base import AccessDenied, BackupPlan, Guest, Platform, PlatformError
 from .api import PVE_TYPES, ProxmoxAPI, ProxmoxError
-from .capture import UnsupportedStorage, guest_disks, make_source
+from .capture import UnsupportedStorage, guest_disks, make_source, parse_size
 
 log = logging.getLogger(__name__)
 
@@ -138,6 +138,12 @@ class ProxmoxPlatform(Platform):
 
     def guests(self) -> list[Guest]:
         return self.api.guests()
+
+    def disk_sizes(self, guest: Guest) -> dict[str, int]:
+        """The ``size=`` Proxmox records for each disk (container: the disk's size, not its data)."""
+        disks = guest_disks(PVE_TYPES[guest.kind], self.api.guest_config(guest))
+        sizes = {d.key: parse_size(d.options.get("size", "")) for d in disks}
+        return {key: size for key, size in sizes.items() if size is not None}
 
     def plan_backup(self, guest: Guest, snapshot: str, low_priority: bool = True) -> BackupPlan:
         config = self.api.guest_config(guest)

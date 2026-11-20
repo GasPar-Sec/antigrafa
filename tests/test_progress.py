@@ -551,3 +551,36 @@ def test_snapshot_with_an_unknown_size():
     s = p.snapshot()
     assert s["total"] is None and s["percent"] is None and s["eta"] is None and s["done"] == 300
     assert s["tasks"][0]["total"] is None and s["tasks"][0]["percent"] is None
+
+
+# --------------------------------------------------------------------------- work announced in advance
+
+
+def test_announced_disks_count_in_the_overall_total():
+    clock = Clock()
+    p = _progress(clock, label="backup", enabled=False)
+    p.expect("1/scsi0", 1000)
+    p.expect("2/scsi0", 3000)  # a guest not reached yet
+    s = p.snapshot()
+    assert s["total"] == 4000 and s["percent"] == 0 and s["approximate"]
+
+    p.drop_expected("1/scsi0")  # its real size now comes from the task
+    task = p.task(1200, name="1/scsi0")
+    clock.now += 10
+    task.advance(1200)
+    task.close()
+    s = p.snapshot()
+    assert s["total"] == 4200 and s["percent"] == pytest.approx(1200 / 4200 * 100)
+    assert s["eta"] == pytest.approx(3000 / 120)
+    assert "1.2 KiB/~4.1 KiB" in p.line()
+
+    p.drop_expected("2/", prefix=True)  # that guest failed before reading anything
+    s = p.snapshot()
+    assert s["total"] == 1200 and s["percent"] == 100 and not s["approximate"]
+    assert "~" not in p.line()
+
+
+def test_announced_size_is_never_negative():
+    p = _progress(enabled=False)
+    p.expect("1/scsi0", -5)
+    assert p.snapshot()["total"] is None  # nothing to measure against yet
