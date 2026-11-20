@@ -184,6 +184,28 @@ def cmd_web_deluser(cfg: Config, args) -> int:
     return 0
 
 
+def _open_log_file(cfg: Config) -> logging.Handler | None:
+    """The [log] file on the root logger; None when disabled or not writable."""
+    from .logfile import ArchivingFileHandler
+
+    if not cfg.log.enabled:
+        return None
+    try:
+        handler = ArchivingFileHandler(
+            cfg.log.path, cfg.log.max_bytes, cfg.log.max_archives, cfg.log.compression, cfg.log.compression_level
+        )
+        handler.check()  # fails here, not on the first record
+    except OSError as exc:
+        # A user without the rights of the service account: the terminal still has it all
+        log.warning("no log file (%s): %s", cfg.log.path, exc)
+        return None
+    logging.getLogger().addHandler(handler)
+    log.debug("log file: %s", cfg.log.path)
+    if handler.warning:  # rar or 7z missing: on the terminal and in the file
+        log.warning("log file: %s", handler.warning)
+    return handler
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="antigrafa", description="Backups for virtual machines and containers")
     p.add_argument("-c", "--config", default=default_config_path(), help="default: %(default)s")
@@ -248,14 +270,20 @@ def main(argv: list[str] | None = None) -> int:
     # Shown on a terminal unless --no-progress; -q hides it unless --progress
     enabled = args.progress if args.progress is not None else (None if verbosity >= 0 else False)
     args.progress_bar = Progress(label=args.cmd, enabled=enabled)
+    console = ProgressLogHandler(args.progress_bar)
+    console.setLevel(LOG_LEVELS[min(verbosity, 1)])
     logging.basicConfig(
-        level=LOG_LEVELS[min(verbosity, 1)],
         format=LOG_FORMAT_DETAILED if verbosity >= 2 else LOG_FORMAT,
         datefmt="%H:%M:%S",
-        handlers=[ProgressLogHandler(args.progress_bar)],
+        handlers=[console],
     )
+    # -q only quiets the terminal: the log file always gets INFO (DEBUG with -v)
+    logging.getLogger().setLevel(logging.DEBUG if verbosity >= 1 else logging.INFO)
+    file_handler = None
     try:
-        return args.func(load_config(args.config), args)
+        cfg = load_config(args.config)
+        file_handler = _open_log_file(cfg)
+        return args.func(cfg, args)
     except ConfigError as exc:
         log.error("%s", exc)
         return 2
@@ -268,6 +296,10 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         log.error("interrupted")
         return 130
+    finally:
+        if file_handler is not None:
+            logging.getLogger().removeHandler(file_handler)
+            file_handler.close()  # waits for an archive being compressed
 
 
 if __name__ == "__main__":

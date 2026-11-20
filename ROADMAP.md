@@ -38,10 +38,38 @@ of different sizes never deduplicate against each other.
 - [ ] Let garbage collection remove the old chunks once no index references them
       (depends on retention / GC)
 
+## Backup speed
+
+Today every backup reads each disk in full on the source host. With `remote_hash`, only
+changed chunks cross the network, but the whole snapshot is still read and hashed. Before
+picking an item, measure a real run (phase timings and per-disk rate in the report, `-v`):
+the bottleneck can be the read on the node, the network or the destination.
+
+### Step 1: cheap wins (no repository format change)
+
+- [ ] All-zero chunks detected on the source host: send a short record instead of the
+      data (first backups and thin disks: unallocated space no longer crosses SSH, and is
+      no longer hashed and compressed at the destination)
+- [ ] Read the disks of one guest in parallel, with a limit (disks are read one after the
+      other today)
+- [ ] Hash in parallel in the script on the source host (`hashlib` releases the GIL): the
+      single-threaded hash at low priority can cap the rate on a busy node
+- [ ] Revisit the default `max_parallel_per_host = 1` (one guest at a time per node), now
+      that the iowait throttle protects the guests
+
+### Step 2: native incrementals (read only the changed blocks)
+
+- [ ] Keep the last Antigrafa snapshot on the source as the base of the next backup
+      (costs space on the source storage; delete it when the chain is broken)
+- [ ] Ceph RBD: `rbd diff --from-snap` gives the changed extents directly
+- [ ] ZFS zvol: changed blocks from `zfs send -i`
+- [ ] LVM-thin: changed blocks from `thin_delta`
+- [ ] Fall back to a full read when the base snapshot is missing or does not match the
+      previous backup
+
 ## Features
 
 - [x] Chunks hashed on the source host (`remote_hash`): only changed chunks cross the network
-- [ ] Native incrementals (`zfs send -i`, `rbd export-diff`) to also *read* only changed blocks
 - [ ] Repair: `verify` removes a damaged chunk and the next backup sends it again (with
       `remote_hash`, a chunk unchanged on the source is never sent again, so a chunk
       damaged at the destination stays damaged until then)

@@ -28,9 +28,10 @@ GUESTS = [
 def _reset_logging():
     # main() configures the root logger: undo it so each test starts clean
     root = logging.getLogger()
-    handlers = root.handlers[:]
+    handlers, level = root.handlers[:], root.level
     yield
     root.handlers[:] = handlers
+    root.setLevel(level)
 
 
 @pytest.fixture
@@ -228,7 +229,8 @@ def test_verbose_flag_enables_debug(config, monkeypatch):
     seen = {}
     monkeypatch.setattr(logging, "basicConfig", lambda **kw: seen.update(kw))
     assert cli.main(["-c", config, "-v", "list"]) == 0
-    assert seen["level"] == logging.DEBUG
+    assert seen["handlers"][0].level == logging.DEBUG
+    assert logging.getLogger().level == logging.DEBUG
 
 
 # --------------------------------------------------------------------------- guests
@@ -453,9 +455,11 @@ def logging_config(monkeypatch):
 )
 def test_verbosity_levels(config, logging_config, flags, level, detailed):
     assert cli.main(["-c", config, *flags, "list"]) == 0
-    assert logging_config["level"] == level
+    terminal = logging_config["handlers"][0]
+    assert isinstance(terminal, cli.ProgressLogHandler) and terminal.level == level
     assert ("threadName" in logging_config["format"]) is detailed
-    assert isinstance(logging_config["handlers"][0], cli.ProgressLogHandler)
+    # The root lets INFO through for the log file, even with -q
+    assert logging.getLogger().level == min(level, logging.INFO)
 
 
 def test_quiet_and_verbose_are_exclusive(config, capsys):
@@ -535,3 +539,181 @@ def test_backup_hands_the_progress_line_to_the_runner(config, fake_runner, loggi
         fake_runner.__init__ = original
     assert isinstance(seen["progress"], cli.Progress)
     assert seen["progress"].enabled is False  # finished before the summary
+
+
+# --------------------------------------------------------------------------- log file
+
+
+def _logging_list(monkeypatch):
+    def cmd_list(cfg, args):
+        logging.getLogger("antigrafa.jobs").info("info line")
+        logging.getLogger("antigrafa.jobs").debug("debug line")
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_list", cmd_list)
+
+
+def test_log_file_gets_info_even_with_quiet(config, monkeypatch, tmp_path):
+    from antigrafa import config as config_module
+
+    _logging_list(monkeypatch)
+    path = tmp_path / "log" / "antigrafa.log"
+    assert config_module.default_log_file() == str(path)  # tests never write /var/log
+    assert cli.main(["-c", config, "-q", "list"]) == 0
+    text = path.read_text(encoding="utf-8")
+    assert "antigrafa.jobs: info line" in text and "debug line" not in text
+    # Removed and closed when the command ends
+    assert not any(type(h).__name__ == "ArchivingFileHandler" for h in logging.getLogger().handlers)
+
+
+def test_log_file_gets_debug_with_verbose(config, monkeypatch, tmp_path):
+    _logging_list(monkeypatch)
+    assert cli.main(["-c", config, "-v", "list"]) == 0
+    assert "debug line" in (tmp_path / "log" / "antigrafa.log").read_text(encoding="utf-8")
+
+
+def test_log_file_from_the_configuration(config, monkeypatch, tmp_path):
+    _logging_list(monkeypatch)
+    path = tmp_path / "custom" / "backup.log"
+    with open(config, "a") as f:
+        f.write(f'\n[log]\nfile = "{path.as_posix()}"\ncompression = "tar.gz"\n')
+    assert cli.main(["-c", config, "list"]) == 0
+    assert "info line" in path.read_text(encoding="utf-8")
+
+
+def test_log_file_disabled(config, monkeypatch, tmp_path):
+    _logging_list(monkeypatch)
+    with open(config, "a") as f:
+        f.write('\n[log]\nfile = "none"\n')
+    assert cli.main(["-c", config, "list"]) == 0
+    assert not (tmp_path / "log").exists()
+
+
+def test_log_file_not_writable_is_only_a_warning(config, monkeypatch, tmp_path, caplog):
+    _logging_list(monkeypatch)
+    (tmp_path / "blocker").write_text("")  # a file where the directory should be
+    with open(config, "a") as f:
+        f.write(f'\n[log]\nfile = "{(tmp_path / "blocker" / "antigrafa.log").as_posix()}"\n')
+    assert cli.main(["-c", config, "list"]) == 0  # the command still runs
+    assert "no log file" in caplog.text and "info line" in caplog.text
+
+
+# ------------------------------------------------- log file archived at max_size_mib = 1
+
+MiB = 1024 * 1024
+EXTENSIONS = {"zip": ".zip", "tar.gz": ".tar.gz", "rar": ".rar", "7z": ".7z"}
+
+
+def _log_section(config, **settings):
+    with open(config, "a") as f:
+        f.write("\n[log]\nmax_size_mib = 1\n")
+        for key, value in settings.items():
+            f.write(f"{key} = {value!r}\n".replace("'", '"'))
+
+
+def _logging_lines(monkeypatch, total_bytes):
+    """The command logs numbered lines of about 1000 bytes, ``total_bytes`` in all."""
+    count = total_bytes // 1000 + 1
+
+    def cmd_list(cfg, args):
+        for i in range(count):
+            logging.getLogger("antigrafa.jobs").info("line %06d %s", i, "backup data " * 80)
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_list", cmd_list)
+    return count
+
+
+def _read_archive(archive):
+    """(member name, text) of a log archive (the fake rar and 7z write a zip)."""
+    import tarfile
+    import zipfile
+
+    if archive.name.endswith(".tar.gz"):
+        with tarfile.open(archive, "r:gz") as tf:
+            (info,) = tf.getmembers()
+            return info.name, tf.extractfile(info).read().decode()
+    with zipfile.ZipFile(archive) as zf:
+        (name,) = zf.namelist()
+        return name, zf.read(name).decode()
+
+
+def _archives(directory):
+    return sorted(p for p in directory.iterdir() if p.name.startswith("antigrafa-"))
+
+
+@pytest.mark.parametrize("compression", ["zip", "tar.gz", "rar", "7z"])
+def test_log_archived_past_1_mib(config, monkeypatch, tmp_path, fake_archivers, compression):
+    _log_section(config, compression=compression)
+    count = _logging_lines(monkeypatch, int(1.5 * MiB))
+    assert cli.main(["-c", config, "list"]) == 0  # waits for the archive at the end
+    directory = tmp_path / "log"
+    (archive,) = _archives(directory)
+    assert archive.name.endswith(".log" + EXTENSIONS[compression])
+    name, text = _read_archive(archive)
+    assert name == archive.name[: -len(EXTENSIONS[compression])]
+    assert len(text.encode()) >= MiB and "line 000000" in text  # the first MiB, from the start
+    current = (directory / "antigrafa.log").read_text(encoding="utf-8")
+    assert len(current.encode()) < MiB and f"line {count - 1:06d}" in current
+    # Nothing lost or written twice: every line is in the archive or in the file
+    numbers = [line.split("line ")[1][:6] for line in (text + current).splitlines() if "antigrafa.jobs" in line]
+    assert numbers == [f"{i:06d}" for i in range(count)]
+    # Nothing left over: no uncompressed copy, no temporary archive
+    assert sorted(p.name for p in directory.iterdir()) == sorted(["antigrafa.log", archive.name])
+
+
+@pytest.mark.parametrize("compression", ["zip", "tar.gz", "rar", "7z"])
+def test_log_keeps_max_archives_past_1_mib(config, monkeypatch, tmp_path, fake_archivers, compression):
+    _log_section(config, compression=compression, max_archives=2)
+    count = _logging_lines(monkeypatch, int(4.5 * MiB))  # 4 archives made, 2 kept
+    assert cli.main(["-c", config, "list"]) == 0
+    archives = _archives(tmp_path / "log")
+    assert len(archives) == 2
+    texts = [_read_archive(a)[1] for a in archives]
+    assert all("line 000000" not in t for t in texts)  # the oldest ones went
+    assert f"line {count - 1:06d}" in (tmp_path / "log" / "antigrafa.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("compression", ["zip", "tar.gz"])
+def test_log_compression_level_past_1_mib(config, monkeypatch, tmp_path, compression):
+    import shutil
+
+    _logging_lines(monkeypatch, int(1.2 * MiB))
+    sizes = {}
+    original = open(config).read()
+    for level in (0, 9):
+        with open(config, "w") as f:
+            f.write(original)
+        _log_section(config, compression=compression, compression_level=level)
+        assert cli.main(["-c", config, "list"]) == 0
+        (archive,) = _archives(tmp_path / "log")
+        sizes[level] = archive.stat().st_size
+        shutil.rmtree(tmp_path / "log")
+    assert sizes[0] >= MiB  # level 0: stored as is
+    assert sizes[9] < sizes[0] / 20  # these lines repeat a lot
+
+
+@pytest.mark.parametrize(("compression", "level"), [("rar", 5), ("7z", 9), ("rar", 0), ("7z", 1)])
+def test_outside_program_level_past_1_mib(config, monkeypatch, tmp_path, fake_archivers, compression, level):
+    import zipfile
+
+    _log_section(config, compression=compression, compression_level=level)
+    _logging_lines(monkeypatch, int(1.2 * MiB))
+    assert cli.main(["-c", config, "list"]) == 0
+    (archive,) = _archives(tmp_path / "log")
+    with zipfile.ZipFile(archive) as zf:
+        assert zf.comment == f"level={level}".encode()  # rar -m<level>, 7z -mx<level>
+
+
+@pytest.mark.parametrize("compression", ["rar", "7z"])
+def test_outside_program_missing_archives_in_zip_with_a_warning(config, monkeypatch, tmp_path, caplog, compression):
+    from antigrafa import logfile
+
+    monkeypatch.setattr(logfile, "find_program", lambda name: None)
+    _log_section(config, compression=compression)
+    _logging_lines(monkeypatch, int(1.2 * MiB))
+    assert cli.main(["-c", config, "list"]) == 0
+    assert f"{compression} not found" in caplog.text
+    (archive,) = _archives(tmp_path / "log")
+    assert archive.name.endswith(".log.zip")
+    assert f"{compression} not found" in _read_archive(archive)[1]  # also in the log file itself

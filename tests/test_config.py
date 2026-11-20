@@ -230,3 +230,74 @@ def test_default_paths_on_linux_and_windows():
     assert default_config_path("win32", env) == r"D:\ProgramData\antigrafa\antigrafa.toml"
     assert default_web_dir("win32", env) == r"D:\ProgramData\antigrafa\web"
     assert default_web_dir("win32", {}) == r"C:\ProgramData\antigrafa\web"  # variable missing
+
+
+def test_default_log_file_on_linux_and_windows():
+    from antigrafa.config import default_log_file
+
+    assert default_log_file("linux", {}) == "/var/log/antigrafa/antigrafa.log"
+    env = {"PROGRAMDATA": r"D:\ProgramData"}
+    assert default_log_file("win32", env) == r"D:\ProgramData\antigrafa\antigrafa.log"
+
+
+# --------------------------------------------------------------------------- log file
+
+
+def test_log_section_defaults_and_values(tmp_path):
+    from antigrafa import config
+    from antigrafa.config import LogConfig
+
+    cfg = load_config(_write(tmp_path, MINIMAL))
+    assert cfg.log == LogConfig()
+    assert cfg.log.enabled and cfg.log.path == Path(config.default_log_file())
+    assert cfg.log.max_bytes == 1024**3  # 1 GiB
+    assert (cfg.log.max_archives, cfg.log.compression, cfg.log.compression_level) == (5, "zip", 6)
+
+    cfg = load_config(_write(tmp_path, MINIMAL + """
+[log]
+file = "/srv/logs/backup.log"
+max_size_mib = 100
+max_archives = 10
+compression = "tar.gz"
+compression_level = 9
+"""))
+    assert cfg.log.path == Path("/srv/logs/backup.log") and cfg.log.max_bytes == 100 * 1024**2
+    assert (cfg.log.max_archives, cfg.log.compression, cfg.log.compression_level) == (10, "tar.gz", 9)
+    assert not load_config(_write(tmp_path, MINIMAL + '[log]\nfile = "none"\n')).log.enabled
+
+
+@pytest.mark.parametrize(
+    ("log", "message"),
+    [
+        ("max_size_mib = 0", "max_size_mib must be an integer >= 1"),
+        ("max_size_mib = 1.5", "max_size_mib must be an integer >= 1"),
+        ("max_archives = -1", "max_archives must be an integer >= 0"),
+        ("max_archives = true", "max_archives must be an integer >= 0"),
+        ("compression = \"arj\"", "compression must be one of zip, tar.gz, rar, 7z"),
+        ("compression = \"7z\"\ncompression_level = 10", "compression_level must be between 0 and 9 for 7z"),
+        ("compression = \"rar\"\ncompression_level = 6", "compression_level must be between 0 and 5 for rar"),
+        ("compression_level = 10", "compression_level must be between 0 and 9 for zip"),
+        ("compression_level = -1", "compression_level must be between 0 and 9"),
+        ("file = 5", "file must be a string"),
+        ("size = 5", "unknown keys size"),
+    ],
+)
+def test_invalid_log_section(tmp_path, log, message):
+    with pytest.raises(ConfigError, match=rf"\[log\]: .*{message}"):
+        load_config(_write(tmp_path, MINIMAL + "[log]\n" + log + "\n"))
+
+
+def test_log_compression_level_default_depends_on_the_compression(tmp_path):
+    rar = load_config(_write(tmp_path, MINIMAL + '[log]\ncompression = "rar"\n')).log
+    assert (rar.compression, rar.compression_level) == ("rar", 3)  # rar -m3, its own default
+    gz = load_config(_write(tmp_path, MINIMAL + '[log]\ncompression = "tar.gz"\n')).log
+    assert gz.compression_level == 6
+    best = load_config(_write(tmp_path, MINIMAL + '[log]\ncompression = "rar"\ncompression_level = 5\n')).log
+    assert best.compression_level == 5
+
+
+def test_log_7z_default_level(tmp_path):
+    seven = load_config(_write(tmp_path, MINIMAL + '[log]\ncompression = "7z"\n')).log
+    assert (seven.compression, seven.compression_level) == ("7z", 5)  # 7z -mx5, its own default
+    best = load_config(_write(tmp_path, MINIMAL + '[log]\ncompression = "7z"\ncompression_level = 9\n')).log
+    assert best.compression_level == 9

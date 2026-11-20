@@ -224,6 +224,41 @@ New data: 4.7 GiB -> 2.1 GiB written (final zstd level 5, 6 parallel writes)
 then writing the manifest. A failed guest shows the phases it reached. The report is
 printed even with `-q`.
 
+### Log file
+
+Every command, the web interface included, also writes its log to a file. The file
+always gets INFO, and DEBUG with `-v`: `-q` only quiets the terminal. Each line
+carries the date, the process and the thread, because a backup started by cron and
+the web interface may write the same file. Everything is set in the `[log]` section:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `file` | `/var/log/antigrafa/antigrafa.log`, `%PROGRAMDATA%\antigrafa\antigrafa.log` | the `.log` file; `"none"`: no log file |
+| `max_size_mib` | `1024` | past this size, the file is archived and a new one starts |
+| `max_archives` | `5` | archives kept; the oldest ones are removed first |
+| `compression` | `zip` | `zip`, `tar.gz`, `rar` or `7z` |
+| `compression_level` | `6` (zip, tar.gz), `3` (rar), `5` (7z) | `0` (none) to `9` (smallest, slowest); `0` to `5` for rar (`-m0` to `-m5`), 7z uses `-mx0` to `-mx9` |
+
+`zip` and `tar.gz` need nothing else. Python cannot write `rar` or `7z` archives, so
+those two need their program:
+
+- **rar**: the `rar` program, looked up in the `PATH`, then in `Program Files\WinRAR\Rar.exe`
+  on Windows. It is not free software, and on Debian it is in the `non-free` section.
+- **7z**: `7z`, `7zz` or `7za` (`7zip` or `p7zip-full` package), looked up in the `PATH`,
+  then in `Program Files\7-Zip\7z.exe` on Windows.
+
+If the program is missing, the archives are written in zip and a warning is shown.
+This way the log is never lost.
+
+The archives sit next to the file, one per rotation, named after the time the file was
+archived: `antigrafa-2026-11-20T10-15-00.log.zip`. Each archive holds one file with
+the same name, so several archives can be extracted side by side. Compression runs in
+the background, so the backups keep logging meanwhile. If it fails, the file stays
+uncompressed next to the log and the error is written to the log. The file is opened
+for each line and closed right after, so any process can archive it, Windows
+included. When the file cannot be written (a user without the rights of the service
+account), the command still runs and prints a warning.
+
 ## Web interface
 
 A web page to start backups, follow them live and cancel them, served over HTTPS only,
