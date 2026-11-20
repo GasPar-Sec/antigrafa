@@ -191,3 +191,80 @@ def test_hashed_stream_disabled():
     ssh = StreamingSSH()
     src = make_source(ssh, {"type": "rbd", "pool": "vms"}, Disk("scsi0", "ceph:vm-1-disk-0"), "s")
     assert src.open_hashed_stream([b"a" * 32], 4096) is None  # remote_hash off by default here
+
+
+# --------------------------------------------------------------------------- stopped reads
+
+
+class Stream:
+    def __init__(self, aborted):
+        self.aborted = aborted
+
+
+class StreamSSH(FakeSSH):
+    def __init__(self, replies=None, aborted=True):
+        super().__init__(replies)
+        self.aborted = aborted
+
+    def stream(self, cmd, input=None):
+        return Stream(self.aborted)
+
+
+def _stop(marker_pattern):
+    return lambda cmd: cmd.startswith(f"pkill -KILL -f -- '{marker_pattern}'")
+
+
+def test_aborted_read_kills_the_reader_before_snapdev_is_restored():
+    ssh = StreamSSH({"zfs get -H -o value,source snapdev": "hidden\tdefault\n"})
+    src = ZfsZvolSource(ssh, {"type": "zfspool", "pool": "rpool/data"}, Disk("scsi0", "z:vm-100-disk-0"), "antigrafa_1")
+    src.prepare()
+    src.open_stream()
+    src.cleanup()
+    stop, restore = ssh.commands[-2:]
+    assert _stop("[/]dev/zvol/rpool/data/vm-100-disk-0@antigrafa_1")(stop)
+    assert "pgrep -f" in stop and stop.endswith("; true")  # waits, never fails the cleanup
+    assert restore == "zfs inherit snapdev rpool/data/vm-100-disk-0"
+    src.cleanup()  # once only
+    assert sum("pkill" in c for c in ssh.commands) == 1
+
+
+def test_finished_read_kills_nothing():
+    ssh = StreamSSH({"zfs get -H -o value,source snapdev": "visible\tlocal\n"}, aborted=False)
+    src = ZfsZvolSource(ssh, {"type": "zfspool", "pool": "tank"}, Disk("scsi0", "z:vm-1-disk-0"), "s")
+    src.prepare()
+    src.open_stream()
+    src.cleanup()
+    assert not any("pkill" in c for c in ssh.commands)
+
+
+def test_aborted_hashed_read_kills_the_reader_too():
+    ssh = StreamSSH()
+    src = RbdSource(ssh, {"type": "rbd", "pool": "vms"}, Disk("scsi0", "ceph:vm-1-disk-0"), "s1", remote_hash=True)
+    src.open_hashed_stream([b"\0" * 32], 4 * 1024 * 1024)
+    src.cleanup()
+    assert _stop("[v]ms/vm-1-disk-0@s1")(ssh.commands[-1])
+
+
+def test_every_storage_has_its_own_reader_marker():
+    ssh = StreamSSH({"zfs get -H -o value mountpoint": "/rpool/data/subvol-101-disk-0\n"})
+    tree = ZfsDatasetSource(ssh, {"type": "zfspool", "pool": "rpool/data"}, Disk("rootfs", "z:subvol-101-disk-0"), "s1")
+    tree.prepare()
+    tree.open_stream()
+    tree.cleanup()
+    # "." is special in a regular expression: in brackets, it is just a dot
+    assert _stop("[.]zfs/snapshot/s1")(ssh.commands[-1])
+
+    lvm = LvmThinSource(ssh, {"type": "lvmthin", "vgname": "pve"}, Disk("scsi0", "local-lvm:vm-100-disk-0"), "s1")
+    lvm.prepare()
+    lvm.open_stream()
+    lvm.cleanup()
+    stop, deactivate = ssh.commands[-2:]
+    assert _stop("[/]dev/pve/snap_vm-100-disk-0_s1")(stop)
+    assert deactivate == "lvchange -an pve/snap_vm-100-disk-0_s1"
+
+
+def test_stop_command_escapes_regular_expression_characters():
+    from antigrafa.platforms.proxmox.capture import stop_readers_command
+
+    cmd = stop_readers_command("pool/vm-1+x.y@s")
+    assert cmd.startswith(r"pkill -KILL -f -- '[p]ool/vm-1\+x\.y@s'")

@@ -92,6 +92,25 @@ def guest_disks(guest_type: str, config: dict) -> list[Disk]:
     return disks
 
 
+_ERE_SPECIAL = set("\\.[]()*+?{}|^$")  # special in an extended regular expression
+
+
+def stop_readers_command(marker: str) -> str:
+    """Kill what still reads ``marker`` on the host, then wait (10 s at most) until it is gone.
+
+    Killing ssh here does not stop the command on the host at once: until it notices,
+    it keeps the snapshot open, and Proxmox cannot delete a snapshot in use (ZFS:
+    "dataset is busy"; the guest then stays locked "snapshot-delete").
+    """
+    escaped = "".join("\\" + ch if ch in _ERE_SPECIAL else ch for ch in marker[1:])
+    # "[x]..." matches the reader's command line, never this command's own
+    pattern = shlex.quote(f"[{marker[0]}]{escaped}")
+    return (
+        f"pkill -KILL -f -- {pattern}; i=0; "
+        f"while pgrep -f -- {pattern} >/dev/null && [ $i -lt 50 ]; do sleep 0.2; i=$((i+1)); done; true"
+    )
+
+
 class VolumeSource(DiskSource):
     """One Proxmox volume, read from its snapshot by a command run over SSH."""
 
@@ -110,6 +129,7 @@ class VolumeSource(DiskSource):
         self.snapname = snapname
         self.prefix = LOW_PRIORITY if low_priority else ""
         self.remote_hash = remote_hash
+        self._streams: list[RemoteStream] = []
 
     @property
     def key(self) -> str:
@@ -122,15 +142,29 @@ class VolumeSource(DiskSource):
     @abstractmethod
     def stream_command(self) -> str: ...
 
+    @abstractmethod
+    def reader_marker(self) -> str:
+        """Text found only in the command line that reads this disk (to stop it)."""
+
     def open_stream(self) -> RemoteStream:
-        return self.ssh.stream(self.prefix + self.stream_command())
+        return self._opened(self.ssh.stream(self.prefix + self.stream_command()))
+
+    def _opened(self, stream: RemoteStream) -> RemoteStream:
+        self._streams.append(stream)
+        return stream
+
+    def cleanup(self) -> None:
+        # Before anything else touches the snapshot: nothing may read it any more
+        if any(getattr(s, "aborted", False) for s in self._streams):
+            self.ssh.run(stop_readers_command(self.reader_marker()))
+        self._streams.clear()
 
     def open_hashed_stream(self, reference: list[bytes], chunk_size: int) -> RemoteStream | None:
         if not self.remote_hash:
             return None
         # The same read command, piped through the hashing script, at the same priority
         command = remote_command(self.stream_command(), chunk_size, self.prefix)
-        return self.ssh.stream(command, input=encode_reference(reference))
+        return self._opened(self.ssh.stream(command, input=encode_reference(reference)))
 
 
 def _wait_for_device(dev: str) -> str:
@@ -163,7 +197,11 @@ class ZfsZvolSource(VolumeSource):
     def stream_command(self) -> str:
         return f"dd if={shlex.quote(self.device)} bs=4M status=none"
 
+    def reader_marker(self) -> str:
+        return self.device
+
     def cleanup(self) -> None:
+        super().cleanup()
         if self._restore_snapdev:
             self.ssh.run(self._restore_snapdev)
             self._restore_snapdev = None
@@ -206,6 +244,9 @@ class ZfsDatasetSource(VolumeSource):
             f"-cf - -C {shlex.quote(self.snapdir)} ."
         )
 
+    def reader_marker(self) -> str:
+        return f".zfs/snapshot/{self.snapname}"
+
 
 class RbdSource(VolumeSource):
     def _spec(self) -> str:
@@ -230,6 +271,9 @@ class RbdSource(VolumeSource):
     def stream_command(self) -> str:
         return f"{self._rbd()} export --no-progress {shlex.quote(self._spec())} -"
 
+    def reader_marker(self) -> str:
+        return self._spec()
+
 
 class LvmThinSource(VolumeSource):
     def __init__(self, *args, **kwargs):
@@ -252,7 +296,11 @@ class LvmThinSource(VolumeSource):
     def stream_command(self) -> str:
         return f"dd if={shlex.quote(self.device)} bs=4M status=none"
 
+    def reader_marker(self) -> str:
+        return self.device
+
     def cleanup(self) -> None:
+        super().cleanup()
         if self._activated:
             self.ssh.run(f"lvchange -an {shlex.quote(f'{self.vg}/{self.snap_lv}')}")
             self._activated = False

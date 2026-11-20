@@ -14,7 +14,7 @@ def test_registry_builds_proxmox():
 
 
 def test_registry_rejects_unknown_type():
-    with pytest.raises(ValueError, match="unknown platform type 'hyperv' \(supported: proxmox\)"):
+    with pytest.raises(ValueError, match=r"unknown platform type 'hyperv' \(supported: proxmox\)"):
         platforms.parse_settings("hyperv", "h", {})
     with pytest.raises(ValueError, match="unknown platform type"):
         platforms.create_platform("vmware", "v", None)
@@ -115,6 +115,57 @@ def test_proxmox_platform_maps_calls_to_the_api():
     assert platform.leftover_snapshots(g, "antigrafa_") == ["antigrafa_1"]
     assert platform.host_iowait("pve1") == 0.2
     assert platform.guests() == ["listed"]
+
+
+class LockedAPI:
+    """Refuses the deletion while the guest is locked by a failed one."""
+
+    def __init__(self, error="VM is locked (snapshot-delete)"):
+        self.locked = True
+        self.error = error
+        self.deleted = []
+
+    def delete_snapshot(self, g, name):
+        if self.locked:
+            from antigrafa.platforms.proxmox import ProxmoxError
+
+            raise ProxmoxError(f"task UPID:pve1:qmdelsnapshot:{g.id}: {self.error}")
+        self.deleted.append((g.id, name))
+
+
+class UnlockSSH:
+    def __init__(self, api):
+        self.api, self.commands = api, []
+
+    def run(self, cmd, timeout=120):
+        self.commands.append(cmd)
+        self.api.locked = False
+        return ""
+
+
+@pytest.mark.parametrize(("kind", "tool"), [("vm", "qm"), ("ct", "pct")])
+def test_guest_left_locked_by_a_failed_deletion_is_unlocked(kind, tool, caplog):
+    api = LockedAPI()
+    ssh = UnlockSSH(api)
+    platform = ProxmoxPlatform("c1", ProxmoxSettings(url="https://pve", token_id="a@pve!b"), api=api,
+                               ssh_for_host=lambda node: ssh)
+    g = Guest("111", kind, "win", "pve1")
+    platform.delete_snapshot(g, "antigrafa_1")
+    assert ssh.commands == [f"{tool} unlock 111"]
+    assert api.deleted == [("111", "antigrafa_1")]
+    assert f"locked by the failed deletion of antigrafa_1: {tool} unlock" in caplog.text
+
+
+def test_other_deletion_errors_are_not_unlocked():
+    from antigrafa.platforms.proxmox import ProxmoxError
+
+    api = LockedAPI(error="zfs error: cannot destroy snapshot: dataset is busy")
+    ssh = UnlockSSH(api)
+    platform = ProxmoxPlatform("c1", ProxmoxSettings(url="https://pve", token_id="a@pve!b"), api=api,
+                               ssh_for_host=lambda node: ssh)
+    with pytest.raises(ProxmoxError, match="dataset is busy"):
+        platform.delete_snapshot(Guest("111", "vm", "win", "pve1"), "antigrafa_1")
+    assert ssh.commands == []  # never unlocks a guest for another reason
 
 
 def test_proxmox_platform_passes_verify_tls_to_the_api(caplog):
