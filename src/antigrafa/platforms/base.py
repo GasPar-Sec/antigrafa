@@ -146,6 +146,13 @@ class Platform(ABC):
         With an empty list, checks that guests can be listed at all.
         """
 
+    def disk_sizes(self, guest: Guest) -> dict[str, int]:
+        """Expected size of each disk to back up, by key, from the configuration (cheap).
+
+        Only for the progress of a whole run, before the guest's turn; {}: unknown.
+        """
+        return {}
+
     def leftover_snapshots(self, guest: Guest, prefix: str) -> list[str]:
         """Names of snapshots starting with ``prefix`` (left by an interrupted run)."""
         return []

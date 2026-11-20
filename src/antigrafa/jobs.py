@@ -154,9 +154,21 @@ class BackupRunner:
     def run(self, guests: list[Guest]) -> list[GuestResult]:
         self._guests_total = len(guests)
         self._guests_done = 0
+        self._announce(guests)
         self._update_status()
         with ThreadPoolExecutor(max_workers=self.tuning.max_parallel_guests, thread_name_prefix="guest") as pool:
             return list(pool.map(self._safe_backup, guests))
+
+    def _announce(self, guests: list[Guest]) -> None:
+        """Every disk of the run in the overall progress from the start (estimated sizes)."""
+        for g in guests:
+            try:
+                sizes = self.platform.disk_sizes(g)
+            except Exception as exc:  # progress only: never stops the backup
+                log.debug("%s: disk sizes unknown: %s", g.label, exc)
+                continue
+            for key, size in sizes.items():
+                self.progress.expect(f"{g.id}/{key}", size)
 
     def _check_cancel(self) -> None:
         if self.cancel.is_set():
@@ -177,6 +189,7 @@ class BackupRunner:
             log.error("%s: failed: %s", g.label, exc)
             result = GuestResult(guest=g, ok=False, error=str(exc), timings=timings)
         result.duration = time.monotonic() - start
+        self.progress.drop_expected(f"{g.id}/", prefix=True)  # disks never read (failure, cancel)
         with self._lock:
             self._guests_done += 1
             self._update_status()
@@ -240,6 +253,7 @@ class BackupRunner:
                 log.debug("%s: %s: size %d bytes", g.label, src.key, size)
             else:
                 log.debug("%s: %s: size unknown (archive), estimate %s", g.label, src.key, estimate)
+            self.progress.drop_expected(f"{g.id}/{src.key}")  # the task has the real size
             task = self.progress.task(
                 size if size is not None else estimate,
                 name=f"{g.id}/{src.key}",

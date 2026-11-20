@@ -9,6 +9,7 @@ from antigrafa.platforms.proxmox.capture import (
     ZfsZvolSource,
     guest_disks,
     make_source,
+    parse_size,
 )
 
 
@@ -268,3 +269,12 @@ def test_stop_command_escapes_regular_expression_characters():
 
     cmd = stop_readers_command("pool/vm-1+x.y@s")
     assert cmd.startswith(r"pkill -KILL -f -- '[p]ool/vm-1\+x\.y@s'")
+
+
+@pytest.mark.parametrize(
+    ("value", "size"),
+    [("32G", 32 * 1024**3), ("528K", 528 * 1024), ("4M", 4 * 1024**2), ("1.5T", int(1.5 * 1024**4)),
+     ("4096", 4096), (" 8G ", 8 * 1024**3), ("", None), ("big", None), ("8 G", None)],
+)
+def test_parse_size(value, size):
+    assert parse_size(value) == size

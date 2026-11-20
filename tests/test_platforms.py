@@ -307,3 +307,37 @@ def test_remote_hash_turned_off():
     ssh = PythonSSH()
     [disk] = _planner(ssh, remote_hash=False).plan_backup(VM, "s").disks
     assert disk.remote_hash is False and ssh.calls == 0
+
+
+def test_disk_sizes_from_the_proxmox_configuration():
+    class API:
+        def guest_config(self, g):
+            return {
+                "scsi0": "local-zfs:vm-100-disk-0,size=32G",
+                "scsi1": "local-zfs:vm-100-disk-1,backup=0,size=100G",  # not backed up
+                "efidisk0": "local-lvm:vm-100-disk-2,efitype=4m,size=528K",
+                "sata0": "local-lvm:vm-100-disk-3",  # no size recorded
+                "ide2": "local:iso/debian.iso,media=cdrom,size=600M",
+            }
+
+    platform = ProxmoxPlatform("c1", ProxmoxSettings(url="https://pve", token_id="a@pve!b"), api=API())
+    assert platform.disk_sizes(Guest("100", "vm", "web", "pve1")) == {"scsi0": 32 * 1024**3, "efidisk0": 528 * 1024}
+
+
+def test_platform_without_disk_sizes():
+    class Bare(Platform):
+        type = "bare"
+
+        def guests(self):
+            return []
+
+        def plan_backup(self, guest, snapshot, low_priority=True):
+            return BackupPlan(config={}, disks=[])
+
+        def create_snapshot(self, guest, snapshot):
+            pass
+
+        def delete_snapshot(self, guest, snapshot):
+            pass
+
+    assert Bare("x").disk_sizes(Guest("1", "vm", "a", "h")) == {}
