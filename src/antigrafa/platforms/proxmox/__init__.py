@@ -22,6 +22,7 @@ Configuration (``[source.<name>]`` with ``type = "proxmox"``)::
 from __future__ import annotations
 
 import logging
+import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +37,8 @@ log = logging.getLogger(__name__)
 
 # Always succeeds: an empty answer means python3 is missing (remote hashing, see delta)
 PYTHON3_CHECK = "command -v python3 || true"
+# What Proxmox answers while a failed snapshot deletion still holds the guest
+DELETE_LOCK = "locked (snapshot-delete)"
 
 __all__ = ["ProxmoxAPI", "ProxmoxError", "ProxmoxPlatform", "ProxmoxSettings", "UnsupportedStorage"]
 
@@ -168,7 +171,18 @@ class ProxmoxPlatform(Platform):
         self.api.create_snapshot(guest, snapshot, "Temporary Antigrafa snapshot, deleted after the backup")
 
     def delete_snapshot(self, guest: Guest, snapshot: str) -> None:
-        self.api.delete_snapshot(guest, snapshot)
+        try:
+            self.api.delete_snapshot(guest, snapshot)
+        except ProxmoxError as exc:
+            if DELETE_LOCK not in str(exc):
+                raise
+            # A previous try failed half-way (snapshot still in use): Proxmox left the guest
+            # locked, and every new try is refused. Only root can lift it (not through a token).
+            tool = "qm" if guest.kind == "vm" else "pct"
+            log.warning("%s: locked by the failed deletion of %s: %s unlock, then a new try", guest.label,
+                        snapshot, tool)
+            self.ssh_for_host(guest.host).run(f"{tool} unlock {shlex.quote(guest.id)}")
+            self.api.delete_snapshot(guest, snapshot)
 
     def check_access(self, guests: list[Guest]) -> None:
         missing: list[str] = []

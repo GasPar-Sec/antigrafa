@@ -29,12 +29,15 @@ class RemoteStream:
         self.command = command
         self.proc = proc
         self._stderr = stderr_file
+        self.aborted = False  # closed on an error: the remote command may still run a moment
+
 
     @property
     def stdout(self) -> BinaryIO:
         return self.proc.stdout
 
     def close(self, abort: bool = False) -> None:
+        self.aborted = self.aborted or abort
         if abort and self.proc.poll() is None:
             self.proc.kill()
         if self.proc.stdout:

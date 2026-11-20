@@ -149,3 +149,13 @@ def test_long_commands_are_shortened_in_messages():
     assert _short(long).endswith(f"... ({len(long)} characters)") and len(_short(long)) < 340
     err = RemoteCommandError("pve1", long, 1, "boom")
     assert len(str(err)) < 400 and "boom" in str(err)
+
+
+def test_stream_remembers_it_was_aborted():
+    with _local("printf abc", "echo abc") as s:
+        s.stdout.read()
+    assert s.aborted is False
+    with pytest.raises(ValueError):
+        with _local("printf abc", "echo abc") as s:
+            raise ValueError("cancelled")
+    assert s.aborted is True

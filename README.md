@@ -43,7 +43,11 @@ read the disks: see [Adding a platform](#adding-a-platform).
    `rbd export` or `tar`, depending on the storage). If the destination slows down,
    only the backup slows down: the guest is never in the loop. Only what changed
    crosses the network (see [Only changes are sent](#only-changes-are-sent)).
-3. **Cleanup**: the snapshot is deleted in every case, success or failure.
+3. **Cleanup**: the snapshot is deleted in every case, success or failure. After a
+   stopped read (cancel, error), the reader still running on the host is killed first:
+   a snapshot in use cannot be deleted. The deletion is tried again for about 30 s, and
+   on Proxmox VE a guest left locked (`snapshot-delete`) by a failed deletion of the
+   Antigrafa snapshot is unlocked (`qm unlock` / `pct unlock`, over SSH).
 
 The trade-off: the snapshot takes space on the source storage for as long as the
 transfer lasts.
