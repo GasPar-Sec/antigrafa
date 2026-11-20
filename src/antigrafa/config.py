@@ -1,7 +1,7 @@
 """Loading the TOML configuration (see ``antigrafa.example.toml``).
 
 Generic sections: ``[source.<name>]`` (one per cluster or host, with its ``type``),
-``[target.<name>]``, ``[tuning]`` and ``[web]`` (the web interface). The rest of a source section belongs to its
+``[target.<name>]``, ``[tuning]``, ``[web]`` (the web interface) and ``[log]`` (the log file). The rest of a source section belongs to its
 platform, which validates it (see ``antigrafa.platforms``).
 """
 
@@ -36,6 +36,10 @@ def default_config_path(platform: str = sys.platform, environ=os.environ) -> str
 
 def default_web_dir(platform: str = sys.platform, environ=os.environ) -> str:
     return str(_system_dir("/var/lib/antigrafa", "web", platform=platform, environ=environ))
+
+
+def default_log_file(platform: str = sys.platform, environ=os.environ) -> str:
+    return str(_system_dir("/var/log/antigrafa", "antigrafa.log", platform=platform, environ=environ))
 
 
 @dataclass
@@ -106,12 +110,58 @@ class WebConfig:
         return Path(self.key_file) if self.key_file else self.directory / "tls" / "key.pem"
 
 
+# Compression of the log archives: (highest level, default level). rar: -m0 to -m5,
+# 7z: -mx0 to -mx9
+LOG_COMPRESSIONS = {"zip": (9, 6), "tar.gz": (9, 6), "rar": (5, 3), "7z": (9, 5)}
+
+
+@dataclass
+class LogConfig:
+    """The log file: archived and compressed when it reaches ``max_size_mib``."""
+
+    file: str = ""  # "": default_log_file(); "none": no log file
+    max_size_mib: int = 1024
+    max_archives: int = 5
+    compression: str = "zip"  # "zip", "tar.gz", "rar" or "7z"
+    # 0 (stored) to 9 (smallest), 0 to 5 for rar; None: the default of the compression
+    compression_level: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.file, str):
+            raise ValueError("file must be a string")
+        for name, low in (("max_size_mib", 1), ("max_archives", 0)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < low:
+                raise ValueError(f"{name} must be an integer >= {low}, not {value!r}")
+        if self.compression not in LOG_COMPRESSIONS:
+            raise ValueError(f"compression must be one of {', '.join(LOG_COMPRESSIONS)}, not {self.compression!r}")
+        highest, default = LOG_COMPRESSIONS[self.compression]
+        if self.compression_level is None:
+            self.compression_level = default
+        level = self.compression_level
+        if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= highest:
+            raise ValueError(f"compression_level must be between 0 and {highest} for {self.compression}, not {level!r}")
+
+    @property
+    def enabled(self) -> bool:
+        return self.file.lower() != "none"
+
+    @property
+    def path(self) -> Path:
+        return Path(self.file or default_log_file())
+
+    @property
+    def max_bytes(self) -> int:
+        return self.max_size_mib * 1024 * 1024
+
+
 @dataclass
 class Config:
     sources: dict[str, SourceConfig]
     targets: dict[str, TargetConfig]
     tuning: Tuning
     web: WebConfig = field(default_factory=WebConfig)
+    log: LogConfig = field(default_factory=LogConfig)
 
     def source(self, name: str | None) -> SourceConfig:
         return _pick(self.sources, name, "source")
@@ -190,7 +240,7 @@ def load_config(path: str | Path) -> Config:
             f"[{'], ['.join(sorted(old))}]: these sections moved into [source.<name>] "
             'with type = "proxmox" (see antigrafa.example.toml)'
         )
-    unknown = set(raw) - {"source", "target", "tuning", "web"}
+    unknown = set(raw) - {"source", "target", "tuning", "web", "log"}
     if unknown:
         raise ConfigError(f"unknown sections: {', '.join(sorted(unknown))}")
 
@@ -206,4 +256,5 @@ def load_config(path: str | Path) -> Config:
         targets=targets,
         tuning=build_section(Tuning, raw.get("tuning", {}), "tuning"),
         web=build_section(WebConfig, raw.get("web", {}), "web"),
+        log=build_section(LogConfig, raw.get("log", {}), "log"),
     )

@@ -64,6 +64,24 @@ port = 8443
 # addresses. Add the DNS name when the page is reached through it.
 # allowed_hosts = ["backup.example.lan"]
 
+# --------------------------------------------------------------------------- log file
+
+# Every command also writes its log to a file: INFO, DEBUG with -v (-q only quiets the
+# terminal). Past max_size_mib, the file is compressed next to it
+# (antigrafa-2026-11-20T10-15-00.log.zip) and a new one starts.
+[log]
+# Default: /var/log/antigrafa/antigrafa.log (Linux),
+# %PROGRAMDATA%\antigrafa\antigrafa.log (Windows). "none": no log file.
+# file = "/var/log/antigrafa/antigrafa.log"
+max_size_mib = 1024           # size of the .log file before it is archived
+max_archives = 5              # archives kept, the oldest removed first
+# "zip", "tar.gz", "rar" or "7z". rar and 7z need their program: rar (WinRAR on
+# Windows), 7z / 7zz / 7za (7-Zip on Windows); without it, the archives are zip.
+compression = "zip"
+# 0 (no compression) to 9 (smallest, slowest); rar: 0 to 5.
+# Default: 6 (zip, tar.gz), 3 (rar), 5 (7z).
+# compression_level = 6
+
 # --------------------------------------------------------------------------- tuning
 
 [tuning]
