@@ -46,6 +46,24 @@ kind = "nfs"              # refuses to write if the share is not mounted
 path = "/mnt/nas/antigrafa"
 sync = "filesystem"       # "file" (fsync per chunk) | "filesystem" | "none"
 
+# --------------------------------------------------------------------------- web
+
+# Web interface: antigrafa web serve (needs pip install 'antigrafa[web]'). HTTPS only,
+# with a login: create users with antigrafa web adduser <name>.
+[web]
+listen = "0.0.0.0"            # every interface; "127.0.0.1": this machine only
+port = 8443
+# Users, sessions, secret key, generated certificate.
+# Default: /var/lib/antigrafa/web (Linux), %PROGRAMDATA%\antigrafa\web (Windows).
+# data_dir = "/var/lib/antigrafa/web"
+# Your own certificate (both or neither). Without them, a self-signed certificate is
+# created in <data_dir>/tls/ on the first start.
+# cert_file = "/etc/antigrafa/web.pem"
+# key_file = "/etc/antigrafa/web.key"
+# Names the browser may use to reach the page. Default: this machine's names and
+# addresses. Add the DNS name when the page is reached through it.
+# allowed_hosts = ["backup.example.lan"]
+
 # --------------------------------------------------------------------------- tuning
 
 [tuning]

@@ -1,0 +1,23 @@
+{% extends "antigrafa/base.html" %}
+{% block title %}Antigrafa: sign in{% endblock %}
+{% block body %}
+<main style="max-width: 380px; padding-top: 12vh;">
+  <section>
+    <h2>Antigrafa</h2>
+    <form method="post" action="{% url 'login' %}">
+      {% csrf_token %}
+      <input type="hidden" name="next" value="{{ next }}">
+      {% if form.errors %}<p class="error">Wrong user name or password.</p>{% endif %}
+      <div style="margin-bottom: 10px;">
+        <label for="id_username">User</label>
+        <input type="text" name="username" id="id_username" autocomplete="username" required>
+      </div>
+      <div style="margin-bottom: 14px;">
+        <label for="id_password">Password</label>
+        <input type="password" name="password" id="id_password" autocomplete="current-password" required>
+      </div>
+      <button class="primary" type="submit">Sign in</button>
+    </form>
+  </section>
+</main>
+{% endblock %}

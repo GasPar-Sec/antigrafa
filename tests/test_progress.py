@@ -511,3 +511,43 @@ def test_windows_console_without_ansi_falls_back_to_one_line():
         raise OSError("bad file descriptor")
 
     assert progress_module._enable_windows_vt(FileNo(), Kernel32(), no_handle) is False
+
+
+# --------------------------------------------------------------------------- snapshot (web interface)
+
+
+def test_snapshot_gives_plain_values():
+    clock = Clock()
+    p = _progress(clock, label="backup", enabled=False)
+    p.set_status("0/2 guests")
+    disk = p.task(1000, name="100/scsi0")
+    tree = p.task(400, name="150/rootfs", approximate=True)
+    clock.now += 10
+    disk.advance(500)
+    tree.advance(100)
+
+    s = p.snapshot()
+    assert s["label"] == "backup" and s["status"] == "0/2 guests" and s["unit"] == "bytes"
+    assert (s["done"], s["total"]) == (600, 1400)
+    assert s["percent"] == pytest.approx(600 / 1400 * 100)
+    assert s["approximate"] and s["rate"] == pytest.approx(60.0) and s["elapsed"] == pytest.approx(10.0)
+    assert s["eta"] == pytest.approx(800 / 60)
+    first, second = s["tasks"]
+    assert first == {
+        "name": "100/scsi0", "done": 500, "total": 1000, "percent": 50.0, "approximate": False,
+        "rate": pytest.approx(50.0), "eta": pytest.approx(10.0),
+    }
+    assert second["approximate"] and second["percent"] == 25.0
+
+    tree.advance(1000)  # larger than its estimate: never 100 % until it ends
+    assert p.snapshot()["tasks"][1]["percent"] == 99.0 and p.snapshot()["tasks"][1]["eta"] is None
+
+
+def test_snapshot_with_an_unknown_size():
+    p = _progress(enabled=False)
+    assert p.snapshot()["percent"] is None and p.snapshot()["eta"] is None  # nothing yet
+    task = p.task(None, name="150/rootfs")
+    task.advance(300)
+    s = p.snapshot()
+    assert s["total"] is None and s["percent"] is None and s["eta"] is None and s["done"] == 300
+    assert s["tasks"][0]["total"] is None and s["tasks"][0]["percent"] is None

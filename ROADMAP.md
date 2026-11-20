@@ -49,6 +49,9 @@ of different sizes never deduplicate against each other.
 - [ ] Content-defined chunking (CDC) for container tar archives
 - [ ] qcow2 (through `qemu-nbd` on the snapshot)
 - [ ] Automatic abort when the snapshot grows too large on the source storage
+- [x] Web interface (HTTPS, login): start, follow and cancel backups
+- [ ] Web interface: limit login attempts, keep the run history across restarts, list
+      and restore backups, schedules
 - [ ] Scheduling, notifications, client-side encryption
 - [ ] Direct restore to Proxmox
 - [ ] Replication between 2 antigrafa servers

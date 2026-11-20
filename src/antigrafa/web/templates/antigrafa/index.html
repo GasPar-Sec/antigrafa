@@ -1,0 +1,315 @@
+{% extends "antigrafa/base.html" %}
+{% block body %}
+<header>
+  <h1>Antigrafa</h1>
+  <div class="who">
+    <span>{{ user.get_username }}</span>
+    <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button type="submit">Sign out</button></form>
+  </div>
+</header>
+<main>
+  {% if config_error %}<section><p class="error">Configuration: {{ config_error }}</p></section>{% endif %}
+
+  <section id="start">
+    <h2>Start a backup</h2>
+    <div class="row">
+      <div>
+        <label for="source">Source</label>
+        <select id="source">{% for name in choices.sources %}<option>{{ name }}</option>{% endfor %}</select>
+      </div>
+      <div>
+        <label for="target">Destination</label>
+        <select id="target">{% for name in choices.targets %}<option>{{ name }}</option>{% endfor %}</select>
+      </div>
+      <div style="flex: 0 0 auto;"><button id="load-guests" type="button">Reload guests</button></div>
+    </div>
+    <div class="row" style="margin: 14px 0 8px;">
+      <label style="display: inline; color: inherit;"><input type="radio" name="mode" value="all" checked> Every guest</label>
+      <label style="display: inline; color: inherit;"><input type="radio" name="mode" value="chosen"> Chosen guests</label>
+      <span class="muted" id="mode-help"></span>
+    </div>
+    <p class="muted" id="guests-message">Loading guests…</p>
+    <table id="guests" class="hidden">
+      <thead><tr><th id="check-header"></th><th>ID</th><th>Type</th><th>Name</th><th>Node</th><th>Status</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="row" style="margin-top: 14px;">
+      <div style="flex: 0 0 auto;"><button id="start-button" class="primary" type="button">Start the backup</button></div>
+      <div><p class="error" id="start-error"></p></div>
+    </div>
+  </section>
+
+  <section id="run" class="hidden">
+    <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 8px;">
+      <h2 style="margin: 0;">Backup <span id="run-id"></span> <span id="run-state" class="badge"></span></h2>
+      <button id="cancel-button" class="danger hidden" type="button">Cancel</button>
+    </div>
+    <p class="muted" id="run-info"></p>
+    <p class="error" id="run-error"></p>
+    <div id="progress"></div>
+    <table id="results" class="hidden" style="margin-top: 12px;">
+      <thead><tr><th style="width: 22%;">Guest</th><th style="width: 9%;">Result</th><th style="width: 9%;">Time</th><th>Details</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="report-box" class="hidden" style="margin-top: 14px;">
+      <h2>Report</h2>
+      <pre id="report"></pre>
+    </div>
+    <div style="margin-top: 14px;">
+      <h2>Log</h2>
+      <pre id="log" style="max-height: 340px;"></pre>
+    </div>
+  </section>
+
+  <section>
+    <h2>Recent backups</h2>
+    <p class="muted" id="runs-empty">None since the server started.</p>
+    <table id="runs" class="hidden">
+      <thead><tr><th>#</th><th>Started</th><th>By</th><th>Source → destination</th><th>Guests</th><th>State</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+"use strict";
+const CSRF = document.querySelector('meta[name="csrf-token"]').content;
+const $ = (id) => document.getElementById(id);
+let selectedRun = null;   // run shown; null: the most recent one
+let shownRun = null;      // run whose log is on screen
+let logTotal = 0;         // log lines of that run already shown
+let timer = null;
+
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = text;  // never innerHTML: names come from the hypervisor
+  if (cls) node.className = cls;
+  return node;
+}
+
+function bytes(n) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (Math.abs(n) >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return i === 0 ? `${Math.round(n)} B` : `${n.toFixed(1)} ${units[i]}`;
+}
+
+function duration(s) {
+  s = Math.floor(s);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+function time(iso) {
+  return iso ? new Date(iso).toLocaleString() : "";
+}
+
+async function call(url, options = {}) {
+  options.headers = Object.assign({"X-CSRFToken": CSRF, "Content-Type": "application/json"}, options.headers || {});
+  options.credentials = "same-origin";
+  const response = await fetch(url, options);
+  if (response.status === 401) { window.location = "{% url 'login' %}"; throw new Error("not logged in"); }
+  let data = {};
+  try { data = await response.json(); } catch (e) { /* empty body */ }
+  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  return data;
+}
+
+// ------------------------------------------------------------------ guests
+
+function mode() { return document.querySelector('input[name="mode"]:checked').value; }
+
+function showMode() {
+  const all = mode() === "all";
+  $("check-header").textContent = all ? "Exclude" : "Back up";
+  $("mode-help").textContent = all
+    ? "Every guest of the source, including new ones; tick the ones to leave out."
+    : "Only the ticked guests.";
+  for (const box of document.querySelectorAll("#guests tbody input")) box.checked = false;
+}
+
+async function loadGuests() {
+  const tbody = $("guests").querySelector("tbody");
+  tbody.replaceChildren();
+  $("guests").classList.add("hidden");
+  $("guests-message").textContent = "Loading guests…";
+  $("guests-message").className = "muted";
+  try {
+    const data = await call(`{% url 'guests' %}?source=${encodeURIComponent($("source").value)}`);
+    for (const g of data.guests) {
+      const tr = el("tr");
+      const box = el("input");
+      box.type = "checkbox";
+      box.value = g.id;
+      const cell = el("td");
+      cell.append(box);
+      tr.append(cell, el("td", g.id), el("td", g.kind.toUpperCase()), el("td", g.name), el("td", g.host), el("td", g.status));
+      tbody.append(tr);
+    }
+    $("guests-message").textContent = data.guests.length ? "" : "No guest on this source.";
+    $("guests").classList.toggle("hidden", !data.guests.length);
+  } catch (e) {
+    $("guests-message").textContent = e.message;
+    $("guests-message").className = "error";
+  }
+}
+
+async function startBackup() {
+  const ticked = [...document.querySelectorAll("#guests tbody input:checked")].map((b) => b.value);
+  const all = mode() === "all";
+  if (!all && !ticked.length) { $("start-error").textContent = "Tick at least one guest."; return; }
+  $("start-error").textContent = "";
+  $("start-button").disabled = true;
+  try {
+    const data = await call("{% url 'start' %}", {
+      method: "POST",
+      body: JSON.stringify({
+        source: $("source").value, target: $("target").value,
+        all: all, guests: all ? [] : ticked, exclude: all ? ticked : [],
+      }),
+    });
+    selectedRun = data.run;
+    await refresh();
+  } catch (e) {
+    $("start-error").textContent = e.message;
+  } finally {
+    $("start-button").disabled = false;
+  }
+}
+
+// ------------------------------------------------------------------ runs
+
+function progressLine(name, p, cls) {
+  const line = el("div", null, "progress-line" + (cls ? " " + cls : ""));
+  const bar = el("div", null, "bar" + (p.percent === null ? " unknown" : ""));
+  const fill = el("span");
+  fill.style.width = `${p.percent === null ? 0 : p.percent}%`;
+  bar.append(fill);
+  const parts = [];
+  if (p.percent !== null) parts.push(`${p.approximate ? "~" : ""}${Math.floor(p.percent)}%`);
+  parts.push(p.total ? `${bytes(p.done)} / ${p.approximate ? "~" : ""}${bytes(p.total)}` : bytes(p.done));
+  if (p.done) parts.push(`${bytes(p.rate)}/s`);
+  if (p.eta !== null && p.eta !== undefined) parts.push(`ETA ${duration(p.eta)}`);
+  line.append(el("div", name), bar, el("div", parts.join("  ·  "), "numbers"));
+  return line;
+}
+
+function showProgress(run) {
+  const box = $("progress");
+  box.replaceChildren();
+  const p = run.progress;
+  if (!p) return;
+  const overall = progressLine(`${run.guests_done}/${run.guests_total} guests`, p, "overall");
+  overall.querySelector(".numbers").textContent += `  ·  ${duration(p.elapsed)}`;
+  box.append(overall);
+  for (const t of p.tasks) box.append(progressLine(t.name, t));
+}
+
+function showResults(run) {
+  const tbody = $("results").querySelector("tbody");
+  tbody.replaceChildren();
+  for (const r of run.results) {
+    const tr = el("tr");
+    const disks = r.disks.map((d) => `${d.key} ${bytes(d.size)} (${bytes(d.sent_bytes)} sent)`).join(", ");
+    tr.append(
+      el("td", r.guest.label),
+      el("td", r.ok ? "OK" : "FAILED", r.ok ? "state-ok" : "state-failed"),
+      el("td", duration(r.duration)),
+      el("td", r.ok ? `${r.snapshot}${disks ? " · " + disks : ""}` : r.error),
+    );
+    tbody.append(tr);
+  }
+  $("results").classList.toggle("hidden", !run.results.length);
+}
+
+function showRun(run) {
+  $("run").classList.toggle("hidden", !run);
+  if (!run) return;
+  if (shownRun !== run.id) { shownRun = run.id; logTotal = 0; $("log").textContent = ""; }
+  $("run-id").textContent = `#${run.id}`;
+  $("run-state").textContent = run.state;
+  $("run-state").className = `badge state-${run.state}`;
+  let info = `${run.source} → ${run.target} · started ${time(run.started)} by ${run.user}`;
+  if (run.finished) info += ` · ended ${time(run.finished)}`;
+  if (run.cancelled_by) info += ` · cancelled by ${run.cancelled_by}`;
+  $("run-info").textContent = info;
+  $("run-error").textContent = run.error;
+  $("cancel-button").classList.toggle("hidden", run.state !== "running");
+  $("cancel-button").dataset.run = run.id;
+  showProgress(run);
+  showResults(run);
+  $("report-box").classList.toggle("hidden", !run.report.length);
+  $("report").textContent = run.report.join("\n");
+  if (run.logs.length) {
+    const log = $("log");
+    const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+    log.textContent += run.logs.join("\n") + "\n";
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+  logTotal = run.log_total;
+}
+
+function showRuns(runs) {
+  const tbody = $("runs").querySelector("tbody");
+  tbody.replaceChildren();
+  for (const r of runs) {
+    const tr = el("tr");
+    tr.style.cursor = "pointer";
+    tr.addEventListener("click", () => { selectedRun = r.id; refresh(); });
+    const guests = `${r.guests_done}/${r.guests_total}` + (r.guests_failed ? ` (${r.guests_failed} failed)` : "");
+    tr.append(el("td", `#${r.id}`), el("td", time(r.started)), el("td", r.user),
+      el("td", `${r.source} → ${r.target}`), el("td", guests), el("td", r.state, `state-${r.state}`));
+    tbody.append(tr);
+  }
+  $("runs").classList.toggle("hidden", !runs.length);
+  $("runs-empty").classList.toggle("hidden", runs.length > 0);
+}
+
+async function refresh() {
+  clearTimeout(timer);
+  let active = false;
+  try {
+    const params = new URLSearchParams();
+    if (selectedRun !== null) params.set("run", selectedRun);
+    const target = selectedRun !== null ? selectedRun : shownRun;
+    if (target !== null && target === shownRun) params.set("logs_after", logTotal);
+    let data = await call(`{% url 'status' %}?${params}`);
+    if (data.run && data.run.id !== shownRun && params.has("logs_after")) {
+      // another run started meanwhile: its whole log, not the end of the previous one
+      params.delete("logs_after");
+      data = await call(`{% url 'status' %}?${params}`);
+    }
+    showRuns(data.runs);
+    showRun(data.run);
+    active = data.busy;
+    $("start-button").disabled = data.busy;
+  } catch (e) {
+    $("run-error").textContent = e.message;
+  } finally {
+    timer = setTimeout(refresh, active ? 1000 : 5000);
+  }
+}
+
+async function cancelRun() {
+  const id = $("cancel-button").dataset.run;
+  if (!confirm(`Cancel backup #${id}? The snapshots are deleted and the unfinished backups removed.`)) return;
+  try {
+    await call(`/api/backups/${encodeURIComponent(id)}/cancel`, {method: "POST"});
+  } catch (e) {
+    $("run-error").textContent = e.message;
+  }
+  refresh();
+}
+
+for (const radio of document.querySelectorAll('input[name="mode"]')) radio.addEventListener("change", showMode);
+$("source").addEventListener("change", loadGuests);
+$("load-guests").addEventListener("click", loadGuests);
+$("start-button").addEventListener("click", startBackup);
+$("cancel-button").addEventListener("click", cancelRun);
+showMode();
+if ($("source").options.length) loadGuests(); else $("guests-message").textContent = "No source configured.";
+refresh();
+</script>
+{% endblock %}

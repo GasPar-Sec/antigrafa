@@ -1,16 +1,18 @@
 """Loading the TOML configuration (see ``antigrafa.example.toml``).
 
 Generic sections: ``[source.<name>]`` (one per cluster or host, with its ``type``),
-``[target.<name>]`` and ``[tuning]``. The rest of a source section belongs to its
+``[target.<name>]``, ``[tuning]`` and ``[web]`` (the web interface). The rest of a source section belongs to its
 platform, which validates it (see ``antigrafa.platforms``).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import os
+import sys
 import tomllib
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from .platforms.base import check_name
@@ -19,6 +21,21 @@ from .targets import TargetConfig
 
 class ConfigError(Exception):
     pass
+
+
+def _system_dir(*parts: str, platform: str = sys.platform, environ=os.environ) -> PurePath:
+    """Linux: ``parts`` as given (/etc/antigrafa/...); Windows: %PROGRAMDATA%/antigrafa/<the rest>."""
+    if platform == "win32":
+        return PureWindowsPath(environ.get("PROGRAMDATA", r"C:\ProgramData"), "antigrafa", *parts[1:])
+    return PurePosixPath(*parts)
+
+
+def default_config_path(platform: str = sys.platform, environ=os.environ) -> str:
+    return str(_system_dir("/etc/antigrafa", "antigrafa.toml", platform=platform, environ=environ))
+
+
+def default_web_dir(platform: str = sys.platform, environ=os.environ) -> str:
+    return str(_system_dir("/var/lib/antigrafa", "web", platform=platform, environ=environ))
 
 
 @dataclass
@@ -50,10 +67,51 @@ class Tuning:
 
 
 @dataclass
+class WebConfig:
+    """The web interface (``antigrafa web serve``): HTTPS only, with a login."""
+
+    # Every interface: the page is used from other machines (HTTPS only, with a login)
+    listen: str = "0.0.0.0"  # nosec B104
+    port: int = 8443
+    data_dir: str = ""  # users, sessions, secret key, certificate; "": default_web_dir()
+    # "": <data_dir>/tls/; created (self-signed) when neither file exists
+    cert_file: str = ""
+    key_file: str = ""
+    # Host names the browser may use; []: this machine's names and addresses
+    allowed_hosts: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        for name in ("listen", "data_dir", "cert_file", "key_file"):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f"{name} must be a string")
+        if not self.listen:
+            raise ValueError("listen must not be empty")
+        if isinstance(self.port, bool) or not isinstance(self.port, int) or not 1 <= self.port <= 65535:
+            raise ValueError(f"port must be between 1 and 65535, not {self.port!r}")
+        if not isinstance(self.allowed_hosts, list) or not all(isinstance(h, str) and h for h in self.allowed_hosts):
+            raise ValueError("allowed_hosts must be a list of host names")
+        if bool(self.cert_file) != bool(self.key_file):
+            raise ValueError("cert_file and key_file go together")
+
+    @property
+    def directory(self) -> Path:
+        return Path(self.data_dir or default_web_dir())
+
+    @property
+    def certificate(self) -> Path:
+        return Path(self.cert_file) if self.cert_file else self.directory / "tls" / "cert.pem"
+
+    @property
+    def private_key(self) -> Path:
+        return Path(self.key_file) if self.key_file else self.directory / "tls" / "key.pem"
+
+
+@dataclass
 class Config:
     sources: dict[str, SourceConfig]
     targets: dict[str, TargetConfig]
     tuning: Tuning
+    web: WebConfig = field(default_factory=WebConfig)
 
     def source(self, name: str | None) -> SourceConfig:
         return _pick(self.sources, name, "source")
@@ -132,7 +190,7 @@ def load_config(path: str | Path) -> Config:
             f"[{'], ['.join(sorted(old))}]: these sections moved into [source.<name>] "
             'with type = "proxmox" (see antigrafa.example.toml)'
         )
-    unknown = set(raw) - {"source", "target", "tuning"}
+    unknown = set(raw) - {"source", "target", "tuning", "web"}
     if unknown:
         raise ConfigError(f"unknown sections: {', '.join(sorted(unknown))}")
 
@@ -147,4 +205,5 @@ def load_config(path: str | Path) -> Config:
         sources={name: _source(name, data) for name, data in _tables(raw, "source").items()},
         targets=targets,
         tuning=build_section(Tuning, raw.get("tuning", {}), "tuning"),
+        web=build_section(WebConfig, raw.get("web", {}), "web"),
     )
