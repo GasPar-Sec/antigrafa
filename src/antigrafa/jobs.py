@@ -19,12 +19,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from . import __version__
 from .adaptive import MiB, SourceThrottle, WriteController, WriteTuning
 from .config import Tuning
-from .index import write_index, write_manifest
-from .pipeline import StreamStats, backup_stream
+from .index import IndexCorrupted, read_index, read_manifest, write_index, write_manifest
+from .pipeline import StreamStats, backup_delta, backup_stream
 from .platforms.base import DiskSource, Guest, Platform
 from .progress import Progress
 from .targets import Repository
@@ -39,6 +40,13 @@ PHASES = ("wait", "prepare", "snapshot", "transfer", "cleanup", "flush")
 
 class BackupError(Exception):
     pass
+
+
+class BackupCancelled(BackupError):
+    """Stopped on request: the snapshot is deleted and the partial backup removed."""
+
+    def __init__(self) -> None:
+        super().__init__("cancelled")
 
 
 @dataclass
@@ -85,14 +93,22 @@ def write_tuning(t: Tuning) -> WriteTuning:
 
 
 class BackupRunner:
+    # Seconds between the tries to delete a snapshot (about 30 s in all)
+    delete_retry_delays: tuple[float, ...] = (2, 4, 8, 16)
+
     def __init__(
         self,
         tuning: Tuning,
         platform: Platform,
         repo: Repository,
         progress: Progress | None = None,
+        cancel: threading.Event | None = None,
+        on_result: Callable[[GuestResult], None] | None = None,
     ) -> None:
         self.tuning = tuning
+        # Set: the disks being read stop at the next chunk, guests not started never start
+        self.cancel = cancel if cancel is not None else threading.Event()
+        self.on_result = on_result  # called as each guest ends, from its thread
         self.platform = platform
         self.repo = repo
         self.progress = progress if progress is not None else Progress(enabled=False)
@@ -142,6 +158,10 @@ class BackupRunner:
         with ThreadPoolExecutor(max_workers=self.tuning.max_parallel_guests, thread_name_prefix="guest") as pool:
             return list(pool.map(self._safe_backup, guests))
 
+    def _check_cancel(self) -> None:
+        if self.cancel.is_set():
+            raise BackupCancelled()
+
     def _update_status(self) -> None:
         self.progress.set_status(f"{self._guests_done}/{self._guests_total} guests")
 
@@ -150,6 +170,9 @@ class BackupRunner:
         timings: dict[str, float] = {}
         try:
             result = self.backup_guest(g, timings)
+        except BackupCancelled as exc:
+            log.warning("%s: cancelled", g.label)
+            result = GuestResult(guest=g, ok=False, error=str(exc), timings=timings)
         except Exception as exc:
             log.error("%s: failed: %s", g.label, exc)
             result = GuestResult(guest=g, ok=False, error=str(exc), timings=timings)
@@ -157,6 +180,11 @@ class BackupRunner:
         with self._lock:
             self._guests_done += 1
             self._update_status()
+        if self.on_result is not None:
+            try:
+                self.on_result(result)
+            except Exception as exc:  # a display problem never fails the backup
+                log.error("%s: result not reported: %s", g.label, exc)
         return result
 
     def backup_guest(self, g: Guest, timings: dict[str, float] | None = None) -> GuestResult:
@@ -165,6 +193,7 @@ class BackupRunner:
         with _timed(timings, "wait"):  # other guests of the same host first
             slot.acquire()
         try:
+            self._check_cancel()  # cancelled while waiting: nothing done yet
             with _timed(timings, "prepare"):
                 now = datetime.now(timezone.utc)
                 snapname = SNAP_PREFIX + now.strftime("%Y%m%dT%H%M%S")
@@ -176,6 +205,7 @@ class BackupRunner:
                 self._warn_stale_snapshots(g)
                 dest = self.repo.create_snapshot_dir(self.platform.name, g.kind, g.id, now)
             try:
+                self._check_cancel()
                 log.info("%s: snapshot %s", g.label, snapname)
                 with _timed(timings, "snapshot"):
                     self.platform.create_snapshot(g, snapname)
@@ -215,16 +245,30 @@ class BackupRunner:
                 name=f"{g.id}/{src.key}",
                 approximate=size is None,
             )
-            with task, src.open_stream() as stream:
-                digests, stats = backup_stream(
-                    stream.stdout,
-                    self.repo.store,
-                    self.controller,
-                    self._writers,
-                    self._throttle(g.host),
-                    self.chunk_size,
-                    on_read=task.advance,
-                )
+            reference = self._reference(g, src)
+
+            def advance(n: int) -> None:
+                task.advance(n)
+                self._check_cancel()  # raised through the read: stream closed, snapshot deleted
+
+            with task:
+                self._check_cancel()
+                hashed = src.open_hashed_stream(reference, self.chunk_size) if reference else None
+                if hashed is not None:
+                    log.debug("%s: %s: hashed on the source, %d chunks of reference", g.label, src.key, len(reference))
+                else:
+                    log.debug("%s: %s: every chunk sent", g.label, src.key)
+                with hashed or src.open_stream() as stream:
+                    store, throttle = self.repo.store, self._throttle(g.host)
+                    if hashed is not None:
+                        digests, stats = backup_delta(
+                            stream.stdout, reference, store, self.controller, self._writers, throttle, advance
+                        )
+                    else:
+                        digests, stats = backup_stream(
+                            stream.stdout, store, self.controller, self._writers, throttle, self.chunk_size,
+                            on_read=advance,
+                        )
         finally:
             try:
                 src.cleanup()
@@ -238,18 +282,42 @@ class BackupRunner:
         write_index(dest / f"{src.key}.{ext}.fidx", size, self.chunk_size, digests)
         rate = stats.bytes_read / MiB / stats.elapsed if stats.elapsed else 0.0
         log.info(
-            "%s: %s: %.0f MiB in %.0f s (%.0f MiB/s), %d new chunks, %d reused",
+            "%s: %s: %.0f MiB in %.0f s (%.0f MiB/s), %d new chunks, %d reused, %.0f MiB sent",
             g.label, src.key, size / MiB, stats.elapsed, rate, stats.new_chunks, stats.reused_chunks,
+            stats.sent_bytes / MiB,
         )
         return DiskResult(key=src.key, volume=src.volume, format=src.format, size=size, stats=stats)
 
-    def _delete_snapshot(self, g: Guest, snapname: str) -> None:
+    def _reference(self, g: Guest, src: DiskSource) -> list[bytes]:
+        """Digests of the same disk in the previous complete backup ([]: none usable)."""
+        previous = self.repo.latest_backup(self.platform.name, g.kind, g.id)
+        if previous is None:
+            return []
         try:
-            self.platform.delete_snapshot(g, snapname)
-        except Exception as exc:
-            # A forgotten snapshot grows with every VM write: report it loudly.
-            log.error("%s: FAILED to delete snapshot %s, remove it by hand: %s", g.label, snapname, exc)
-            raise
+            disks = read_manifest(previous)["disks"]
+            entry = next((d for d in disks if d["key"] == src.key and d["format"] == src.format), None)
+            if entry is None:
+                return []
+            _, chunk_size, digests = read_index(previous / entry["index"])
+        except (OSError, ValueError, KeyError, TypeError, IndexCorrupted) as exc:
+            log.warning("%s: %s: previous backup unreadable (%s): every chunk sent", g.label, src.key, exc)
+            return []
+        return digests if chunk_size == self.chunk_size else []
+
+    def _delete_snapshot(self, g: Guest, snapname: str) -> None:
+        # Tried again: after a stopped read (cancel, error), the reader on the host can
+        # keep the snapshot open a few more seconds ("dataset is busy" on ZFS).
+        for delay in (*self.delete_retry_delays, None):
+            try:
+                self.platform.delete_snapshot(g, snapname)
+                return
+            except Exception as exc:
+                if delay is None:
+                    # A forgotten snapshot grows with every VM write: report it loudly.
+                    log.error("%s: FAILED to delete snapshot %s, remove it by hand: %s", g.label, snapname, exc)
+                    raise
+                log.warning("%s: snapshot %s not deleted yet, new try in %g s: %s", g.label, snapname, delay, exc)
+                time.sleep(delay)
 
     def _warn_stale_snapshots(self, g: Guest) -> None:
         try:

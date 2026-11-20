@@ -6,65 +6,39 @@ import pytest
 
 from antigrafa.ssh import RemoteCommandError, RemoteStream, SSHHost
 
-# The RemoteStream tests run a local shell in place of ssh: sh on Linux, cmd on Windows.
-linux_only = pytest.mark.skipif(sys.platform != "linux", reason="needs a POSIX sh")
-windows_only = pytest.mark.skipif(sys.platform != "win32", reason="needs cmd.exe")
+# The RemoteStream tests run a local shell in place of ssh: sh on Linux and macOS,
+# cmd.exe on Windows. Every test runs on every system, with the commands of its shell.
+WINDOWS = sys.platform == "win32"
 
 
-def _local(cmd):
+def _local(posix: str, windows: str) -> RemoteStream:
     err = tempfile.TemporaryFile()
-    proc = subprocess.Popen(["sh", "-c", cmd], stdout=subprocess.PIPE, stderr=err, bufsize=0)
+    if WINDOWS:
+        # A command line string: cmd.exe parses its own quoting, unlike sh -c
+        cmd = windows
+        proc = subprocess.Popen(f"cmd.exe /d /c {cmd}", stdout=subprocess.PIPE, stderr=err, bufsize=0)
+    else:
+        cmd = posix
+        proc = subprocess.Popen(["sh", "-c", cmd], stdout=subprocess.PIPE, stderr=err, bufsize=0)
     return RemoteStream("local", cmd, proc, err)
 
 
-def _local_windows(cmd):
-    err = tempfile.TemporaryFile()
-    # A command line string: cmd.exe parses its own quoting, unlike sh -c
-    proc = subprocess.Popen(f"cmd.exe /d /c {cmd}", stdout=subprocess.PIPE, stderr=err, bufsize=0)
-    return RemoteStream("local", cmd, proc, err)
-
-
-@linux_only
 def test_stream_ok():
-    with _local("printf abc") as s:
-        assert s.stdout.read() == b"abc"
+    with _local("printf abc", "echo abc") as s:
+        assert s.stdout.read() == (b"abc\r\n" if WINDOWS else b"abc")
 
 
-@windows_only
-def test_stream_ok_windows():
-    with _local_windows("echo abc") as s:
-        assert s.stdout.read() == b"abc\r\n"
-
-
-@linux_only
 def test_stream_failure_is_reported_with_stderr():
-    with pytest.raises(RemoteCommandError, match="vanished"):
-        with _local("echo vanished >&2; exit 3") as s:
-            s.stdout.read()
-
-
-@windows_only
-def test_stream_failure_is_reported_with_stderr_windows():
     with pytest.raises(RemoteCommandError, match="vanished") as exc:
-        with _local_windows("echo vanished 1>&2 & exit 3") as s:
+        with _local("echo vanished >&2; exit 3", "echo vanished 1>&2 & exit 3") as s:
             s.stdout.read()
     assert exc.value.returncode == 3
 
 
-@linux_only
 def test_stream_abort_kills_reader():
     with pytest.raises(ValueError):
-        with _local("yes") as s:
-            s.stdout.read(10)
-            raise ValueError("destination down")
-    assert s.proc.returncode is not None
-
-
-@windows_only
-def test_stream_abort_kills_reader_windows():
-    with pytest.raises(ValueError):
-        # Endless output, like yes: only the kill can stop it
-        with _local_windows("for /l %i in (0,0,1) do @echo y") as s:
+        # Endless output: only the kill can stop it
+        with _local("yes", "for /l %i in (0,0,1) do @echo y") as s:
             s.stdout.read(10)
             raise ValueError("destination down")
     assert s.proc.returncode is not None
@@ -125,3 +99,53 @@ def test_run_logs_command_at_debug(monkeypatch, caplog):
     SSHHost("pve1", user="backup").run("zfs list")
     assert "ssh backup@pve1: zfs list" in caplog.text
     assert "ssh pve1: exit 0 in" in caplog.text
+
+
+def test_stream_sends_input_first(monkeypatch):
+    # A local python in place of ssh: the same on every platform
+    echo = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read()[::-1])"]
+    monkeypatch.setattr(SSHHost, "_argv", lambda self, command: echo)
+    with SSHHost("pve1").stream("reverse", input=b"abc" * 100000) as s:
+        assert s.stdout.read() == (b"abc" * 100000)[::-1]
+
+
+def test_send_writes_everything_even_in_small_pieces():
+    from antigrafa.ssh import _send
+
+    class Slow:
+        def __init__(self):
+            self.data, self.closed = b"", False
+
+        def write(self, view):
+            self.data += bytes(view[:3])
+            return min(3, len(view))
+
+        def close(self):
+            self.closed = True
+
+    pipe = Slow()
+    _send(pipe, b"0123456789")
+    assert pipe.data == b"0123456789" and pipe.closed
+
+
+def test_send_to_a_command_that_already_ended():
+    from antigrafa.ssh import _send
+
+    class Gone:
+        def write(self, view):
+            raise BrokenPipeError
+
+        def close(self):
+            raise BrokenPipeError
+
+    _send(Gone(), b"data")  # no error here: the exit status of the command reports it
+
+
+def test_long_commands_are_shortened_in_messages():
+    from antigrafa.ssh import _short
+
+    assert _short("zfs list") == "zfs list"
+    long = "python3 -c '" + "x" * 1000 + "'"
+    assert _short(long).endswith(f"... ({len(long)} characters)") and len(_short(long)) < 340
+    err = RemoteCommandError("pve1", long, 1, "boom")
+    assert len(str(err)) < 400 and "boom" in str(err)

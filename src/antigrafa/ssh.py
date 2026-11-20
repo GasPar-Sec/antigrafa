@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 class RemoteCommandError(Exception):
     def __init__(self, host: str, command: str, returncode: int, stderr: str) -> None:
-        super().__init__(f"{host}: '{command}' failed (exit {returncode}): {stderr.strip()}")
+        super().__init__(f"{host}: '{_short(command)}' failed (exit {returncode}): {stderr.strip()}")
         self.returncode = returncode
         self.stderr = stderr
 
@@ -85,11 +85,38 @@ class SSHHost:
             raise RemoteCommandError(self.host, command, res.returncode, res.stderr.decode(errors="replace"))
         return res.stdout.decode()
 
-    def stream(self, command: str) -> RemoteStream:
+    def stream(self, command: str, input: bytes | None = None) -> RemoteStream:
+        """Start ``command``; ``input`` is written to its standard input first, then closed.
+
+        The remote command must read all of ``input`` before writing much output.
+        """
         stderr_file = tempfile.TemporaryFile()
         argv = self._argv(command)
-        log.debug("ssh %s@%s (stream): %s", self.user, self.host, command)
-        pipes = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": stderr_file}
+        log.debug("ssh %s@%s (stream): %s", self.user, self.host, _short(command))
+        stdin = subprocess.DEVNULL if input is None else subprocess.PIPE
+        pipes = {"stdin": stdin, "stdout": subprocess.PIPE, "stderr": stderr_file}
         # Argument list without a shell, as in run()
         proc = subprocess.Popen(argv, bufsize=0, **pipes)  # nosec B603
+        if input is not None:
+            _send(proc.stdin, input)
         return RemoteStream(self.host, command, proc, stderr_file)
+
+
+def _send(pipe, data: bytes) -> None:
+    """Write everything (an unbuffered pipe may take part of it), then close."""
+    view = memoryview(data)
+    try:
+        while view:
+            view = view[pipe.write(view) :]
+    except BrokenPipeError:
+        pass  # the remote command already ended: its exit status tells why
+    finally:
+        try:
+            pipe.close()
+        except BrokenPipeError:
+            pass
+
+
+def _short(command: str, limit: int = 300) -> str:
+    """Commands with an inline script are long: keep the log readable."""
+    return command if len(command) <= limit else f"{command[:limit]}... ({len(command)} characters)"

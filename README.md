@@ -41,7 +41,8 @@ read the disks: see [Adding a platform](#adding-a-platform).
    guest. The guest resumes right away.
 2. **Transfer**: Antigrafa reads the snapshot (over SSH for Proxmox VE: `dd`,
    `rbd export` or `tar`, depending on the storage). If the destination slows down,
-   only the backup slows down: the guest is never in the loop.
+   only the backup slows down: the guest is never in the loop. Only what changed
+   crosses the network (see [Only changes are sent](#only-changes-are-sent)).
 3. **Cleanup**: the snapshot is deleted in every case, success or failure.
 
 The trade-off: the snapshot takes space on the source storage for as long as the
@@ -58,6 +59,31 @@ transfer lasts.
 
 The destination is shared: a single controller drives every concurrent backup that
 writes to it.
+
+## Only changes are sent
+
+For a slow link (a remote site over the internet) or a slow destination, the chunks
+are hashed on the source host, before anything is sent:
+
+1. Antigrafa sends the digests of the previous backup of the disk to a small Python
+   script run on the host (standard library only, nothing to install);
+2. the script reads the snapshot chunk by chunk and hashes each chunk;
+3. a chunk with the same digest as before at the same position is not sent: only a
+   5-byte "unchanged" record is. A changed chunk is sent with its digest, checked
+   again on arrival;
+4. Antigrafa writes a complete index: every backup is still a full image, restored
+   on its own.
+
+| | Without (`remote_hash = false`) | With (default) |
+|---|---|---|
+| Network | every chunk | changed chunks only |
+| Destination | lookup of every chunk, writes of new ones | writes of changed chunks only |
+| Source host | reads the snapshot | reads the snapshot and hashes it (CPU, at low priority) |
+
+The first backup of a disk sends everything. The report shows what was sent
+(`Sent over the network: 1.2 GiB (3% of what was read)`). On Proxmox VE, without
+`python3` on a node, its chunks are all sent (a warning says so). Container archives
+gain less: a file that changes size shifts everything after it in the archive.
 
 ## Proxmox VE
 
@@ -121,6 +147,10 @@ cp antigrafa.example.toml /etc/antigrafa/antigrafa.toml
 
 Requires Python 3.11 or later. On Python 3.14+, zstd comes from the standard library
 and the project has no dependencies.
+
+On Windows, the configuration goes to `%PROGRAMDATA%\antigrafa\antigrafa.toml`
+(`C:\ProgramData\antigrafa\antigrafa.toml`) instead of `/etc/antigrafa/antigrafa.toml`;
+`-c` picks another file.
 
 Declare one `[source.<name>]` section per cluster or host (with its `type`), and one
 `[target.<name>]` per destination. Each platform has its own requirements: see
@@ -189,6 +219,65 @@ New data: 4.7 GiB -> 2.1 GiB written (final zstd level 5, 6 parallel writes)
 (`max_parallel_per_host`). *Flush*: forcing the data onto the destination's disk,
 then writing the manifest. A failed guest shows the phases it reached. The report is
 printed even with `-q`.
+
+## Web interface
+
+A web page to start backups, follow them live and cancel them, served over HTTPS only,
+on Linux and Windows:
+
+```sh
+pip install '.[web]'                 # Django, cheroot (HTTPS server), cryptography
+antigrafa web adduser admin          # asks for the password (12 characters or more)
+antigrafa web serve                  # https://<this machine>:8443/
+```
+
+- **Start**: source, destination, then every guest (with exclusions) or the chosen
+  ones. The configuration, the destination, the guests and the token's rights are
+  checked before the page says it started: an error shows up at once.
+- **Follow**: one bar per disk being read and an overall bar (percentage, rate, ETA),
+  each guest's result as it ends, the log, then the full report.
+- **Cancel**: the disks being read stop at the next chunk, the snapshots are deleted
+  and the unfinished backups removed; guests not started yet are skipped.
+- One backup at a time. The last 20 runs stay listed until the server stops.
+
+**Certificate.** Without one, a self-signed certificate is created on the first start
+(ECDSA P-256, valid 397 days, renewed by Antigrafa 30 days before it expires) for the
+machine's names and addresses. The browser warns on the first visit: check that it shows
+the SHA-256 fingerprint printed at startup. To use your own certificate, set `cert_file`
+and `key_file`; Antigrafa never replaces a certificate it did not create.
+
+**Data.** Users (passwords hashed by Django), sessions, the secret key and the generated
+certificate live in `data_dir`: `/var/lib/antigrafa/web` on Linux (mode 0700),
+`%PROGRAMDATA%\antigrafa\web` on Windows (rights limited to SYSTEM, Administrators and
+the account running Antigrafa).
+
+**Stopping.** Ctrl+C, or SIGTERM (`systemctl stop`): a running backup is cancelled
+first, so that its snapshots are deleted.
+
+| Command | Effect |
+|---|---|
+| `antigrafa web serve` | start the web interface |
+| `antigrafa web adduser <name>` | create a user, or change its password (`--password-stdin` for scripts) |
+| `antigrafa web deluser <name>` | remove a user |
+
+Running as a service on Linux (systemd), `/etc/systemd/system/antigrafa-web.service`:
+
+```ini
+[Unit]
+Description=Antigrafa web interface
+After=network-online.target
+
+[Service]
+ExecStart=/opt/antigrafa/bin/antigrafa web serve
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+On Windows, `antigrafa web serve` runs in a console, or at startup through the Task
+Scheduler (run whether the user is logged on or not, with the account that has the SSH
+key). See the `[web]` section of [antigrafa.example.toml](antigrafa.example.toml).
 
 ## Repository format
 

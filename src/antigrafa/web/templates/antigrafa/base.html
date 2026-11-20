@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{ csrf_token }}">
+<title>{% block title %}Antigrafa{% endblock %}</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d232b; --muted: #5f6b7a; --line: #dde2e8;
+  --accent: #2c6bed; --accent-text: #ffffff; --ok: #1f8a4c; --bad: #c4352b; --warn: #b26a00;
+  --bar: #e6eaf0; --code: #f0f2f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181d; --panel: #1c2128; --text: #e6e9ed; --muted: #9aa5b1; --line: #2e353e;
+    --accent: #5b8cff; --accent-text: #0d1117; --ok: #4cc27f; --bad: #f0675d; --warn: #e3a33b;
+    --bar: #2a313a; --code: #161a20;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+header h1 { font-size: 18px; margin: 0; }
+header .who { color: var(--muted); display: flex; gap: 12px; align-items: center; }
+/* minmax(0, 1fr): a long line (error, report) never widens the page */
+main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; display: grid;
+  grid-template-columns: minmax(0, 1fr); gap: 16px; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+h2 { font-size: 16px; margin: 0 0 12px; }
+label { color: var(--muted); font-size: 13px; display: block; margin-bottom: 4px; }
+select, input[type=text], input[type=password] { width: 100%; padding: 7px 9px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit; }
+button { padding: 7px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel);
+  color: var(--text); font: inherit; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+button.danger { color: var(--bad); border-color: var(--bad); }
+button:disabled { opacity: .5; cursor: default; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+.row > div { flex: 1 1 180px; }
+.muted { color: var(--muted); }
+.error { color: var(--bad); white-space: pre-wrap; }
+.hidden { display: none !important; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top;
+  overflow-wrap: anywhere; }
+th { color: var(--muted); font-weight: 600; font-size: 13px; }
+pre { background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: 10px;
+  overflow: auto; font: 12.5px/1.4 ui-monospace, Consolas, monospace; margin: 0;
+  white-space: pre-wrap; overflow-wrap: anywhere; }  /* errors read in full, no sideways scrolling */
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  border: 1px solid currentColor; }
+.state-running, .state-cancelling { color: var(--accent); }
+.state-ok { color: var(--ok); }
+.state-failed { color: var(--bad); }
+.state-cancelled { color: var(--warn); }
+.bar { height: 10px; background: var(--bar); border-radius: 5px; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--accent); transition: width .4s; }
+.bar.unknown > span { width: 30% !important; animation: slide 1.4s infinite linear; }
+@keyframes slide { from { margin-left: -30%; } to { margin-left: 100%; } }
+.progress-line { display: grid; grid-template-columns: minmax(110px, 180px) 1fr auto; gap: 10px;
+  align-items: center; margin: 6px 0; font-size: 13.5px; }
+.progress-line .numbers { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.overall { font-size: 14.5px; font-weight: 600; }
+@media (max-width: 640px) {
+  .progress-line { grid-template-columns: 1fr; gap: 3px; }
+}
+</style>
+</head>
+<body>
+{% block body %}{% endblock %}
+</body>
+</html>

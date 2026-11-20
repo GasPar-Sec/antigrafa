@@ -9,12 +9,14 @@ itself. The VM never waits.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from typing import BinaryIO, Callable
 
 from .adaptive import SourceThrottle, WriteController
 from .chunkstore import ChunkStore, digest_of, encode_chunk
+from .delta import read_records
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
 
@@ -24,7 +26,9 @@ class StreamStats:
     bytes_read: int = 0
     chunks: int = 0
     new_chunks: int = 0
-    reused_chunks: int = 0
+    reused_chunks: int = 0  # already in the store (unchanged ones included)
+    unchanged_chunks: int = 0  # same as the previous backup: not even sent
+    sent_bytes: int = 0  # chunk data that crossed the network
     stored_bytes: int = 0
     elapsed: float = 0.0
 
@@ -66,6 +70,14 @@ def read_full(stream: BinaryIO, size: int) -> bytes:
     return b"".join(parts)
 
 
+def _chunks(stream: BinaryIO, chunk_size: int) -> Iterator[tuple[bytes, bytes, int]]:
+    while True:
+        data = read_full(stream, chunk_size)
+        if not data:
+            return
+        yield digest_of(data), data, len(data)
+
+
 def backup_stream(
     stream: BinaryIO,
     store: ChunkStore,
@@ -75,7 +87,32 @@ def backup_stream(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     on_read: Callable[[int], None] | None = None,
 ) -> tuple[list[bytes], StreamStats]:
-    """Back up ``stream``. ``on_read(n)`` is called after each chunk read (progress)."""
+    """Back up a raw stream. ``on_read(n)`` is called after each chunk read (progress)."""
+    return backup_records(_chunks(stream, chunk_size), store, controller, executor, throttle, on_read)
+
+
+def backup_delta(
+    stream: BinaryIO,
+    reference: Sequence[bytes],
+    store: ChunkStore,
+    controller: WriteController,
+    executor: Executor,
+    throttle: SourceThrottle | None = None,
+    on_read: Callable[[int], None] | None = None,
+) -> tuple[list[bytes], StreamStats]:
+    """Back up a stream hashed on the source host against ``reference`` (see ``delta``)."""
+    return backup_records(read_records(stream, reference), store, controller, executor, throttle, on_read)
+
+
+def backup_records(
+    records: Iterable[tuple[bytes, bytes | None, int]],
+    store: ChunkStore,
+    controller: WriteController,
+    executor: Executor,
+    throttle: SourceThrottle | None = None,
+    on_read: Callable[[int], None] | None = None,
+) -> tuple[list[bytes], StreamStats]:
+    """Store chunks given as (digest, data, length); data None: unchanged, already stored."""
     stats = StreamStats()
     digests: list[bytes] = []
     seen: set[bytes] = set()
@@ -95,18 +132,20 @@ def backup_stream(
             controller.limiter.release()
 
     try:
-        while True:
-            data = read_full(stream, chunk_size)
-            if not data:
-                break
+        for digest, data, length in records:
+            # The source read the chunk either way: it counts for its load and the progress
             if throttle is not None:
-                throttle.consume(len(data))
+                throttle.consume(length)
             if on_read is not None:
-                on_read(len(data))
-            digest = digest_of(data)
+                on_read(length)
             digests.append(digest)
-            stats.bytes_read += len(data)
+            stats.bytes_read += length
             stats.chunks += 1
+            if data is None:  # unchanged since the previous backup, which stored it
+                stats.reused_chunks += 1
+                stats.unchanged_chunks += 1
+                continue
+            stats.sent_bytes += length
             if digest in seen or store.has(digest):
                 stats.reused_chunks += 1
                 continue

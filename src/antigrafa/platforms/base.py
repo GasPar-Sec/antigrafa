@@ -90,6 +90,14 @@ class DiskSource(ABC):
         """
         return None
 
+    def open_hashed_stream(self, reference: list[bytes], chunk_size: int) -> Stream | None:
+        """Read the snapshot hashed on the source host, against the digests of the
+        previous backup: only changed chunks are sent (protocol: ``antigrafa.delta``).
+
+        ``None``: not supported here, ``open_stream`` is used instead.
+        """
+        return None
+
     @abstractmethod
     def open_stream(self) -> Stream:
         """Start reading the snapshot of this disk."""

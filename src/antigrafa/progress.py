@@ -177,6 +177,48 @@ class Progress:
             self.status = text
             self._maybe_draw(force=True)
 
+    # ----------------------------------------------------------------- state
+
+    def snapshot(self) -> dict:
+        """Where things stand, as plain values (the web interface draws its own bars).
+
+        ``percent``, ``total`` and ``eta`` are None when unknown (an archive of unknown
+        size is being read); ``approximate``: the percentage relies on an estimate.
+        """
+        with self._lock:
+            elapsed = max(self._clock() - self._start, 1e-6)
+            rate = self.done / elapsed
+            known = bool(self.total) and not self.unknown_open
+            left = self.total - self.done_known
+            approximate = self.approximate_open > 0
+            return {
+                "label": self.label,
+                "unit": self.unit,
+                "status": self.status,
+                "done": self.done,
+                "total": self.total if known else None,
+                "percent": _fraction(self.done_known, self.total, approximate) * 100 if known else None,
+                "approximate": approximate,
+                "rate": rate,
+                "eta": left / rate if known and rate and left > 0 else None,
+                "elapsed": elapsed,
+                "tasks": [self._task_snapshot(t) for t in self._running],
+            }
+
+    def _task_snapshot(self, task: Task) -> dict:
+        elapsed = max(self._clock() - task.start, 1e-6)
+        rate = task.done / elapsed
+        total = task.total or None
+        return {
+            "name": task.name,
+            "done": task.done,
+            "total": total,
+            "percent": _fraction(task.done, total, task.approximate) * 100 if total else None,
+            "approximate": task.approximate,
+            "rate": rate,
+            "eta": (total - task.done) / rate if total and rate and total > task.done else None,
+        }
+
     # ----------------------------------------------------------------- text
 
     def line(self, width: int | None = None, tasks: bool = True) -> str:

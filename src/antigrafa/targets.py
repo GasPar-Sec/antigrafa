@@ -148,6 +148,11 @@ class Repository:
             raise ValueError(f"invalid backup path: {snapshot}")
         return path
 
+    def latest_backup(self, source: str, kind: str, guest_id: str) -> Path | None:
+        """Directory of the most recent complete backup of a guest (None: never backed up)."""
+        found = sorted((self.root / source / kind / guest_id).glob(f"*/{MANIFEST_NAME}"))
+        return found[-1].parent if found else None
+
     def list_snapshots(self) -> list[tuple[str, dict]]:
         """Complete backups (with a manifest), sorted by path."""
         found = []

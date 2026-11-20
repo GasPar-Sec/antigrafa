@@ -6,30 +6,23 @@ import argparse
 import logging
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from . import platforms
-from .config import Config, ConfigError, load_config
+from . import operations
+from .config import Config, ConfigError, default_config_path, load_config
 from .index import read_index, read_manifest
 from .pipeline import restore_stream
-from .platforms.base import AccessDenied, Platform, PlatformError
+from .operations import new_data_line, open_platform, open_repository, report_lines, select_guests
+from .platforms.base import AccessDenied, PlatformError
 from .progress import Progress, ProgressLogHandler, human_bytes, human_duration
-from .targets import Repository, TargetUnavailable
+from .targets import TargetUnavailable
 
 log = logging.getLogger("antigrafa")
 
 
-def _platform(cfg: Config, name: str | None) -> Platform:
-    if not cfg.sources:
-        raise ConfigError("a [source.<name>] section is required for this command")
-    source = cfg.source(name)
-    return platforms.create_platform(source.type, source.name, source.settings)
-
-
-def _repo(cfg: Config, name: str | None) -> Repository:
-    repo = Repository(cfg.target(name))
-    repo.open()
-    return repo
+# Kept under their old names (tests and older code)
+_platform = open_platform
+_repo = open_repository
 
 
 _human = human_bytes
@@ -56,17 +49,7 @@ def cmd_backup(cfg: Config, args) -> int:
 
     platform = _platform(cfg, args.source)
     repo = _repo(cfg, args.target)
-    guests = platform.guests()
-    if not args.all:
-        wanted = set(args.guest or [])
-        if not wanted:
-            raise ConfigError("use --all or --guest")
-        missing = wanted - {g.id for g in guests}
-        if missing:
-            raise ConfigError(f"guests not found: {', '.join(sorted(missing))} (or not visible with these credentials)")
-        guests = [g for g in guests if g.id in wanted]
-    excluded = set(args.exclude or [])
-    guests = [g for g in guests if g.id not in excluded]
+    guests = select_guests(platform.guests(), args.guest, args.all, args.exclude)
     # Every right checked before the first snapshot: missing one stops everything
     platform.check_access(guests)
 
@@ -82,61 +65,18 @@ def cmd_backup(cfg: Config, args) -> int:
     elapsed = time.monotonic() - start
 
     _backup_report(results, started, elapsed)
-    s = runner.controller.stats()
-    if s["raw_bytes"]:
-        print(
-            f"New data: {_human(s['raw_bytes'])} -> {_human(s['stored_bytes'])} written "
-            f"(final zstd level {s['level']}, {s['concurrency']} parallel writes)"
-        )
+    new_data = new_data_line(runner.controller.stats())
+    if new_data:
+        print(new_data)
     return 0 if all(r.ok for r in results) else 1
 
 
-PHASE_LABELS = {
-    "wait": "waiting for host",
-    "prepare": "preparation",
-    "snapshot": "snapshot",
-    "transfer": "transfer",
-    "cleanup": "snapshot removal",
-    "flush": "flush",
-}
-
-
-def _secs(seconds: float) -> str:
-    """Short durations to the tenth of a second, longer ones as 1m 05s."""
-    return f"{seconds:.1f}s" if seconds < 10 else human_duration(seconds)
+PHASE_LABELS = operations.PHASE_LABELS
+_secs = operations.secs
 
 
 def _backup_report(results, started: datetime, elapsed: float) -> None:
-    """Everything about the time a backup took: overall, per guest, per phase, per disk."""
-    ended = started + timedelta(seconds=elapsed)
-    end_format = "%H:%M:%S" if ended.date() == started.date() else "%Y-%m-%d %H:%M:%S"
-    print(f"\nBackup report: {started:%Y-%m-%d %H:%M:%S} -> {ended.strftime(end_format)} ({_secs(elapsed)})")
-    for r in results:
-        status = "OK    " if r.ok else "FAILED"
-        detail = r.snapshot if r.ok else r.error
-        print(f"\n{status} {r.guest.label:<30} {_secs(r.duration):>8}  {detail}")
-        phases = [f"{PHASE_LABELS[k]} {_secs(v)}" for k, v in r.timings.items() if k in PHASE_LABELS]
-        if phases:
-            print("       " + ", ".join(phases))
-        for d in r.disks:
-            s = d.stats
-            rate = f"{_human(d.size / s.elapsed)}/s" if s.elapsed else "-"
-            print(
-                f"       {d.key:<12} {_human(d.size):>10}  {_secs(s.elapsed):>8}  {rate:>12}  "
-                f"{s.new_chunks} new chunks, {s.reused_chunks} reused"
-            )
-
-    ok = sum(1 for r in results if r.ok)
-    print(f"\nTotal: {len(results)} guest(s), {ok} OK, {len(results) - ok} failed, in {_secs(elapsed)}")
-    busy = sum(r.duration for r in results)
-    if busy > elapsed * 1.05:  # several guests at once
-        print(f"Sum of guest times: {_secs(busy)} (guests backed up in parallel)")
-    read = sum(d.size for r in results for d in r.disks)
-    if read and elapsed:
-        print(f"Read: {_human(read)}, {_human(read / elapsed)}/s on average")
-    if len(results) > 1:
-        longest = max(results, key=lambda r: r.duration)
-        print(f"Longest: {longest.guest.label} ({_secs(longest.duration)})")
+    print("\n".join(report_lines(results, started, elapsed)))
 
 
 def cmd_list(cfg: Config, args) -> int:
@@ -200,9 +140,53 @@ def cmd_restore(cfg: Config, args) -> int:
     return 0
 
 
+WEB_MISSING = "the web interface needs its extra dependencies: pip install 'antigrafa[web]'"
+
+
+def _web(module: str):
+    """A module of the web interface, or a clear error when Django & co. are missing."""
+    import importlib
+
+    try:
+        return importlib.import_module(f"antigrafa.web.{module}")
+    except ImportError as exc:
+        if exc.name and exc.name.split(".")[0] in ("django", "cheroot", "cryptography"):
+            raise ConfigError(WEB_MISSING) from None
+        raise
+
+
+def cmd_web_serve(cfg: Config, args) -> int:
+    return _web("server").serve(cfg, args.config)
+
+
+def _read_password(args) -> str:
+    if args.password_stdin:
+        return sys.stdin.readline().rstrip("\r\n")
+    import getpass
+
+    password = getpass.getpass(f"Password for {args.name}: ")
+    if getpass.getpass("Again: ") != password:
+        raise ConfigError("the two passwords differ")
+    return password
+
+
+def cmd_web_adduser(cfg: Config, args) -> int:
+    server = _web("server")
+    created = server.add_user(cfg, args.config, args.name, _read_password(args))
+    print(f"user {args.name} {'created' if created else 'updated (new password)'}")
+    return 0
+
+
+def cmd_web_deluser(cfg: Config, args) -> int:
+    if not _web("server").remove_user(cfg, args.config, args.name):
+        raise ConfigError(f"no user {args.name}")
+    print(f"user {args.name} removed")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="antigrafa", description="Backups for virtual machines and containers")
-    p.add_argument("-c", "--config", default="/etc/antigrafa/antigrafa.toml")
+    p.add_argument("-c", "--config", default=default_config_path(), help="default: %(default)s")
     talk = p.add_mutually_exclusive_group()
     talk.add_argument(
         "-v", "--verbose", action="count", default=0, help="more details: -v debug, -vv also threads and milliseconds"
@@ -243,6 +227,18 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("disk", help="e.g. scsi0, rootfs")
     r.add_argument("output")
     r.set_defaults(func=cmd_restore)
+
+    w = sub.add_parser("web", help="web interface (HTTPS): start and follow backups")
+    wsub = w.add_subparsers(dest="web_cmd", required=True)
+    ws = wsub.add_parser("serve", help="start the web interface (see the [web] section)")
+    ws.set_defaults(func=cmd_web_serve)
+    wa = wsub.add_parser("adduser", help="create a user of the web interface, or change its password")
+    wa.add_argument("name")
+    wa.add_argument("--password-stdin", action="store_true", help="read the password from the standard input")
+    wa.set_defaults(func=cmd_web_adduser)
+    wd = wsub.add_parser("deluser", help="remove a user of the web interface")
+    wd.add_argument("name")
+    wd.set_defaults(func=cmd_web_deluser)
     return p
 
 

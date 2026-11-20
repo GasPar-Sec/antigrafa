@@ -162,3 +162,71 @@ def test_source_selection():
         both.source(None)
     with pytest.raises(ConfigError, match="unknown source: c"):
         both.source("c")
+
+
+def test_remote_hash_setting(tmp_path):
+    assert load_config(_write(tmp_path, MINIMAL + PROXMOX)).source("pve").settings.remote_hash is True
+    text = MINIMAL + PROXMOX + "remote_hash = false\n"
+    assert load_config(_write(tmp_path, text)).source("pve").settings.remote_hash is False
+    with pytest.raises(ConfigError, match="remote_hash must be true or false"):
+        load_config(_write(tmp_path, MINIMAL + PROXMOX + "remote_hash = 'yes'\n"))
+
+
+# --------------------------------------------------------------------------- web interface
+
+
+def test_web_section_defaults_and_values(tmp_path):
+    from antigrafa.config import WebConfig, default_web_dir
+
+    cfg = load_config(_write(tmp_path, MINIMAL))
+    assert cfg.web == WebConfig()
+    assert cfg.web.port == 8443 and cfg.web.listen == "0.0.0.0"
+    assert cfg.web.directory == Path(default_web_dir())
+    assert cfg.web.certificate == Path(default_web_dir()) / "tls" / "cert.pem"
+    assert cfg.web.private_key == Path(default_web_dir()) / "tls" / "key.pem"
+
+    cfg = load_config(_write(tmp_path, MINIMAL + """
+[web]
+listen = "10.0.0.5"
+port = 443
+data_dir = "/srv/antigrafa-web"
+cert_file = "/etc/ssl/backup.pem"
+key_file = "/etc/ssl/backup.key"
+allowed_hosts = ["backup.lab"]
+"""))
+    assert cfg.web.listen == "10.0.0.5" and cfg.web.port == 443
+    assert cfg.web.directory == Path("/srv/antigrafa-web")
+    assert cfg.web.certificate == Path("/etc/ssl/backup.pem")
+    assert cfg.web.private_key == Path("/etc/ssl/backup.key")
+    assert cfg.web.allowed_hosts == ["backup.lab"]
+
+
+@pytest.mark.parametrize(
+    ("web", "message"),
+    [
+        ("port = 0", "port must be between 1 and 65535"),
+        ("port = 70000", "port must be between 1 and 65535"),
+        ("port = true", "port must be between 1 and 65535"),
+        ("port = \"8443\"", "port must be between 1 and 65535"),
+        ("listen = \"\"", "listen must not be empty"),
+        ("listen = 5", "listen must be a string"),
+        ("allowed_hosts = \"backup.lab\"", "allowed_hosts must be a list"),
+        ("allowed_hosts = [\"\"]", "allowed_hosts must be a list"),
+        ("cert_file = \"/etc/ssl/a.pem\"", "cert_file and key_file go together"),
+        ("colour = \"blue\"", "unknown keys colour"),
+    ],
+)
+def test_invalid_web_section(tmp_path, web, message):
+    with pytest.raises(ConfigError, match=rf"\[web\]: .*{message}"):
+        load_config(_write(tmp_path, MINIMAL + "[web]\n" + web + "\n"))
+
+
+def test_default_paths_on_linux_and_windows():
+    from antigrafa.config import default_config_path, default_web_dir
+
+    assert default_config_path("linux", {}) == "/etc/antigrafa/antigrafa.toml"
+    assert default_web_dir("linux", {}) == "/var/lib/antigrafa/web"
+    env = {"PROGRAMDATA": r"D:\ProgramData"}
+    assert default_config_path("win32", env) == r"D:\ProgramData\antigrafa\antigrafa.toml"
+    assert default_web_dir("win32", env) == r"D:\ProgramData\antigrafa\web"
+    assert default_web_dir("win32", {}) == r"C:\ProgramData\antigrafa\web"  # variable missing

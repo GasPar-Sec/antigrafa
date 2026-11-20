@@ -20,6 +20,7 @@ import shlex
 from abc import abstractmethod
 from dataclasses import dataclass, field
 
+from ...delta import encode_reference, remote_command
 from ...ssh import RemoteStream, SSHHost
 from ..base import DiskSource, PlatformError
 
@@ -94,12 +95,21 @@ def guest_disks(guest_type: str, config: dict) -> list[Disk]:
 class VolumeSource(DiskSource):
     """One Proxmox volume, read from its snapshot by a command run over SSH."""
 
-    def __init__(self, ssh: SSHHost, storage_cfg: dict, disk: Disk, snapname: str, low_priority: bool = True):
+    def __init__(
+        self,
+        ssh: SSHHost,
+        storage_cfg: dict,
+        disk: Disk,
+        snapname: str,
+        low_priority: bool = True,
+        remote_hash: bool = False,  # python3 available on the node: hash it there
+    ):
         self.ssh = ssh
         self.cfg = storage_cfg
         self.disk = disk
         self.snapname = snapname
         self.prefix = LOW_PRIORITY if low_priority else ""
+        self.remote_hash = remote_hash
 
     @property
     def key(self) -> str:
@@ -114,6 +124,13 @@ class VolumeSource(DiskSource):
 
     def open_stream(self) -> RemoteStream:
         return self.ssh.stream(self.prefix + self.stream_command())
+
+    def open_hashed_stream(self, reference: list[bytes], chunk_size: int) -> RemoteStream | None:
+        if not self.remote_hash:
+            return None
+        # The same read command, piped through the hashing script, at the same priority
+        command = remote_command(self.stream_command(), chunk_size, self.prefix)
+        return self.ssh.stream(command, input=encode_reference(reference))
 
 
 def _wait_for_device(dev: str) -> str:
@@ -241,10 +258,17 @@ class LvmThinSource(VolumeSource):
             self._activated = False
 
 
-def make_source(ssh: SSHHost, storage_cfg: dict, disk: Disk, snapname: str, low_priority: bool = True) -> VolumeSource:
+def make_source(
+    ssh: SSHHost,
+    storage_cfg: dict,
+    disk: Disk,
+    snapname: str,
+    low_priority: bool = True,
+    remote_hash: bool = False,
+) -> VolumeSource:
     """Pick the right reader. Called before the snapshot so that we fail early."""
     stype = storage_cfg.get("type")
-    args = (ssh, storage_cfg, disk, snapname, low_priority)
+    args = (ssh, storage_cfg, disk, snapname, low_priority, remote_hash)
     if stype == "zfspool":
         if disk.volname.startswith("subvol-"):
             return ZfsDatasetSource(*args)
