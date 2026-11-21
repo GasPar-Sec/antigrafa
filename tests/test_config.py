@@ -172,6 +172,33 @@ def test_remote_hash_setting(tmp_path):
         load_config(_write(tmp_path, MINIMAL + PROXMOX + "remote_hash = 'yes'\n"))
 
 
+def test_snapshot_mode_setting(tmp_path):
+    assert load_config(_write(tmp_path, MINIMAL + PROXMOX)).source("pve").settings.snapshot_mode == "proxmox"
+    text = MINIMAL + PROXMOX + 'snapshot_mode = "storage"\n'
+    assert load_config(_write(tmp_path, text)).source("pve").settings.snapshot_mode == "storage"
+    for bad in ('"zfs"', "true"):
+        with pytest.raises(ConfigError, match=r"\[source.pve\]: snapshot_mode must be one of proxmox, storage"):
+            load_config(_write(tmp_path, MINIMAL + PROXMOX + f"snapshot_mode = {bad}\n"))
+
+
+def test_snapshot_mode_per_guest(tmp_path):
+    text = MINIMAL + PROXMOX + (
+        'snapshot_mode = "auto"\n'
+        '[source.pve.guests.650]\nsnapshot_mode = "qemu"\n'
+        "[source.pve.guests.911]\n"
+    )
+    settings = load_config(_write(tmp_path, text)).source("pve").settings
+    assert [settings.mode_for(g) for g in ("650", "911", "100")] == ["qemu", "auto", "auto"]
+    bad = {
+        '[source.pve.guests.650]\nsnapshot_mode = "zfs"\n': r"\[source.pve.guests.650\]: snapshot_mode must be one of",
+        '[source.pve.guests.web]\nsnapshot_mode = "qemu"\n': r"\[source.pve.guests.web\]: a guest is named by its id",
+        "[source.pve.guests.650]\nchunk = 4\n": r"\[source.pve.guests.650\]: unknown keys chunk",
+    }
+    for section, error in bad.items():
+        with pytest.raises(ConfigError, match=error):
+            load_config(_write(tmp_path, MINIMAL + PROXMOX + section))
+
+
 # --------------------------------------------------------------------------- web interface
 
 

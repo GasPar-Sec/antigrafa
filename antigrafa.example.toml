@@ -20,6 +20,23 @@ ca_file = "/etc/antigrafa/pve-root-ca.pem"
 # changed since the previous backup cross the network. Costs CPU on the node, at low
 # priority. false: every chunk is sent, hashed here.
 # remote_hash = true
+# How the disks are captured (no mode stops a guest). "proxmox": snapshot through the
+# API; Proxmox snapshots every disk of the guest and refuses if one is on a storage
+# without snapshots (LVM thick, iSCSI, raw file), even flagged backup=0. "storage":
+# Antigrafa freezes the guest (agent) and snapshots only the disks it backs up,
+# directly on their storage. "qemu": running VMs are backed up by QEMU itself, as PBS
+# does, on any storage; containers as "storage". "auto": for each guest, the first of
+# these that works: "proxmox" (if Proxmox can snapshot every disk and the token has
+# VM.Snapshot), else "storage", else "qemu". The choice is logged.
+snapshot_mode = "auto"           # default: "proxmox"
+# "qemu" mode: temporary images on the nodes, growing with what a VM writes during
+# its backup. If this filesystem fills up, the VM's writes fail: leave room. Created
+# 0700 if missing; refused if anyone but root can write to it.
+# fleecing_dir = "/var/lib/antigrafa/fleecing"
+
+# One guest with its own snapshot_mode (by id), the source's for the others.
+# [source.cluster1.guests.650]
+# snapshot_mode = "qemu"
 
 # How Antigrafa reaches the nodes to read the snapshots.
 [source.cluster1.ssh]

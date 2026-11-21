@@ -79,7 +79,7 @@ def test_zvol_sets_and_restores_snapdev():
     src.prepare()
     assert "zfs set snapdev=visible rpool/data/vm-100-disk-0" in ssh.commands
     assert src.size() == 34359738368
-    assert src.stream_command() == "dd if=/dev/zvol/rpool/data/vm-100-disk-0@antigrafa_1 bs=4M status=none"
+    assert src.stream_command() == "dd if=/dev/zvol/rpool/data/vm-100-disk-0@antigrafa_1 bs=4M iflag=direct status=none"
     src.cleanup()
     assert ssh.commands[-1] == "zfs inherit snapdev rpool/data/vm-100-disk-0"
 
@@ -278,3 +278,193 @@ def test_stop_command_escapes_regular_expression_characters():
 )
 def test_parse_size(value, size):
     assert parse_size(value) == size
+
+
+# --------------------------------------------------------------------------- storage snapshots
+
+
+def test_guest_volumes_include_disks_not_backed_up():
+    from antigrafa.platforms.proxmox.capture import guest_volumes
+
+    volumes = [(d.key, backed_up) for d, backed_up in guest_volumes("qemu", QEMU_CONFIG)]
+    assert volumes == [("efidisk0", True), ("scsi0", True), ("scsi1", False)]  # no CD-ROM, no unused
+
+
+STORAGES = {
+    "local-zfs": {"type": "zfspool"},
+    "thick": {"type": "lvm"},
+    "san": {"type": "iscsi"},
+    "nas": {"type": "nfs"},
+    "local": {"type": "dir"},
+}
+
+
+def test_snapshot_blockers_name_every_disk_proxmox_refuses():
+    from antigrafa.platforms.proxmox.capture import snapshot_blockers
+
+    config = {
+        "scsi0": "local-zfs:vm-650-disk-0,size=32G",
+        "scsi1": "thick:vm-650-disk-1,backup=0,size=1T",  # not backed up: still counts
+        "scsi2": "nas:650/vm-650-disk-2.raw,size=10G",
+        "scsi3": "nas:650/vm-650-disk-3.qcow2,size=10G",  # qcow2: Proxmox can snapshot it
+        "scsi4": "san:0.0.1.scsi-36001,size=100G",
+        "scsi5": "/dev/disk/by-id/ata-XYZ,backup=0",
+        "virtio0": "unknown-storage:vm-650-disk-5",  # not visible: left to Proxmox
+        "ide2": "local:iso/debian.iso,media=cdrom",
+    }
+    blockers = snapshot_blockers("qemu", config, STORAGES.get)
+    assert blockers == [
+        "scsi1 (thick:vm-650-disk-1): storage type lvm has no snapshots",
+        "scsi2 (nas:650/vm-650-disk-2.raw): on storage type nfs, only qcow2 files have snapshots",
+        "scsi4 (san:0.0.1.scsi-36001): storage type iscsi has no snapshots",
+        "scsi5 (/dev/disk/by-id/ata-XYZ): passthrough disk, no snapshot possible",
+    ]
+
+
+def test_snapshot_blockers_of_a_container():
+    from antigrafa.platforms.proxmox.capture import snapshot_blockers
+
+    config = {
+        "rootfs": "local-zfs:subvol-101-disk-0,size=8G",
+        "mp0": "/srv/share,mp=/share",  # bind mount: never part of a snapshot
+        "mp1": "local:101/vm-101-disk-1.raw,mp=/data",  # not backed up: still counts
+    }
+    assert snapshot_blockers("lxc", config, STORAGES.get) == [
+        "mp1 (local:101/vm-101-disk-1.raw): on storage type dir, only qcow2 files have snapshots"
+    ]
+    assert snapshot_blockers("lxc", {"rootfs": "local-zfs:subvol-101-disk-0"}, STORAGES.get) == []
+
+
+def _zvol(ssh):
+    return ZfsZvolSource(ssh, {"type": "zfspool", "pool": "rpool/data"}, Disk("scsi0", "local-zfs:vm-100-disk-0"), "antigrafa_1")
+
+
+def test_zfs_storage_snapshot():
+    ssh = FakeSSH({"zfs list -H -o name -t snapshot -d 1": "rpool/data/vm-100-disk-0@antigrafa_0\nrpool/data/vm-100-disk-0@daily\n"})
+    for src in (_zvol(ssh), ZfsDatasetSource(ssh, {"type": "zfspool", "pool": "rpool/data"},
+                                             Disk("rootfs", "local-zfs:vm-100-disk-0"), "antigrafa_1")):
+        ssh.commands.clear()
+        src.take_snapshot()
+        src.drop_snapshot()
+        assert ssh.commands == [
+            "zfs snapshot rpool/data/vm-100-disk-0@antigrafa_1",
+            # Deleting twice (a retry) is not an error
+            "if zfs list -H -o name -t snapshot rpool/data/vm-100-disk-0@antigrafa_1 >/dev/null 2>&1; "
+            "then zfs destroy rpool/data/vm-100-disk-0@antigrafa_1; fi",
+        ]
+        assert src.snapshots() == ["antigrafa_0", "daily"]
+
+
+def test_rbd_storage_snapshot_on_an_external_cluster():
+    ssh = FakeSSH({"rbd -m": '[{"id": 4, "name": "antigrafa_0"}, {"id": 5, "name": "before"}]'})
+    cfg = {"type": "rbd", "pool": "vms", "namespace": "prod", "monhost": "10.0.0.1", "username": "pve"}
+    src = RbdSource(ssh, cfg, Disk("scsi0", "ceph-ext:vm-100-disk-0"), "antigrafa_1")
+    src.take_snapshot()
+    src.drop_snapshot()
+    rbd = "rbd -m 10.0.0.1 --keyring /etc/pve/priv/ceph/ceph-ext.keyring --id pve"
+    assert ssh.commands == [
+        f"{rbd} snap create vms/prod/vm-100-disk-0@antigrafa_1",
+        f"if {rbd} info vms/prod/vm-100-disk-0@antigrafa_1 >/dev/null 2>&1; "
+        f"then {rbd} snap rm --no-progress vms/prod/vm-100-disk-0@antigrafa_1; fi",
+    ]
+    assert src.snapshots() == ["antigrafa_0", "before"]
+    assert ssh.commands[-1] == f"{rbd} snap ls --format json vms/prod/vm-100-disk-0"
+
+
+def test_lvmthin_storage_snapshot_named_like_proxmox():
+    ssh = FakeSSH({"lvs --noheadings": "  vm-100-disk-0\n  snap_vm-100-disk-0_antigrafa_0\n  snap_vm-100-disk-1_x\n"})
+    src = LvmThinSource(ssh, {"type": "lvmthin", "vgname": "pve"}, Disk("scsi0", "local-lvm:vm-100-disk-0"), "antigrafa_1")
+    src.take_snapshot()
+    src.drop_snapshot()
+    assert ssh.commands == [
+        # The volume the reader activates (prepare) is this one
+        "lvcreate -s -n snap_vm-100-disk-0_antigrafa_1 pve/vm-100-disk-0",
+        "if lvs pve/snap_vm-100-disk-0_antigrafa_1 >/dev/null 2>&1; then lvremove -f pve/snap_vm-100-disk-0_antigrafa_1; fi",
+    ]
+    assert src.device == "/dev/pve/snap_vm-100-disk-0_antigrafa_1"
+    assert src.snapshots() == ["antigrafa_0"]  # only this volume's
+
+
+# --------------------------------------------------------------------------- stopped VM: live volumes
+
+
+def _live(cfg, volid, key="scsi0", ssh=None, **replies):
+    ssh = ssh or StreamingSSH(replies)
+    return ssh, make_source(ssh, cfg, Disk(key, volid), "antigrafa_1", live=True)
+
+
+def test_live_zvol_reads_the_volume_itself():
+    ssh, src = _live({"type": "zfspool", "pool": "rpool/data"}, "local-zfs:vm-100-disk-0")
+    src.prepare()
+    src.open_stream()
+    assert src.device == "/dev/zvol/rpool/data/vm-100-disk-0"
+    assert not any("snapdev" in c for c in ssh.commands)  # no snapshot device to show
+    assert ssh.streamed[0].endswith("dd if=/dev/zvol/rpool/data/vm-100-disk-0 bs=4M iflag=direct status=none")
+
+
+def test_live_dataset_tars_the_mountpoint():
+    ssh = StreamingSSH({"zfs get -H -o value mountpoint": "/rpool/data/subvol-101-disk-0\n"})
+    _, src = _live({"type": "zfspool", "pool": "rpool/data"}, "local-zfs:subvol-101-disk-0", "rootfs", ssh=ssh)
+    src.prepare()
+    assert src.stream_command().endswith("-cf - -C /rpool/data/subvol-101-disk-0 .")
+    src.estimated_size()
+    assert ssh.commands[-1] == "zfs get -Hp -o value logicalreferenced rpool/data/subvol-101-disk-0"
+
+
+def test_live_rbd_exports_the_image():
+    _, src = _live({"type": "rbd", "pool": "vms"}, "ceph:vm-100-disk-0")
+    assert src.stream_command() == "rbd export --no-progress vms/vm-100-disk-0 -"
+
+
+@pytest.mark.parametrize(("attr", "activated"), [("  -wi-ao----\n", False), ("  -wi-------\n", True)])
+def test_live_lvm_volumes_are_activated_only_when_inactive(attr, activated):
+    for cfg, volid in (({"type": "lvmthin", "vgname": "pve"}, "local-lvm:vm-100-disk-0"),
+                       ({"type": "lvm", "vgname": "san"}, "thick:vm-100-disk-0")):
+        vg = cfg["vgname"]
+        ssh, src = _live(cfg, volid, **{"lvs --noheadings -o lv_attr": attr})
+        src.prepare()
+        assert src.device == f"/dev/{vg}/vm-100-disk-0"
+        assert (f"lvchange -ay {vg}/vm-100-disk-0" in ssh.commands) is activated
+        src.cleanup()
+        # Put back as found: a shared LVM volume stays active only where the guest runs
+        assert (ssh.commands[-1] == f"lvchange -an {vg}/vm-100-disk-0") is activated
+
+
+def test_live_iscsi_lun_is_read_by_id():
+    _, src = _live({"type": "iscsi", "portal": "10.0.0.5"}, "ISCSI-QNAP:0.0.8.scsi-36e843b694fe4fe4df4b9d4d16d832bd3")
+    assert src.device == "/dev/disk/by-id/scsi-36e843b694fe4fe4df4b9d4d16d832bd3"
+    with pytest.raises(UnsupportedStorage, match="not an iSCSI LUN name"):
+        _live({"type": "iscsi"}, "ISCSI-QNAP:weird")
+
+
+def test_live_raw_file_on_a_directory_storage():
+    ssh, src = _live({"type": "nfs", "path": "/mnt/pve/nas/"}, "nas:100/vm-100-disk-0.raw", **{"stat": "1024\n"})
+    src.prepare()
+    assert src.size() == 1024
+    assert ssh.commands == ["test -f /mnt/pve/nas/images/100/vm-100-disk-0.raw",
+                            "stat -L -c %s /mnt/pve/nas/images/100/vm-100-disk-0.raw"]
+    assert src.snapshots() == []
+    with pytest.raises(UnsupportedStorage, match="has no snapshots"):
+        src.take_snapshot()
+    # O_DIRECT (no page cache) when the filesystem accepts it, tested on one block first
+    image = "/mnt/pve/nas/images/100/vm-100-disk-0.raw"
+    assert src.stream_command() == (
+        f"if dd if={image} bs=4096 count=1 iflag=direct of=/dev/null status=none 2>/dev/null; "
+        f"then dd if={image} bs=4M iflag=direct status=none; else dd if={image} bs=4M status=none; fi"
+    )
+
+
+@pytest.mark.parametrize(
+    ("cfg", "volid"),
+    [({"type": "lvm", "vgname": "san"}, "thick:vm-1-disk-0"),
+     ({"type": "iscsi"}, "lun:0.0.1.scsi-abc"),
+     ({"type": "dir", "path": "/var/lib/vz"}, "local:1/vm-1-disk-0.raw")],
+)
+def test_storages_without_snapshots_need_the_qemu_mode(cfg, volid):
+    with pytest.raises(UnsupportedStorage, match='snapshot_mode = "qemu"'):
+        make_source(FakeSSH(), cfg, Disk("scsi0", volid), "s")
+
+
+def test_qcow2_stays_unsupported_even_stopped():
+    with pytest.raises(UnsupportedStorage, match="qcow2"):
+        make_source(FakeSSH(), {"type": "dir", "path": "/x"}, Disk("scsi0", "local:1/vm-1-disk-0.qcow2"), "s", live=True)

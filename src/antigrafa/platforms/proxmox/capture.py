@@ -1,14 +1,23 @@
 """Reading disks from a Proxmox snapshot, depending on the storage type.
 
 The snapshot is created through the Proxmox API (consistent across all disks,
-filesystems frozen through the qemu-guest-agent). It is instantaneous: the VM
-resumes right away. Each ``VolumeSource`` then knows how to read the snapshot of
-one volume remotely, over SSH, at whatever pace the destination allows.
+filesystems frozen through the qemu-guest-agent), or with ``snapshot_mode = "storage"``
+by each ``VolumeSource`` on its own storage, under the name Proxmox would give it. It
+is instantaneous: the VM resumes right away. Each ``VolumeSource`` then knows how to
+read the snapshot of one volume remotely, over SSH, at whatever pace the destination
+allows.
+
+A stopped VM (``snapshot_mode = "qemu"``, locked meanwhile) needs no snapshot: each
+source then reads the volume itself (``live``), which also works on storages without
+snapshots. A running VM is read through QEMU instead (see ``.qemu``).
 
 Supported storages:
-    zfspool  zvol (VM, raw disk) or ``subvol-*`` dataset (CT, tar archive)
-    rbd      Ceph RBD (``rbd export`` of the snapshot)
-    lvmthin  LVM-thin (``snap_<vol>_<snap>`` snapshot activated for reading)
+    zfspool         zvol (VM, raw disk) or ``subvol-*`` dataset (CT, tar archive)
+    rbd             Ceph RBD (``rbd export`` of the snapshot)
+    lvmthin         LVM-thin (``snap_<vol>_<snap>`` snapshot activated for reading)
+    lvm             LVM thick: the logical volume itself, stopped VM only
+    iscsi           iSCSI LUN used directly as a disk, stopped VM only
+    dir, nfs, cifs  raw image files, stopped VM only
 """
 
 from __future__ import annotations
@@ -18,6 +27,7 @@ import logging
 import re
 import shlex
 from abc import abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ...delta import encode_reference, remote_command
@@ -73,9 +83,9 @@ def parse_size(value: str) -> int | None:
     return int(float(m.group(1)) * _UNITS[m.group(2)]) if m else None
 
 
-def guest_disks(guest_type: str, config: dict) -> list[Disk]:
-    """Disks to back up, honouring Proxmox's ``backup`` flag."""
-    disks = []
+def guest_volumes(guest_type: str, config: dict) -> list[tuple[Disk, bool]]:
+    """Every disk of the guest (CD-ROMs aside), with whether it is to be backed up."""
+    volumes = []
     for key in sorted(config):
         value = str(config[key])
         if guest_type == "qemu":
@@ -84,22 +94,60 @@ def guest_disks(guest_type: str, config: dict) -> list[Disk]:
             volume, opts = parse_volume(value)
             if opts.get("media") == "cdrom" or volume == "none":
                 continue
-            if opts.get("backup", "1") == "0":
-                continue
+            backed_up = opts.get("backup", "1") != "0"
+        elif key == "rootfs":
+            volume, opts = parse_volume(value)
+            backed_up = True
+        elif _LXC_MP.match(key):
+            volume, opts = parse_volume(value)
+            # Proxmox leaves mount points out of backups by default.
+            backed_up = opts.get("backup", "0") == "1"
         else:
-            if key == "rootfs":
-                volume, opts = parse_volume(value)
-            elif _LXC_MP.match(key):
-                volume, opts = parse_volume(value)
-                # Proxmox leaves mount points out of backups by default.
-                if opts.get("backup", "0") != "1":
-                    continue
-            else:
-                continue
-        if ":" not in volume:
-            raise UnsupportedStorage(f"{key}: {volume} is not a Proxmox volume (passthrough disk or bind mount?)")
-        disks.append(Disk(key=key, volid=volume, options=opts))
+            continue
+        volumes.append((Disk(key=key, volid=volume, options=opts), backed_up))
+    return volumes
+
+
+def guest_disks(guest_type: str, config: dict) -> list[Disk]:
+    """Disks to back up, honouring Proxmox's ``backup`` flag."""
+    disks = []
+    for disk, backed_up in guest_volumes(guest_type, config):
+        if not backed_up:
+            continue
+        if ":" not in disk.volid:
+            raise UnsupportedStorage(
+                f"{disk.key}: {disk.volid} is not a Proxmox volume (passthrough disk or bind mount?)"
+            )
+        disks.append(disk)
     return disks
+
+
+# Proxmox storage types without snapshots at all; file storages have them in qcow2 only
+NO_SNAPSHOT_TYPES = {"lvm", "iscsi", "iscsidirect"}
+FILE_TYPES = {"dir", "nfs", "cifs", "glusterfs", "cephfs"}
+
+
+def snapshot_blockers(guest_type: str, config: dict, storage_of: Callable[[str], dict | None]) -> list[str]:
+    """Disks Proxmox cannot snapshot ("snapshot feature is not available"), with why.
+
+    Proxmox checks every disk of the guest, ``backup=0`` ones included: a single one
+    makes the whole snapshot fail. ``storage_of`` returns a storage's configuration,
+    None when unknown (that disk is then left for Proxmox to judge).
+    """
+    blockers = []
+    for disk, _ in guest_volumes(guest_type, config):
+        if ":" not in disk.volid:
+            if guest_type == "lxc":
+                continue  # bind and device mounts: never part of a container snapshot
+            blockers.append(f"{disk.key} ({disk.volid}): passthrough disk, no snapshot possible")
+            continue
+        cfg = storage_of(disk.storage)
+        stype = (cfg or {}).get("type")
+        if stype in NO_SNAPSHOT_TYPES:
+            blockers.append(f"{disk.key} ({disk.volid}): storage type {stype} has no snapshots")
+        elif stype in FILE_TYPES and not disk.volname.endswith(".qcow2"):
+            blockers.append(f"{disk.key} ({disk.volid}): on storage type {stype}, only qcow2 files have snapshots")
+    return blockers
 
 
 _ERE_SPECIAL = set("\\.[]()*+?{}|^$")  # special in an extended regular expression
@@ -132,11 +180,13 @@ class VolumeSource(DiskSource):
         snapname: str,
         low_priority: bool = True,
         remote_hash: bool = False,  # python3 available on the node: hash it there
+        live: bool = False,  # read the volume itself: nothing writes to it (stopped VM)
     ):
         self.ssh = ssh
         self.cfg = storage_cfg
         self.disk = disk
         self.snapname = snapname
+        self.live = live
         self.prefix = LOW_PRIORITY if low_priority else ""
         self.remote_hash = remote_hash
         self._streams: list[RemoteStream] = []
@@ -155,6 +205,21 @@ class VolumeSource(DiskSource):
     @abstractmethod
     def reader_marker(self) -> str:
         """Text found only in the command line that reads this disk (to stop it)."""
+
+    # Storage snapshots (snapshot_mode = "storage"): Antigrafa snapshots each volume
+    # itself, under the name Proxmox would give it, so that reading is the same.
+
+    @abstractmethod
+    def take_snapshot(self) -> None:
+        """Snapshot this volume on its storage."""
+
+    @abstractmethod
+    def drop_snapshot(self) -> None:
+        """Delete the snapshot of this volume; nothing to do when it does not exist."""
+
+    @abstractmethod
+    def snapshots(self) -> list[str]:
+        """Names of the snapshots of this volume (to find leftovers)."""
 
     def open_stream(self) -> RemoteStream:
         return self._opened(self.ssh.stream(self.prefix + self.stream_command()))
@@ -182,14 +247,121 @@ def _wait_for_device(dev: str) -> str:
     return f"udevadm settle; for i in $(seq 1 50); do [ -e {q} ] && exit 0; sleep 0.2; done; exit 1"
 
 
-class ZfsZvolSource(VolumeSource):
+def _if_exists(check: str, action: str) -> str:
+    """``action`` only when ``check`` succeeds: deleting twice is not an error."""
+    return f"if {check} >/dev/null 2>&1; then {action}; fi"
+
+
+class _LiveOnly:
+    """A storage without snapshots: readable only with the guest stopped."""
+
+    disk: Disk
+    cfg: dict
+
+    def _no_snapshot(self) -> UnsupportedStorage:
+        return UnsupportedStorage(
+            f"{self.disk.key} ({self.disk.volid}): storage type {self.cfg.get('type')} has no snapshots"
+        )
+
+    def take_snapshot(self) -> None:
+        raise self._no_snapshot()
+
+    def drop_snapshot(self) -> None:
+        raise self._no_snapshot()
+
+    def snapshots(self) -> list[str]:
+        return []
+
+
+class _LogicalVolume:
+    """An LVM logical volume activated for reading, deactivated afterwards if we did it."""
+
+    ssh: SSHHost
+    vg: str
+    _activated: bool
+
+    def _activate(self, lv: str, force: bool = False) -> None:
+        spec = shlex.quote(f"{self.vg}/{lv}")
+        if not force:
+            # 5th character of lv_attr: "a" when active (shared LVM: inactive while stopped)
+            attr = self.ssh.run(f"lvs --noheadings -o lv_attr {spec}").strip()
+            if len(attr) > 4 and attr[4] == "a":
+                return
+        # Thin snapshots are flagged "activation skip": -K forces activation.
+        self.ssh.run(f"lvchange -ay{' -K' if force else ''} {spec}")
+        self._activated = True
+
+    def _deactivate(self, lv: str) -> None:
+        if self._activated:
+            self.ssh.run(f"lvchange -an {shlex.quote(f'{self.vg}/{lv}')}")
+            self._activated = False
+
+
+def direct_read(path: str) -> str:
+    """dd that bypasses the page cache (O_DIRECT), as vzdump does.
+
+    A buffered read of a whole disk fills the node's memory with data nobody reads
+    again (twice on a zvol: page cache and ZFS ARC), and the kernel swaps the guests'
+    memory out to make room. Block devices always accept O_DIRECT.
+    """
+    return f"dd if={shlex.quote(path)} bs=4M iflag=direct status=none"
+
+
+def direct_read_if_supported(path: str) -> str:
+    """Same for a file: O_DIRECT if its filesystem accepts it (tested on one block)."""
+    q = shlex.quote(path)
+    return (
+        f"if dd if={q} bs=4096 count=1 iflag=direct of=/dev/null status=none 2>/dev/null; "
+        f"then {direct_read(path)}; else dd if={q} bs=4M status=none; fi"
+    )
+
+
+class _BlockDevice:
+    """Read with dd; the size from the device itself."""
+
+    ssh: SSHHost
+    device: str
+
+    def size(self) -> int:
+        return int(self.ssh.run(f"blockdev --getsize64 {shlex.quote(self.device)}").strip())
+
+    def stream_command(self) -> str:
+        return direct_read(self.device)
+
+    def reader_marker(self) -> str:
+        return self.device
+
+
+class _ZfsSnapshots:
+    """zvol and dataset alike: ``<pool>/<volume>@<snapshot>``."""
+
+    ssh: SSHHost
+    dataset: str
+    snapname: str
+
+    def take_snapshot(self) -> None:
+        self.ssh.run(f"zfs snapshot {shlex.quote(f'{self.dataset}@{self.snapname}')}")
+
+    def drop_snapshot(self) -> None:
+        snap = shlex.quote(f"{self.dataset}@{self.snapname}")
+        self.ssh.run(_if_exists(f"zfs list -H -o name -t snapshot {snap}", f"zfs destroy {snap}"))
+
+    def snapshots(self) -> list[str]:
+        out = self.ssh.run(f"zfs list -H -o name -t snapshot -d 1 {shlex.quote(self.dataset)}")
+        return [line.split("@", 1)[1] for line in out.splitlines() if "@" in line]
+
+
+class ZfsZvolSource(_ZfsSnapshots, VolumeSource):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.dataset = f"{self.cfg['pool']}/{self.disk.volname}"
-        self.device = f"/dev/zvol/{self.dataset}@{self.snapname}"
+        self.device = f"/dev/zvol/{self.dataset}" + ("" if self.live else f"@{self.snapname}")
         self._restore_snapdev: str | None = None  # command that puts snapdev back
 
     def prepare(self) -> None:
+        if self.live:
+            self.ssh.run(_wait_for_device(self.device))
+            return
         # zvol snapshots only get a device node when snapdev=visible.
         ds = shlex.quote(self.dataset)
         value, source = self.ssh.run(f"zfs get -H -o value,source snapdev {ds}").split()[:2]
@@ -205,7 +377,7 @@ class ZfsZvolSource(VolumeSource):
         return int(self.ssh.run(f"zfs get -Hp -o value volsize {shlex.quote(self.dataset)}").strip())
 
     def stream_command(self) -> str:
-        return f"dd if={shlex.quote(self.device)} bs=4M status=none"
+        return direct_read(self.device)
 
     def reader_marker(self) -> str:
         return self.device
@@ -217,7 +389,7 @@ class ZfsZvolSource(VolumeSource):
             self._restore_snapdev = None
 
 
-class ZfsDatasetSource(VolumeSource):
+class ZfsDatasetSource(_ZfsSnapshots, VolumeSource):
     """Container on a ZFS dataset: no block device, so we archive the snapshot's files."""
 
     format = "tar"
@@ -231,7 +403,7 @@ class ZfsDatasetSource(VolumeSource):
         mountpoint = self.ssh.run(f"zfs get -H -o value mountpoint {shlex.quote(self.dataset)}").strip()
         if not mountpoint.startswith("/"):
             raise UnsupportedStorage(f"{self.dataset} is not mounted (mountpoint={mountpoint})")
-        self.snapdir = f"{mountpoint}/.zfs/snapshot/{self.snapname}"
+        self.snapdir = mountpoint if self.live else f"{mountpoint}/.zfs/snapshot/{self.snapname}"
 
     def size(self) -> None:
         return None
@@ -239,7 +411,7 @@ class ZfsDatasetSource(VolumeSource):
     def estimated_size(self) -> int | None:
         # Data held by the snapshot, uncompressed: the tar archive is about that size
         # (plus headers). Progress only: a failure must not stop the backup.
-        snapshot = shlex.quote(f"{self.dataset}@{self.snapname}")
+        snapshot = shlex.quote(self.dataset if self.live else f"{self.dataset}@{self.snapname}")
         try:
             return int(self.ssh.run(f"zfs get -Hp -o value logicalreferenced {snapshot}").strip())
         except Exception as exc:
@@ -255,15 +427,30 @@ class ZfsDatasetSource(VolumeSource):
         )
 
     def reader_marker(self) -> str:
+        if self.live:
+            return f"-C {self.snapdir} "
         return f".zfs/snapshot/{self.snapname}"
 
 
 class RbdSource(VolumeSource):
-    def _spec(self) -> str:
+    def _image(self) -> str:
         pool = self.cfg.get("pool", "rbd")
         ns = self.cfg.get("namespace")
-        image = f"{pool}/{ns}/{self.disk.volname}" if ns else f"{pool}/{self.disk.volname}"
-        return f"{image}@{self.snapname}"
+        return f"{pool}/{ns}/{self.disk.volname}" if ns else f"{pool}/{self.disk.volname}"
+
+    def _spec(self) -> str:
+        return self._image() if self.live else f"{self._image()}@{self.snapname}"
+
+    def take_snapshot(self) -> None:
+        self.ssh.run(f"{self._rbd()} snap create {shlex.quote(self._spec())}")
+
+    def drop_snapshot(self) -> None:
+        spec = shlex.quote(self._spec())
+        self.ssh.run(_if_exists(f"{self._rbd()} info {spec}", f"{self._rbd()} snap rm --no-progress {spec}"))
+
+    def snapshots(self) -> list[str]:
+        out = self.ssh.run(f"{self._rbd()} snap ls --format json {shlex.quote(self._image())}")
+        return [s["name"] for s in json.loads(out or "[]") if "name" in s]
 
     def _rbd(self) -> str:
         cmd = "rbd"
@@ -285,35 +472,95 @@ class RbdSource(VolumeSource):
         return self._spec()
 
 
-class LvmThinSource(VolumeSource):
+class LvmThinSource(_LogicalVolume, _BlockDevice, VolumeSource):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.vg = self.cfg["vgname"]
         # Name Proxmox (LvmThinPlugin) gives to volume snapshots.
         self.snap_lv = f"snap_{self.disk.volname}_{self.snapname}"
-        self.device = f"/dev/{self.vg}/{self.snap_lv}"
+        self.lv = self.disk.volname if self.live else self.snap_lv
+        self.device = f"/dev/{self.vg}/{self.lv}"
         self._activated = False
 
     def prepare(self) -> None:
-        # Thin snapshots are flagged "activation skip": -K forces activation.
-        self.ssh.run(f"lvchange -ay -K {shlex.quote(f'{self.vg}/{self.snap_lv}')}")
-        self._activated = True
+        self._activate(self.lv, force=not self.live)
         self.ssh.run(_wait_for_device(self.device))
 
-    def size(self) -> int:
-        return int(self.ssh.run(f"blockdev --getsize64 {shlex.quote(self.device)}").strip())
+    def take_snapshot(self) -> None:
+        # A thin snapshot: no size, flagged "activation skip" like those of Proxmox
+        origin = shlex.quote(f"{self.vg}/{self.disk.volname}")
+        self.ssh.run(f"lvcreate -s -n {shlex.quote(self.snap_lv)} {origin}")
 
-    def stream_command(self) -> str:
-        return f"dd if={shlex.quote(self.device)} bs=4M status=none"
+    def drop_snapshot(self) -> None:
+        lv = shlex.quote(f"{self.vg}/{self.snap_lv}")
+        self.ssh.run(_if_exists(f"lvs {lv}", f"lvremove -f {lv}"))
 
-    def reader_marker(self) -> str:
-        return self.device
+    def snapshots(self) -> list[str]:
+        out = self.ssh.run(f"lvs --noheadings -o lv_name {shlex.quote(self.vg)}")
+        prefix = f"snap_{self.disk.volname}_"
+        return [name[len(prefix):] for name in out.split() if name.startswith(prefix)]
 
     def cleanup(self) -> None:
         super().cleanup()
-        if self._activated:
-            self.ssh.run(f"lvchange -an {shlex.quote(f'{self.vg}/{self.snap_lv}')}")
-            self._activated = False
+        self._deactivate(self.lv)
+
+
+class LvmSource(_LiveOnly, _LogicalVolume, _BlockDevice, VolumeSource):
+    """LVM thick, often on an iSCSI or FC LUN: the logical volume itself."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vg = self.cfg["vgname"]
+        self.device = f"/dev/{self.vg}/{self.disk.volname}"
+        self._activated = False
+
+    def prepare(self) -> None:
+        self._activate(self.disk.volname)
+        self.ssh.run(_wait_for_device(self.device))
+
+    def cleanup(self) -> None:
+        super().cleanup()
+        self._deactivate(self.disk.volname)
+
+
+_ISCSI_VOLNAME = re.compile(r"^\d+\.\d+\.\d+\.(\S+)$")
+
+
+class IscsiSource(_LiveOnly, _BlockDevice, VolumeSource):
+    """A whole iSCSI LUN used as a disk (``0.0.8.scsi-<wwid>``): its /dev/disk/by-id device."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        m = _ISCSI_VOLNAME.match(self.disk.volname)
+        if not m:
+            raise UnsupportedStorage(f"{self.disk.key} ({self.disk.volid}): not an iSCSI LUN name")
+        self.device = f"/dev/disk/by-id/{m.group(1)}"
+
+    def prepare(self) -> None:
+        self.ssh.run(_wait_for_device(self.device))
+
+
+class RawFileSource(_LiveOnly, _BlockDevice, VolumeSource):
+    """A raw image file on a directory storage (dir, NFS, CIFS): ``<path>/images/<volname>``."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.device = f"{self.cfg['path'].rstrip('/')}/images/{self.disk.volname}"
+
+    def prepare(self) -> None:
+        self.ssh.run(f"test -f {shlex.quote(self.device)}")
+
+    def size(self) -> int:
+        return int(self.ssh.run(f"stat -L -c %s {shlex.quote(self.device)}").strip())
+
+    def stream_command(self) -> str:
+        # Some filesystems refuse O_DIRECT (CIFS without cache=none, tmpfs...)
+        return direct_read_if_supported(self.device)
+
+
+# Storages without snapshots: read only when nothing writes to them (stopped VM)
+LIVE_ONLY_TYPES = {"lvm", "iscsi"}
+RAW_FILE_TYPES = {"dir", "nfs", "cifs"}
 
 
 def make_source(
@@ -323,10 +570,14 @@ def make_source(
     snapname: str,
     low_priority: bool = True,
     remote_hash: bool = False,
+    live: bool = False,
 ) -> VolumeSource:
-    """Pick the right reader. Called before the snapshot so that we fail early."""
+    """Pick the right reader. Called before the snapshot so that we fail early.
+
+    ``live``: the volume itself is read (the VM is stopped and locked).
+    """
     stype = storage_cfg.get("type")
-    args = (ssh, storage_cfg, disk, snapname, low_priority, remote_hash)
+    args = (ssh, storage_cfg, disk, snapname, low_priority, remote_hash, live)
     if stype == "zfspool":
         if disk.volname.startswith("subvol-"):
             return ZfsDatasetSource(*args)
@@ -335,6 +586,19 @@ def make_source(
         return RbdSource(*args)
     if stype == "lvmthin":
         return LvmThinSource(*args)
+    raw_file = stype in RAW_FILE_TYPES and disk.volname.endswith(".raw")
+    if (stype in LIVE_ONLY_TYPES or raw_file) and not live:
+        raise UnsupportedStorage(
+            f"{disk.key} ({disk.volid}): storage type {stype} has no snapshots: back it up with "
+            'snapshot_mode = "qemu" (VMs: QEMU keeps the frozen view while the VM runs), '
+            "or flag it backup=0"
+        )
+    if stype == "lvm":
+        return LvmSource(*args)
+    if stype == "iscsi":
+        return IscsiSource(*args)
+    if raw_file:
+        return RawFileSource(*args)
     if stype in ("dir", "nfs", "cifs", "glusterfs") and disk.volname.endswith(".qcow2"):
         raise UnsupportedStorage(
             f"{disk.key} ({disk.volid}): qcow2 is not supported yet "
