@@ -60,6 +60,7 @@ transfer lasts.
 | Destination | write time vs. compression time | zstd level: compress harder when the disk is slow, less when the CPU is the bottleneck |
 | Source | iowait of the host running the guest (when the platform reports it) | read rate cap: halved when iowait rises, +25% when it drops |
 | Source | — | reads run at low priority (`ionice -c2 -n7 nice -n10` on Proxmox VE) |
+| Source | — | disks are read in direct I/O (`O_DIRECT`, like vzdump), so the read does not fill the node's page cache (or, on a zvol, the cache and the ZFS ARC) and push the guests' memory to swap. Not container archives (`tar` reads the files) |
 
 The destination is shared: a single controller drives every concurrent backup that
 writes to it.
@@ -102,15 +103,94 @@ through the qemu-guest-agent when it is enabled) and reads the snapshot afterwar
 
 ### Supported storage
 
-| Proxmox storage | VM | Container |
-|---|---|---|
-| ZFS (`zfspool`) | zvol, raw image | `subvol-*` dataset, tar archive |
-| Ceph RBD (hyperconverged or external) | `rbd export`, raw image | raw image |
-| LVM-thin | `snap_<vol>_<snap>` snapshot, raw image | raw image |
-| qcow2 on directory, NFS or CIFS | not yet | — |
+| Proxmox storage | VM, `snapshot_mode = "qemu"` | VM, other modes | Container |
+|---|---|---|---|
+| ZFS (`zfspool`) | yes | zvol snapshot, raw image | `subvol-*` dataset, tar archive |
+| Ceph RBD (hyperconverged or external) | yes | `rbd export` of a snapshot, raw image | raw image |
+| LVM-thin | yes | `snap_<vol>_<snap>` snapshot, raw image | raw image |
+| LVM (thick), iSCSI LUN, raw files on directory, NFS or CIFS | yes | no | no |
+| qcow2 on directory, NFS or CIFS | yes, while the VM runs | no | — |
+| Passthrough disks | no | no | no |
 
-Disks flagged `backup=0` are skipped. For containers, only `rootfs` and mount points
-flagged `backup=1` are backed up, matching Proxmox's behaviour.
+In `"qemu"` mode, a running VM is read through QEMU whatever the storage; the storage
+only matters when the VM is stopped (its volume is then read directly: every storage
+above except qcow2). Disks flagged `backup=0` are skipped. For containers, only
+`rootfs` and mount points flagged `backup=1` are backed up, matching Proxmox's
+behaviour.
+
+What each storage implies for a backup:
+
+| Storage | Advantages | Drawbacks |
+|---|---|---|
+| **ZFS zvol** (VM) | Instant snapshot that costs nothing to create. Unallocated blocks read fast. | The whole volume is read at every backup (only changed chunks are sent, but everything is read). The snapshot keeps the old blocks while the backup runs, so the pool must have room for what the VM writes meanwhile. `snapdev` is switched to `visible` during the read, then restored. |
+| **ZFS dataset** (container `subvol-*`) | Only the files are read, not the free space: fast for a mostly empty container. Ownership, ACLs and extended attributes are kept (`tar --numeric-owner --xattrs --acls`). | No exact size in advance: the progress is estimated (`~`). A tar archive cut into fixed-size chunks deduplicates poorly once files change size: everything after a change shifts (content-defined chunking is on the roadmap). |
+| **Ceph RBD** | Instant snapshots, hyperconverged or external clusters (`monhost`, keyring). The read can run on any node that reaches the cluster. | `rbd export` reads the whole image over the Ceph network at every backup, which loads the cluster network and OSDs. The snapshot keeps the old objects until it is deleted. |
+| **LVM-thin** | Instant thin snapshot, no size to reserve. | The snapshot lives in the same thin pool as the volumes. If the pool fills up while the backup runs, **every volume of the pool** stops writing: keep free room in the pool. The snapshot must be activated to be read (`lvchange -ay -K`). The whole volume is read at every backup. |
+| **LVM thick, iSCSI LUN, raw files** | Simple and often shared (SAN). With `"qemu"`, VMs are backed up without downtime. | No storage snapshot: VMs only with `snapshot_mode = "qemu"`, containers not at all. With the default mode, a single such disk on a guest, even flagged `backup=0`, makes Proxmox refuse the snapshot of the whole guest (`snapshot feature is not available`); `"storage"` and `"qemu"` ignore it. |
+| **qcow2** (directory, NFS, CIFS) | With `"qemu"`, read by QEMU like any other disk. | Not readable otherwise (reading an internal snapshot of a qcow2 file in use is not safe), and not when the VM is stopped. |
+| **Passthrough disks** | — | Never backed up: not a Proxmox volume. Flag them `backup=0` (refused by Proxmox snapshots even then; fine with `"storage"` and `"qemu"`). |
+
+### Snapshot modes
+
+`snapshot_mode`, in the `[source.<name>]` section, chooses how the disks are captured.
+No mode stops a guest. A guest can have its own mode, by id:
+
+```toml
+[source.cluster1]
+snapshot_mode = "auto"        # every guest of the source...
+
+[source.cluster1.guests.650]
+snapshot_mode = "qemu"        # ...except this one
+```
+
+**`"auto"`** decides for each guest, at each backup, and logs its choice
+(`VM 650 (nextcloud): captured by storage (Proxmox cannot snapshot virtio2 ...)`):
+
+1. `"proxmox"` if Proxmox can snapshot every disk of the guest and the token has
+   `VM.Snapshot` on it: the most standard way;
+2. else `"storage"` if every disk backed up is on ZFS, Ceph RBD or LVM-thin: same
+   result, without the disks flagged `backup=0` getting in the way;
+3. else `"qemu"` for a VM (any storage). A container that fits neither 1 nor 2 cannot
+   be backed up.
+
+The default stays `"proxmox"`.
+
+| | `"proxmox"` (default) | `"storage"` | `"qemu"` |
+|---|---|---|---|
+| How | Proxmox snapshots the guest, through the API | Antigrafa snapshots each volume, over SSH, on its storage (`zfs snapshot`, `rbd snap create`, `lvcreate -s`) | running VMs: QEMU keeps a frozen view of each disk (copy-before-write, as PBS does); stopped VMs: their volumes are read directly; containers: as `"storage"` |
+| Storages (VMs) | with snapshots only | with snapshots only | all of them, qcow2 included |
+| Disks involved | every disk of the guest, `backup=0` ones included | only the disks backed up | only the disks backed up |
+| Consistency | filesystems frozen by Proxmox through the qemu-guest-agent | the same way: `qm guest cmd <id> fsfreeze-freeze` (honours `freeze-fs-on-backup=0`). Containers: `lxc-freeze`, then `sync`. Thawed right after the snapshots | the same freeze, thawed as soon as QEMU has started the backup of every disk (one transaction: the same instant for all disks) |
+| Cost while the backup runs | the storage snapshot keeps the old blocks | the same | before the VM overwrites a block not read yet, QEMU copies it to a temporary image in `fleecing_dir` (`/var/lib/antigrafa/fleecing` on the node by default, root only): VM writes are a bit slower, and the image grows with what the VM writes |
+| Visible in Proxmox | yes, in the guest's snapshot list | no. A snapshot left by an interrupted run is reported at the next backup of the guest | the VM is locked (`backup`), as with vzdump |
+| API rights | `VM.Audit`, `VM.Snapshot` | `VM.Audit` (SSH as root does the rest) | `VM.Audit` (SSH as root does the rest) |
+| Proxmox lock | while the snapshot is created and deleted | none: moving or deleting a disk during the backup makes that backup fail | `lock=backup` for the whole read: no migration, snapshot, disk move or start meanwhile |
+
+`"auto"` picks among these three for you. To force one: `"qemu"` for VMs with disks
+on storages without snapshots (iSCSI, LVM thick, NFS files); `"storage"` when the
+disks backed up are on ZFS, Ceph RBD or LVM-thin and only a disk flagged `backup=0`
+blocks Proxmox's snapshot.
+
+`"qemu"` mode in detail:
+
+- the temporary images only grow with what the VM writes during its backup, but if
+  the filesystem of `fleecing_dir` fills up, **QEMU fails the VM's writes**: put it
+  where there is room for a busy VM's writes during a full read;
+- `python3` and `qemu-img` are needed on the nodes (both present on Proxmox VE);
+- `tpmstate` disks are used by swtpm, not by QEMU: they are read from their volume
+  (a few KiB, written only by TPM operations);
+- a VM already locked (another backup, a migration) is not backed up;
+- a run killed outright (power cut, `kill -9`) leaves the VM locked, and its temporary
+  image keeps growing with the VM's writes: run `qm unlock <id>`, then back it up
+  again, which first removes what the killed run left in QEMU. A cancelled run
+  (Ctrl+C, web interface) cleans up by itself.
+
+With snapshots, the capture is consistent across the disks of the guest: they are all
+taken while the filesystems are frozen. Without the guest agent, or when the freeze
+fails (agent not running), the capture is crash-consistent, as after a power cut.
+Antigrafa logs it and goes on. If a guest cannot be thawed after several tries, the
+backup fails with the command to run by hand, since the guest cannot write until then.
+A stopped guest is not frozen: it writes nothing.
 
 ### Requirements
 
@@ -119,7 +199,7 @@ flagged `backup=1` are backed up, matching Proxmox's behaviour.
   | Privilege | Path | Used for |
   |---|---|---|
   | `VM.Audit` | `/vms/<id>` | listing the guests, reading their configuration |
-  | `VM.Snapshot` | `/vms/<id>` | creating and deleting the temporary snapshot |
+  | `VM.Snapshot` | `/vms/<id>` | creating and deleting the temporary snapshot (not needed with `snapshot_mode = "storage"` or `"qemu"`; optional with `"auto"`, which then avoids Proxmox snapshots) |
   | `Sys.Audit` | `/nodes/<node>` | host load (iowait), to throttle reads |
   | `Datastore.Audit` | `/storage/<id>` | how to read each disk (storage type, ZFS pool, Ceph pool...) |
 

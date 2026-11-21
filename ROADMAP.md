@@ -54,6 +54,8 @@ the bottleneck can be the read on the node, the network or the destination.
       other today)
 - [ ] Hash in parallel in the script on the source host (`hashlib` releases the GIL): the
       single-threaded hash at low priority can cap the rate on a busy node
+- [ ] Containers: read their files without filling the node's page cache (`tar` reads
+      them buffered; disks are already read with `O_DIRECT`)
 - [ ] Revisit the default `max_parallel_per_host = 1` (one guest at a time per node), now
       that the iowait throttle protects the guests
 
@@ -70,6 +72,20 @@ the bottleneck can be the read on the node, the network or the destination.
 ## Features
 
 - [x] Chunks hashed on the source host (`remote_hash`): only changed chunks cross the network
+- [x] Storage snapshots (`snapshot_mode = "storage"`): guests with a disk on a storage
+      without snapshots (flagged `backup=0`) can be backed up
+- [x] VMs backed up by QEMU (`snapshot_mode = "qemu"`, image fleecing): no storage
+      snapshot, no downtime, any storage (iSCSI, LVM thick, raw and qcow2 files)
+- [ ] `"qemu"` mode: keep a QEMU dirty bitmap between backups and read only the
+      changed blocks (as PBS does, while the VM is not restarted)
+- [ ] `"qemu"` mode: stop the backup when `fleecing_dir` runs low on space, before the
+      VM's writes fail
+- [ ] `"qemu"` mode: containers on storages without snapshots (copy, then a short
+      suspend, like vzdump's `suspend` mode)
+- [x] `snapshot_mode` per guest (`[source.<name>.guests.<id>]`), and `"auto"`: the best
+      way for each guest (Proxmox snapshot, storage snapshot, then QEMU)
+- [ ] Storage snapshots: lock the guest in Proxmox during the backup (`lock=backup`, like
+      vzdump), so that a disk cannot be moved or deleted meanwhile
 - [ ] Repair: `verify` removes a damaged chunk and the next backup sends it again (with
       `remote_hash`, a chunk unchanged on the source is never sent again, so a chunk
       damaged at the destination stays damaged until then)

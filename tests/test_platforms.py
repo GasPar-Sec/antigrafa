@@ -1,7 +1,7 @@
 import pytest
 
 from antigrafa import platforms
-from antigrafa.platforms.base import AccessDenied, BackupPlan, DiskSource, Guest, Platform, check_name
+from antigrafa.platforms.base import AccessDenied, BackupPlan, DiskSource, Guest, Platform, PlatformError, check_name
 from antigrafa.platforms.proxmox import ProxmoxPlatform, ProxmoxSettings
 
 
@@ -341,3 +341,524 @@ def test_platform_without_disk_sizes():
             pass
 
     assert Bare("x").disk_sizes(Guest("1", "vm", "a", "h")) == {}
+
+
+# --------------------------------------------------------------------------- snapshot modes
+
+
+class ModeAPI:
+    """A VM with a ZFS disk and an LVM-thin disk, and a disk on thick LVM not backed up."""
+
+    def __init__(self, config=None):
+        self.config = config or {
+            "agent": "1",
+            "scsi0": "local-zfs:vm-650-disk-0,size=32G",
+            "scsi1": "local-lvm:vm-650-disk-1,size=8G",
+            "scsi2": "thick:vm-650-disk-2,backup=0,size=1T",
+        }
+        self.snapshots = []
+        self.api_calls = []
+
+    def guest_config(self, g):
+        return self.config
+
+    def storage(self, sid):
+        return {"local-zfs": {"type": "zfspool", "pool": "rpool/data"}, "local-lvm": {"type": "lvmthin", "vgname": "pve"},
+                "thick": {"type": "lvm", "vgname": "data"}}[sid]
+
+    def create_snapshot(self, g, name, description=""):
+        self.api_calls.append(("create", name))
+
+    def delete_snapshot(self, g, name):
+        self.api_calls.append(("delete", name))
+
+    def list_snapshots(self, g):
+        return [{"name": n} for n in self.snapshots]
+
+
+class NodeSSH:
+    """Records the commands; those starting with a key of ``fail`` fail (n times, or always)."""
+
+    def __init__(self, fail=None, replies=None):
+        self.commands, self.fail, self.replies = [], dict(fail or {}), replies or {}
+
+    def run(self, cmd, timeout=120):
+        from antigrafa.ssh import RemoteCommandError
+
+        self.commands.append(cmd)
+        for prefix, times in self.fail.items():
+            if cmd.startswith(prefix) and times:
+                self.fail[prefix] = times - 1
+                raise RemoteCommandError("pve1", cmd, 255, f"{prefix}: refused")
+        return next((reply for prefix, reply in self.replies.items() if cmd.startswith(prefix)), "")
+
+
+RUNNING_VM = Guest("650", "vm", "nextcloud", "pve1", "running")
+SNAP = "antigrafa_20261120T100000"
+ZFS_SNAP = f"zfs snapshot rpool/data/vm-650-disk-0@{SNAP}"
+LVM_SNAP = f"lvcreate -s -n snap_vm-650-disk-1_{SNAP} pve/vm-650-disk-1"
+
+
+def _platform(api, ssh, mode="storage"):
+    settings = ProxmoxSettings(url="https://pve", token_id="a@pve!b", remote_hash=False, snapshot_mode=mode)
+    return ProxmoxPlatform("c1", settings, api=api, ssh_for_host=lambda node: ssh)
+
+
+def test_proxmox_mode_names_the_disk_that_blocks_the_snapshot():
+    from antigrafa.platforms.proxmox import UnsupportedStorage
+
+    platform = _platform(ModeAPI(), NodeSSH(), mode="proxmox")
+    with pytest.raises(UnsupportedStorage) as exc:
+        platform.plan_backup(RUNNING_VM, SNAP)
+    message = str(exc.value)
+    assert "scsi2 (thick:vm-650-disk-2): storage type lvm has no snapshots" in message
+    assert 'snapshot_mode = "storage"' in message and "backup=0 ones included" in message
+
+
+def test_proxmox_mode_leaves_unknown_storages_to_proxmox():
+    class Hidden(ModeAPI):
+        def storage(self, sid):
+            if sid == "thick":
+                from antigrafa.platforms.proxmox import ProxmoxError
+
+                raise ProxmoxError("storage thick: not visible to the token")
+            return super().storage(sid)
+
+    plan = _platform(Hidden(), NodeSSH(), mode="proxmox").plan_backup(RUNNING_VM, SNAP)
+    assert [d.key for d in plan.disks] == ["scsi0", "scsi1"]
+
+
+def test_storage_mode_freezes_snapshots_the_backed_up_volumes_and_thaws():
+    api, ssh = ModeAPI(), NodeSSH()
+    platform = _platform(api, ssh)
+    plan = platform.plan_backup(RUNNING_VM, SNAP)  # the thick LVM disk does not block
+    assert [d.key for d in plan.disks] == ["scsi0", "scsi1"]
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    assert ssh.commands == [
+        "qm guest cmd 650 fsfreeze-freeze",
+        ZFS_SNAP,
+        LVM_SNAP,
+        "qm guest cmd 650 fsfreeze-thaw",
+    ]
+    ssh.commands.clear()
+    platform.delete_snapshot(RUNNING_VM, SNAP)
+    assert [c.split(" then ")[1] for c in ssh.commands] == [
+        f"zfs destroy rpool/data/vm-650-disk-0@{SNAP}; fi",
+        f"lvremove -f pve/snap_vm-650-disk-1_{SNAP}; fi",
+    ]
+    assert api.api_calls == []  # Proxmox is not asked for anything
+
+
+def test_proxmox_mode_still_snapshots_through_the_api():
+    api = ModeAPI({"scsi0": "local-zfs:vm-650-disk-0"})
+    ssh = NodeSSH()
+    platform = _platform(api, ssh, mode="proxmox")
+    platform.plan_backup(RUNNING_VM, SNAP)
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    platform.delete_snapshot(RUNNING_VM, SNAP)
+    assert api.api_calls == [("create", SNAP), ("delete", SNAP)] and ssh.commands == []
+
+
+@pytest.mark.parametrize(
+    ("agent", "frozen"),
+    [("1", True), ("enabled=1,fstrim_cloned_disks=1", True), ("0", False), ("enabled=0", False),
+     ("1,freeze-fs-on-backup=0", False), (None, False)],
+)
+def test_vm_freeze_follows_the_agent_setting(agent, frozen, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    config = {"scsi0": "local-zfs:vm-650-disk-0"}
+    if agent is not None:
+        config["agent"] = agent
+    ssh = NodeSSH()
+    platform = _platform(ModeAPI(config), ssh)
+    platform.plan_backup(RUNNING_VM, SNAP)
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    assert ("qm guest cmd 650 fsfreeze-freeze" in ssh.commands) is frozen
+    assert ("crash-consistent" in caplog.text) is not frozen
+
+
+def test_stopped_guest_is_not_frozen():
+    ssh = NodeSSH()
+    platform = _platform(ModeAPI(), ssh)
+    stopped = Guest("650", "vm", "nextcloud", "pve1", "stopped")
+    platform.plan_backup(stopped, SNAP)
+    platform.create_snapshot(stopped, SNAP)
+    assert ssh.commands == [ZFS_SNAP, LVM_SNAP]
+
+
+def test_running_container_is_frozen_and_flushed():
+    api = ModeAPI({"rootfs": "local-zfs:subvol-210-disk-0,size=8G"})
+    ssh = NodeSSH()
+    platform = _platform(api, ssh)
+    ct = Guest("210", "ct", "dns", "pve1", "running")
+    platform.plan_backup(ct, SNAP)
+    platform.create_snapshot(ct, SNAP)
+    assert ssh.commands == [
+        "lxc-freeze -n 210 && sync",
+        f"zfs snapshot rpool/data/subvol-210-disk-0@{SNAP}",
+        "lxc-unfreeze -n 210",
+    ]
+
+
+def test_failed_freeze_gives_a_crash_consistent_snapshot(caplog):
+    ssh = NodeSSH(fail={"qm guest cmd 650 fsfreeze-freeze": 1})
+    platform = _platform(ModeAPI(), ssh)
+    platform.plan_backup(RUNNING_VM, SNAP)
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    # A freeze that failed (agent not running, timeout) may still have happened: thawed anyway
+    assert ssh.commands == ["qm guest cmd 650 fsfreeze-freeze", "qm guest cmd 650 fsfreeze-thaw", ZFS_SNAP, LVM_SNAP]
+    assert "filesystems not frozen, crash-consistent snapshot" in caplog.text
+
+
+def test_failed_volume_snapshot_removes_the_others_and_thaws():
+    from antigrafa.ssh import RemoteCommandError
+
+    ssh = NodeSSH(fail={"lvcreate": 1})
+    platform = _platform(ModeAPI(), ssh)
+    platform.plan_backup(RUNNING_VM, SNAP)
+    with pytest.raises(RemoteCommandError, match="lvcreate: refused"):
+        platform.create_snapshot(RUNNING_VM, SNAP)
+    assert ssh.commands[:4] == ["qm guest cmd 650 fsfreeze-freeze", ZFS_SNAP, LVM_SNAP, "qm guest cmd 650 fsfreeze-thaw"]
+    assert f"zfs destroy rpool/data/vm-650-disk-0@{SNAP}" in ssh.commands[4]  # all or nothing
+    assert len(ssh.commands) == 5
+
+
+def test_thaw_is_tried_again(monkeypatch, caplog):
+    from antigrafa.platforms import proxmox
+
+    monkeypatch.setattr(proxmox, "THAW_RETRY_DELAYS", (0, 0, 0))
+    ssh = NodeSSH(fail={"qm guest cmd 650 fsfreeze-thaw": 2})
+    platform = _platform(ModeAPI(), ssh)
+    platform.plan_backup(RUNNING_VM, SNAP)
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    assert ssh.commands.count("qm guest cmd 650 fsfreeze-thaw") == 3
+    assert "thaw failed, new try" in caplog.text
+
+
+def test_guest_still_frozen_fails_loudly_without_leaving_snapshots(monkeypatch, caplog):
+    from antigrafa.platforms import proxmox
+
+    monkeypatch.setattr(proxmox, "THAW_RETRY_DELAYS", (0, 0, 0))
+    ssh = NodeSSH(fail={"qm guest cmd 650 fsfreeze-thaw": 99})
+    platform = _platform(ModeAPI(), ssh)
+    platform.plan_backup(RUNNING_VM, SNAP)
+    with pytest.raises(PlatformError, match="still frozen, run on pve1: qm guest cmd 650 fsfreeze-thaw"):
+        platform.create_snapshot(RUNNING_VM, SNAP)
+    assert ssh.commands.count("qm guest cmd 650 fsfreeze-thaw") == 4
+    assert "STILL FROZEN" in caplog.text
+    assert sum("zfs destroy" in c or "lvremove" in c for c in ssh.commands) == 2
+
+
+def test_storage_deletion_tries_every_volume():
+    ssh = NodeSSH(fail={"if zfs list": 1})
+    platform = _platform(ModeAPI(), ssh)
+    platform.plan_backup(RUNNING_VM, SNAP)
+    with pytest.raises(PlatformError, match="local-zfs:vm-650-disk-0: .*refused"):
+        platform.delete_snapshot(RUNNING_VM, SNAP)
+    assert any("lvremove" in c for c in ssh.commands)  # the other one deleted anyway
+    platform.delete_snapshot(RUNNING_VM, SNAP)  # the retry of the backup engine
+
+
+def test_storage_snapshot_needs_a_plan():
+    platform = _platform(ModeAPI(), NodeSSH())
+    with pytest.raises(PlatformError, match="no backup planned for snapshot"):
+        platform.create_snapshot(RUNNING_VM, SNAP)
+    platform.plan_backup(RUNNING_VM, SNAP)
+    with pytest.raises(PlatformError, match="no backup planned for snapshot other"):
+        platform.delete_snapshot(RUNNING_VM, "other")
+
+
+def test_storage_mode_finds_leftovers_on_the_volumes_and_in_proxmox():
+    api = ModeAPI()
+    api.snapshots = ["antigrafa_A", "manual"]
+    ssh = NodeSSH(replies={
+        "zfs list -H -o name -t snapshot -d 1": "rpool/data/vm-650-disk-0@antigrafa_B\nrpool/data/vm-650-disk-0@antigrafa_A\n",
+        "lvs --noheadings": "snap_vm-650-disk-1_antigrafa_B\n",
+    })
+    platform = _platform(api, ssh)
+    platform.plan_backup(RUNNING_VM, SNAP)
+    assert platform.leftover_snapshots(RUNNING_VM, "antigrafa_") == ["antigrafa_A", "antigrafa_B"]
+    proxmox_mode = _platform(api, NodeSSH(), mode="proxmox")
+    assert proxmox_mode.leftover_snapshots(RUNNING_VM, "antigrafa_") == ["antigrafa_A"]
+
+
+def test_storage_mode_does_not_need_the_snapshot_right():
+    api = PermAPI(CONFIGS, denied={"/vms/100": {"VM.Snapshot"}})
+    settings = ProxmoxSettings(url="https://pve", token_id="a@pve!b", snapshot_mode="storage")
+    ProxmoxPlatform("c1", settings, api=api).check_access([VM])  # no VM.Snapshot: fine
+    with pytest.raises(AccessDenied, match="VM.Snapshot on /vms/100"):
+        _checked(api).check_access([VM])  # the Proxmox snapshot needs it
+
+
+# --------------------------------------------------------------------------- "qemu" mode
+
+PYTHON3 = {"command -v python3": "/usr/bin/python3\n"}
+QMP_ANSWER = '{"sizes": {"scsi0": 34359738368, "scsi1": 8589934592}, "removed": []}'
+
+
+def _qemu_ssh(status="running", **kwargs):
+    replies = {**PYTHON3, "qm status 650": f"status: {status}\n", "python3 -c": QMP_ANSWER}
+    return NodeSSH(replies=replies, **kwargs)
+
+
+def _steps(commands):
+    """The QMP script calls shortened to "qmp <action>"."""
+    import shlex
+
+    return [f"qmp {shlex.split(c)[3]}" if c.startswith("python3 -c") else c for c in commands]
+
+
+def _storages(extra):
+    def storage(sid):
+        return extra[sid] if sid in extra else ModeAPI.storage(None, sid)
+
+    return storage
+
+
+def test_qemu_mode_backs_up_a_running_vm_through_qemu():
+    api, ssh = ModeAPI(), _qemu_ssh()
+    platform = _platform(api, ssh, mode="qemu")
+    plan = platform.plan_backup(RUNNING_VM, SNAP)
+    assert [d.key for d in plan.disks] == ["scsi0", "scsi1"]
+    ssh.commands.clear()
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    assert _steps(ssh.commands) == [
+        "qm set 650 --lock backup",  # nothing may move or snapshot it meanwhile
+        "qm status 650",
+        "qmp setup",
+        "qm guest cmd 650 fsfreeze-freeze",
+        "qmp start",  # every disk at the same instant, frozen
+        "qm guest cmd 650 fsfreeze-thaw",
+    ]
+    assert [(d.size(), d.reader_marker()) for d in plan.disks] == [
+        (34359738368, "/run/antigrafa-650.nbd scsi0"),
+        (8589934592, "/run/antigrafa-650.nbd scsi1"),
+    ]
+    ssh.commands.clear()
+    platform.delete_snapshot(RUNNING_VM, SNAP)
+    platform.delete_snapshot(RUNNING_VM, SNAP)  # a retry does nothing more
+    assert _steps(ssh.commands) == ["qmp teardown", "qm unlock 650"]
+    assert api.api_calls == []  # no Proxmox snapshot
+
+
+def test_qemu_mode_backs_up_disks_on_storages_without_snapshots():
+    api = ModeAPI({"agent": "1", "virtio2": "san:0.0.8.scsi-36e8,size=1T", "scsi1": "thick:vm-650-disk-2,size=8G",
+                   "scsi3": "nfs:650/vm-650-disk-3.qcow2,size=8G"})
+    api.storage = _storages({"san": {"type": "iscsi"}, "nfs": {"type": "nfs", "path": "/mnt/pve/nfs"}})
+    plan = _platform(api, _qemu_ssh(), mode="qemu").plan_backup(RUNNING_VM, SNAP)
+    assert [d.key for d in plan.disks] == ["scsi1", "scsi3", "virtio2"]  # qcow2 too: QEMU reads it
+
+
+def test_qemu_mode_reads_a_stopped_vm_from_its_volumes():
+    ssh = _qemu_ssh(status="stopped")
+    platform = _platform(ModeAPI(), ssh, mode="qemu")
+    plan = platform.plan_backup(RUNNING_VM, SNAP)  # listed as running, stopped since
+    ssh.commands.clear()
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    assert ssh.commands == ["qm set 650 --lock backup", "qm status 650"]  # locked: nobody starts it
+    assert plan.disks[0].stream_command() == "dd if=/dev/zvol/rpool/data/vm-650-disk-0 bs=4M iflag=direct status=none"
+    ssh.commands.clear()
+    platform.delete_snapshot(RUNNING_VM, SNAP)
+    assert ssh.commands == ["qm unlock 650"]
+
+
+def test_qemu_mode_stopped_vm_on_a_storage_it_cannot_read_directly():
+    from antigrafa.platforms.proxmox import UnsupportedStorage
+
+    api = ModeAPI({"scsi0": "nfs:650/vm-650-disk-0.qcow2,size=8G"})
+    api.storage = _storages({"nfs": {"type": "nfs", "path": "/mnt/pve/nfs"}})
+    platform = _platform(api, _qemu_ssh(status="stopped"), mode="qemu")
+    plan = platform.plan_backup(RUNNING_VM, SNAP)
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    with pytest.raises(UnsupportedStorage, match="cannot be read while the VM is stopped: .*qcow2"):
+        plan.disks[0].prepare()
+
+
+def test_qemu_mode_reads_tpmstate_from_its_volume():
+    import json
+    import shlex
+
+    from antigrafa.platforms.proxmox import UnsupportedStorage
+
+    config = {"scsi0": "local-zfs:vm-650-disk-0", "tpmstate0": "local-lvm:vm-650-disk-1,size=4M,version=v2.0"}
+    ssh = _qemu_ssh()
+    platform = _platform(ModeAPI(config), ssh, mode="qemu")
+    plan = platform.plan_backup(RUNNING_VM, SNAP)
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    setup = next(c for c in ssh.commands if c.startswith("python3 -c"))
+    assert json.loads(shlex.split(setup)[4])["keys"] == ["scsi0"]  # swtpm uses it, not QEMU
+    tpm = plan.disks[1]
+    assert tpm.key == "tpmstate0" and tpm.stream_command() == "dd if=/dev/pve/vm-650-disk-1 bs=4M iflag=direct status=none"
+    bad = ModeAPI({"tpmstate0": "nfs:650/vm-650-disk-1.qcow2"})
+    bad.storage = _storages({"nfs": {"type": "nfs", "path": "/mnt/pve/nfs"}})
+    with pytest.raises(UnsupportedStorage, match="tpmstate0"):
+        _platform(bad, _qemu_ssh(), mode="qemu").plan_backup(RUNNING_VM, SNAP)
+
+
+def test_qemu_setup_failure_cleans_qemu_and_unlocks():
+    from antigrafa.ssh import RemoteCommandError
+
+    ssh = _qemu_ssh(fail={"python3 -c": 1})  # setup refused, the cleanup works
+    platform = _platform(ModeAPI(), ssh, mode="qemu")
+    platform.plan_backup(RUNNING_VM, SNAP)
+    ssh.commands.clear()
+    with pytest.raises(RemoteCommandError):
+        platform.create_snapshot(RUNNING_VM, SNAP)
+    assert _steps(ssh.commands) == ["qm set 650 --lock backup", "qm status 650", "qmp setup", "qmp teardown",
+                                    "qm unlock 650"]
+
+
+def test_qemu_cleanup_failure_keeps_the_vm_locked_until_a_retry_works():
+    ssh = _qemu_ssh()
+    platform = _platform(ModeAPI(), ssh, mode="qemu")
+    platform.plan_backup(RUNNING_VM, SNAP)
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    ssh.commands.clear()
+    ssh.fail = {"python3 -c": 1}
+    with pytest.raises(PlatformError, match="QEMU cleanup failed, the VM stays locked"):
+        platform.delete_snapshot(RUNNING_VM, SNAP)
+    assert "qm unlock 650" not in ssh.commands
+    platform.delete_snapshot(RUNNING_VM, SNAP)  # the retry of the backup engine
+    assert _steps(ssh.commands)[-2:] == ["qmp teardown", "qm unlock 650"]
+
+
+def test_qemu_mode_does_nothing_on_a_vm_already_locked():
+    from antigrafa.ssh import RemoteCommandError
+
+    ssh = _qemu_ssh(fail={"qm set 650 --lock backup": 1})
+    platform = _platform(ModeAPI(), ssh, mode="qemu")
+    platform.plan_backup(RUNNING_VM, SNAP)
+    with pytest.raises(RemoteCommandError):
+        platform.create_snapshot(RUNNING_VM, SNAP)
+    ssh.commands.clear()
+    platform.delete_snapshot(RUNNING_VM, SNAP)
+    assert ssh.commands == []  # not our lock: left alone
+
+
+def test_qemu_mode_needs_python3_on_the_node():
+    platform = _platform(ModeAPI(), NodeSSH(), mode="qemu")
+    with pytest.raises(PlatformError, match='snapshot_mode = "qemu" needs python3'):
+        platform.plan_backup(RUNNING_VM, SNAP)
+
+
+def test_qemu_mode_snapshots_containers_on_their_storage():
+    api = ModeAPI({"rootfs": "local-zfs:subvol-210-disk-0,size=8G"})
+    ssh = _qemu_ssh()
+    platform = _platform(api, ssh, mode="qemu")
+    ct = Guest("210", "ct", "dns", "pve1", "running")
+    platform.plan_backup(ct, SNAP)
+    ssh.commands.clear()
+    platform.create_snapshot(ct, SNAP)
+    assert ssh.commands == [
+        "lxc-freeze -n 210 && sync",
+        f"zfs snapshot rpool/data/subvol-210-disk-0@{SNAP}",
+        "lxc-unfreeze -n 210",
+    ]
+
+
+# --------------------------------------------------------------------------- "auto" mode, per guest
+
+
+class AutoAPI(ModeAPI):
+    """ModeAPI with the token's rights: VM.Snapshot unless ``no_snapshot_right``."""
+
+    def __init__(self, config=None, no_snapshot_right=False):
+        super().__init__(config)
+        self.no_snapshot_right = no_snapshot_right
+        self.storage = _storages({"san": {"type": "iscsi"}, "nfs": {"type": "nfs", "path": "/mnt/pve/nfs"}})
+
+    def permissions(self, path):
+        return {"VM.Audit"} if self.no_snapshot_right else {"VM.Audit", "VM.Snapshot"}
+
+
+def _auto(api, ssh, guests=None):
+    from antigrafa.platforms.proxmox import GuestSettings
+
+    settings = ProxmoxSettings(url="https://pve", token_id="a@pve!b", remote_hash=False, snapshot_mode="auto",
+                               guests={g: GuestSettings(m) for g, m in (guests or {}).items()})
+    return ProxmoxPlatform("c1", settings, api=api, ssh_for_host=lambda node: ssh)
+
+
+ZFS_ONLY = {"agent": "1", "scsi0": "local-zfs:vm-650-disk-0"}
+
+
+@pytest.mark.parametrize(
+    ("config", "no_right", "method"),
+    [
+        (ZFS_ONLY, False, "proxmox"),  # Proxmox can do it: its own snapshot
+        (ZFS_ONLY, True, "storage"),  # the token may not ask Proxmox
+        ({**ZFS_ONLY, "virtio2": "san:0.0.8.scsi-36e8,backup=0"}, False, "storage"),  # VM 650: iSCSI disk backup=0
+        ({**ZFS_ONLY, "scsi1": "thick:vm-650-disk-2"}, False, "qemu"),  # a disk to back up without snapshots
+        ({"agent": "1", "scsi0": "nfs:650/vm-650-disk-0.qcow2"}, False, "qemu"),
+    ],
+)
+def test_auto_picks_the_best_way_for_each_vm(config, no_right, method, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    api, ssh = AutoAPI(config, no_snapshot_right=no_right), _qemu_ssh()
+    platform = _auto(api, ssh)
+    platform.plan_backup(RUNNING_VM, SNAP)
+    assert f"captured by {method}" in caplog.text
+    ssh.commands.clear()
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    platform.delete_snapshot(RUNNING_VM, SNAP)
+    steps = _steps(ssh.commands)
+    assert (api.api_calls == [("create", SNAP), ("delete", SNAP)]) is (method == "proxmox")
+    assert ("qmp start" in steps) is (method == "qemu")
+    assert any(c.startswith("zfs snapshot") for c in steps) is (method == "storage")
+
+
+def test_auto_explains_why_it_did_not_use_proxmox(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    api = AutoAPI({**ZFS_ONLY, "virtio2": "san:0.0.8.scsi-36e8,backup=0"})
+    _auto(api, _qemu_ssh()).plan_backup(RUNNING_VM, SNAP)
+    assert "captured by storage (Proxmox cannot snapshot virtio2 (san:0.0.8.scsi-36e8): storage type iscsi" in caplog.text
+
+
+def test_auto_cannot_back_up_a_container_without_storage_snapshots():
+    from antigrafa.platforms.proxmox import UnsupportedStorage
+
+    api = AutoAPI({"rootfs": "thick:vm-210-disk-0,size=8G"})
+    ct = Guest("210", "ct", "dns", "pve1", "running")
+    with pytest.raises(UnsupportedStorage, match="containers need a storage with snapshots"):
+        _auto(api, _qemu_ssh()).plan_backup(ct, SNAP)
+
+
+def test_each_guest_can_have_its_own_snapshot_mode():
+    api, ssh = AutoAPI(ZFS_ONLY), _qemu_ssh()
+    platform = _auto(api, ssh, guests={"650": "qemu"})  # auto for the others
+    other = Guest("651", "vm", "other", "pve1", "running")
+    platform.plan_backup(RUNNING_VM, SNAP)
+    platform.plan_backup(other, SNAP)
+    ssh.commands.clear()
+    platform.create_snapshot(RUNNING_VM, SNAP)
+    platform.create_snapshot(other, SNAP)
+    assert "qmp start" in _steps(ssh.commands)  # 650 through QEMU
+    assert api.api_calls == [("create", SNAP)]  # 651: auto picked a Proxmox snapshot
+
+
+def test_rights_follow_the_mode_of_each_guest():
+    from antigrafa.platforms.proxmox import GuestSettings
+
+    api = PermAPI(CONFIGS, denied={"/vms/100": {"VM.Snapshot"}})
+    settings = ProxmoxSettings(url="https://pve", token_id="a@pve!b", guests={"100": GuestSettings("auto")})
+    ProxmoxPlatform("c1", settings, api=api).check_access([VM])  # auto: VM.Snapshot not required
+    settings = ProxmoxSettings(url="https://pve", token_id="a@pve!b", snapshot_mode="auto",
+                               guests={"100": GuestSettings("proxmox")})
+    with pytest.raises(AccessDenied, match="VM.Snapshot on /vms/100"):
+        ProxmoxPlatform("c1", settings, api=api).check_access([VM])
+
+
+def test_qemu_mode_settings_and_rights():
+    with pytest.raises(ValueError, match="fleecing_dir must be an absolute path"):
+        ProxmoxSettings(url="https://pve", token_id="a@pve!b", fleecing_dir="tmp")
+    with pytest.raises(ValueError, match="snapshot_mode must be one of proxmox, storage, qemu"):
+        ProxmoxSettings(url="https://pve", token_id="a@pve!b", snapshot_mode="stop")
+    api = PermAPI(CONFIGS, denied={"/vms/100": {"VM.Snapshot"}})
+    settings = ProxmoxSettings(url="https://pve", token_id="a@pve!b", snapshot_mode="qemu")
+    ProxmoxPlatform("c1", settings, api=api).check_access([VM])  # no VM.Snapshot: fine
