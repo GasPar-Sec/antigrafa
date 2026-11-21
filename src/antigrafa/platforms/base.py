@@ -75,6 +75,12 @@ class DiskSource(ABC):
     key: str  # name of the disk in the guest: scsi0, rootfs...
     volume: str  # where the platform stores it, recorded in the manifest
     format: str = "raw"  # "raw" (disk image) or "tar" (file tree)
+    # How the open stream reads the disk, for the log ("incremental since ...")
+    read_mode: str = ""
+
+    def manifest_extra(self) -> dict:
+        """What this disk adds to its entry in the manifest (what the next backup needs)."""
+        return {}
 
     def prepare(self) -> None:
         """Make the snapshot readable (device node, activation...)."""
@@ -125,10 +131,13 @@ class Platform(ABC):
         """Every guest that can be backed up, sorted by id."""
 
     @abstractmethod
-    def plan_backup(self, guest: Guest, snapshot: str, low_priority: bool = True) -> BackupPlan:
+    def plan_backup(
+        self, guest: Guest, snapshot: str, low_priority: bool = True, previous: dict | None = None
+    ) -> BackupPlan:
         """Configuration and disk readers of ``guest``, for the snapshot named ``snapshot``.
 
         Called before the snapshot exists: raise here if a disk cannot be backed up.
+        ``previous``: manifest of the guest's last complete backup (incremental reads).
         """
 
     @abstractmethod
@@ -136,7 +145,18 @@ class Platform(ABC):
         """Consistent snapshot of every disk of ``guest``; returns once it exists."""
 
     @abstractmethod
-    def delete_snapshot(self, guest: Guest, snapshot: str) -> None: ...
+    def delete_snapshot(self, guest: Guest, snapshot: str) -> None:
+        """All of ``snapshot``, also what ``release_snapshot`` kept."""
+
+    def release_snapshot(self, guest: Guest, snapshot: str) -> bool:
+        """Every disk was read: delete the snapshot, except what the next backup will
+        use as its base. True when something was kept (``delete_snapshot`` removes it
+        if the backup fails after all)."""
+        self.delete_snapshot(guest, snapshot)
+        return False
+
+    def drop_previous_bases(self, guest: Guest, snapshot: str) -> None:
+        """The backup of ``snapshot`` is complete: what the previous one kept can go."""
 
     def check_access(self, guests: list[Guest]) -> None:
         """Raise ``AccessDenied`` if the credentials cannot back up all of ``guests``.

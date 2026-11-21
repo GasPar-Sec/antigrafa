@@ -90,6 +90,37 @@ The first backup of a disk sends everything. The report shows what was sent
 `python3` on a node, its chunks are all sent (a warning says so). Container archives
 gain less: a file that changes size shifts everything after it in the archive.
 
+### Only changes are read (ZFS volumes)
+
+Hashing still reads the whole snapshot. For VM disks on ZFS (zvols), Antigrafa can
+skip that too (`incremental = true`, the default):
+
+1. the snapshot of a backup is not deleted: it stays on the node as the *base* of the
+   next backup (its name and GUID are recorded in the manifest);
+2. at the next backup, `zfs send -i <base> <new>` (read by `zstream dump -v`) lists the
+   blocks written since the base: ZFS knows the birth of every block, so it only reads
+   what changed;
+3. only the chunks those blocks touch are read and hashed on the node; the others are
+   recorded as unchanged without being read (and do not count for the read throttle);
+4. once the new backup is complete, the previous base is deleted.
+
+The log tells how each disk was read
+(`scsi0: incremental since antigrafa_20261121T080000: 81 of 8192 chunks changed`). It
+falls back to a full hashed read, and says why, when the base is missing (deleted,
+disk moved, VM restored), has another GUID, the disk changed size, or `zstream` is not
+there. Each backup is still a complete image.
+
+What it costs:
+
+- the base holds, on the pool, the blocks the VM overwrites between two backups;
+- Proxmox only rolls a ZFS volume back to its most recent snapshot: while the base
+  exists, **a rollback to an older snapshot of yours is refused** (`'X' is not most
+  recent snapshot`). Delete the base first (`zfs destroy <pool>/vm-<id>-disk-<n>@antigrafa_...`):
+  the next backup then reads the disk in full;
+- only snapshots Antigrafa takes itself can stay: the guest is captured with storage
+  snapshots (`"auto"` picks them for guests with zvols, see below). Containers (ZFS
+  datasets, read as archives), Ceph RBD and LVM-thin are read in full.
+
 ## Proxmox VE
 
 ### Why not just PBS?
@@ -146,11 +177,14 @@ snapshot_mode = "qemu"        # ...except this one
 **`"auto"`** decides for each guest, at each backup, and logs its choice
 (`VM 650 (nextcloud): captured by storage (Proxmox cannot snapshot virtio2 ...)`):
 
-1. `"proxmox"` if Proxmox can snapshot every disk of the guest and the token has
+1. `"storage"` if the guest has ZFS volumes (zvols), every disk backed up can be
+   snapshotted that way, and `incremental` is on: its snapshots stay as the base of
+   the next backup, which only reads what changed (see above);
+2. else `"proxmox"` if Proxmox can snapshot every disk of the guest and the token has
    `VM.Snapshot` on it: the most standard way;
-2. else `"storage"` if every disk backed up is on ZFS, Ceph RBD or LVM-thin: same
+3. else `"storage"` if every disk backed up is on ZFS, Ceph RBD or LVM-thin: same
    result, without the disks flagged `backup=0` getting in the way;
-3. else `"qemu"` for a VM (any storage). A container that fits neither 1 nor 2 cannot
+4. else `"qemu"` for a VM (any storage). A container that fits neither 2 nor 3 cannot
    be backed up.
 
 The default stays `"proxmox"`.
@@ -436,6 +470,16 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 A full SonarQube analysis (tests, bandit, quality and security) runs in a throwaway
 Docker instance: see [tools/sonarqube/README.md](tools/sonarqube/README.md).
+
+`tests/test_zfs_live.py` checks incremental reads against a real ZFS. It is skipped
+unless a ZFS machine is configured (Linux with ZFS, `python3`, `zstream`, SSH as root):
+
+```sh
+ANTIGRAFA_TEST_ZFS_SSH=root@zfs-host ANTIGRAFA_TEST_ZFS_POOL=tank/scratch ANTIGRAFA_TEST_ZFS_SSH_KEY=~/.ssh/id_test .venv/bin/pytest tests/test_zfs_live.py
+```
+
+Each test creates a sparse 64 MiB volume `antigrafa-selftest-<random>` under that
+dataset and destroys it afterwards; nothing else is touched.
 
 ## Roadmap
 

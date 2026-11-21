@@ -30,9 +30,10 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ...delta import encode_reference, remote_command
+from ...delta import changed_command, encode_changed, encode_reference, remote_command
 from ...ssh import RemoteStream, SSHHost
 from ..base import DiskSource, PlatformError
+from .zfsdiff import changed_ranges
 
 log = logging.getLogger(__name__)
 
@@ -352,11 +353,79 @@ class _ZfsSnapshots:
 
 
 class ZfsZvolSource(_ZfsSnapshots, VolumeSource):
+    """A zvol, read from its snapshot. Incremental when a base snapshot is known.
+
+    ``keeps_base``: the snapshot of this backup stays on the node as the base of the
+    next one (``incremental``, storage snapshots). ``base``: (name, guid) of the
+    snapshot the previous backup read, kept by it: only the chunks ZFS says changed
+    since then are read (see ``zfsdiff``); anything unexpected, and it is a full read.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.dataset = f"{self.cfg['pool']}/{self.disk.volname}"
         self.device = f"/dev/zvol/{self.dataset}" + ("" if self.live else f"@{self.snapname}")
         self._restore_snapdev: str | None = None  # command that puts snapdev back
+        self.keeps_base = False
+        self.base: tuple[str, str] | None = None
+        self.base_size: int | None = None  # size of the volume in that backup
+        self.snapshot_guid = ""
+        self._size: int | None = None
+
+    def _guid(self, snapshot: str) -> str:
+        """GUID of ``dataset@snapshot``, "" when it does not exist."""
+        snap = shlex.quote(f"{self.dataset}@{snapshot}")
+        return self.ssh.run(f"zfs get -Hp -o value guid {snap} 2>/dev/null || true").strip()
+
+    def manifest_extra(self) -> dict:
+        if self.keeps_base and self.snapshot_guid:
+            return {"source_snapshot": {"name": self.snapname, "guid": self.snapshot_guid}}
+        return {}
+
+    def open_hashed_stream(self, reference: list[bytes], chunk_size: int) -> RemoteStream | None:
+        ranges = self._changes(reference, chunk_size)
+        if ranges is None:
+            return super().open_hashed_stream(reference, chunk_size)
+        command = changed_command(self.device, chunk_size, self.size(), self.prefix)
+        return self._opened(self.ssh.stream(command, input=encode_changed(reference, ranges)))
+
+    def _changes(self, reference: list[bytes], chunk_size: int) -> list[tuple[int, int]] | None:
+        """Chunks changed since the base, or None (``read_mode`` says why) for a full read."""
+        if self.base is None or self.live:
+            return None
+        name, guid = self.base
+        size = self.size()
+        total = (size + chunk_size - 1) // chunk_size
+        why = ""
+        if not self.remote_hash:
+            why = "needs python3 on the node and remote_hash"
+        elif self.base_size != size:
+            why = f"the volume changed size ({self.base_size} -> {size} bytes)"
+        elif len(reference) != total:
+            why = "the previous backup has another number of chunks"
+        elif self._guid(name) != guid:
+            why = f"base snapshot {name} is gone"
+        if not why:
+            try:
+                ranges, records = changed_ranges(
+                    self.ssh, f"{self.dataset}@{name}", f"{self.dataset}@{self.snapname}", size, chunk_size, self.prefix
+                )
+            except Exception as exc:  # whatever went wrong, a full read is always right
+                why = f"changes since {name} unknown: {exc}"
+            else:
+                changed = sum(last - first + 1 for first, last in ranges)
+                self.read_mode = f"incremental since {name}: {changed} of {total} chunks changed ({records} ZFS records)"
+                return ranges
+        self.read_mode = f"full read: {why}"
+        return None
+
+    def drop_base(self) -> None:
+        """Delete the previous base snapshot, once a newer backup is complete."""
+        if self.base is None or self.base[0] == self.snapname:
+            return
+        name, guid = self.base
+        if self._guid(name) == guid:  # never a snapshot that is not the one we kept
+            self.ssh.run(f"zfs destroy {shlex.quote(f'{self.dataset}@{name}')}")
 
     def prepare(self) -> None:
         if self.live:
@@ -372,9 +441,13 @@ class ZfsZvolSource(_ZfsSnapshots, VolumeSource):
                 self._restore_snapdev = f"zfs inherit snapdev {ds}"
             self.ssh.run(f"zfs set snapdev=visible {ds}")
         self.ssh.run(_wait_for_device(self.device))
+        if self.keeps_base:
+            self.snapshot_guid = self._guid(self.snapname)
 
     def size(self) -> int:
-        return int(self.ssh.run(f"zfs get -Hp -o value volsize {shlex.quote(self.dataset)}").strip())
+        if self._size is None:
+            self._size = int(self.ssh.run(f"zfs get -Hp -o value volsize {shlex.quote(self.dataset)}").strip())
+        return self._size
 
     def stream_command(self) -> str:
         return direct_read(self.device)
