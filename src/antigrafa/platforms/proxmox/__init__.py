@@ -37,7 +37,15 @@ from ...config import ConfigError, build_section
 from ...ssh import SSHHost
 from ..base import AccessDenied, BackupPlan, Guest, Platform, PlatformError
 from .api import PVE_TYPES, ProxmoxAPI, ProxmoxError
-from .capture import UnsupportedStorage, VolumeSource, guest_disks, make_source, parse_size, snapshot_blockers
+from .capture import (
+    UnsupportedStorage,
+    VolumeSource,
+    ZfsZvolSource,
+    guest_disks,
+    make_source,
+    parse_size,
+    snapshot_blockers,
+)
 from .qemu import QemuDiskSource, QemuFleecing
 
 log = logging.getLogger(__name__)
@@ -103,6 +111,10 @@ class ProxmoxSettings:
     remote_hash: bool = True
     # "proxmox" (default), "storage", "qemu" or "auto": see SNAPSHOT_MODES
     snapshot_mode: str = "proxmox"
+    # ZFS volumes (zvols) captured by storage snapshots: the snapshot of a backup stays
+    # on the node as the base of the next one, which then reads only what ZFS says
+    # changed. "auto" picks storage snapshots for guests with zvols.
+    incremental: bool = True
     # "qemu" mode: directory, on each node, of the temporary images that keep the old
     # blocks the VM overwrites during its backup (created 0700; refused if others can
     # write to it: the images are created by root under predictable names)
@@ -137,7 +149,7 @@ class ProxmoxSettings:
 
 def parse_settings(name: str, data: dict) -> ProxmoxSettings:
     section = f"source.{name}"
-    for flag in ("verify_tls", "remote_hash"):
+    for flag in ("verify_tls", "remote_hash", "incremental"):
         if not isinstance(data.get(flag, True), bool):
             raise ConfigError(f"[{section}]: {flag} must be true or false")
     verify = data.get("verify_tls", True)
@@ -207,7 +219,9 @@ class ProxmoxPlatform(Platform):
         sizes = {d.key: parse_size(d.options.get("size", "")) for d in disks}
         return {key: size for key, size in sizes.items() if size is not None}
 
-    def plan_backup(self, guest: Guest, snapshot: str, low_priority: bool = True) -> BackupPlan:
+    def plan_backup(
+        self, guest: Guest, snapshot: str, low_priority: bool = True, previous: dict | None = None
+    ) -> BackupPlan:
         config = self.api.guest_config(guest)
         disks = guest_disks(PVE_TYPES[guest.kind], config)
         ssh = self.ssh_for_host(guest.host)
@@ -230,8 +244,28 @@ class ProxmoxPlatform(Platform):
             sources = [make_source(ssh, storages[d.storage], d, snapshot, low_priority, remote_hash) for d in disks]
         if method == "proxmox":
             self._check_snapshot_possible(guest, config, storages)
+        self._attach_bases(method, sources, previous)
         self._plans[guest.id] = (config, sources)
         return BackupPlan(config=config, disks=sources)
+
+    def _attach_bases(self, method: str, sources: list[VolumeSource], previous: dict | None) -> None:
+        """Incremental reads: the base each zvol kept at the previous backup, and whether
+        this backup keeps one (only its own storage snapshots can stay)."""
+        entries = {}
+        for d in (previous or {}).get("disks") or []:
+            if isinstance(d, dict) and "key" in d:
+                entries[d["key"]] = d
+        for src in sources:
+            if not isinstance(src, ZfsZvolSource) or src.live:
+                continue
+            src.keeps_base = self.settings.incremental and method == "storage"
+            entry = entries.get(src.key) or {}
+            base = entry.get("source_snapshot")
+            if entry.get("volume") != src.volume or entry.get("format") != "raw" or not isinstance(base, dict):
+                continue
+            if base.get("name") and base.get("guid"):
+                src.base = (str(base["name"]), str(base["guid"]))
+                src.base_size = entry.get("size")
 
     def _configured_method(self, guest: Guest) -> str:
         """How the guest is captured: "proxmox", "storage" or "qemu"."""
@@ -257,7 +291,11 @@ class ProxmoxPlatform(Platform):
                 unreadable = str(exc)
                 break
         blockers = snapshot_blockers(PVE_TYPES[guest.kind], config, self._storage_lookup(dict(storages)))
-        if not unreadable and not blockers and self._may_snapshot(guest):
+        zvols = [d.key for d in disks if storages[d.storage].get("type") == "zfspool"
+                 and not d.volname.startswith("subvol-")]
+        if not unreadable and zvols and self.settings.incremental:
+            method, why = "storage", f"incremental: the snapshot of {', '.join(zvols)} stays as the next base"
+        elif not unreadable and not blockers and self._may_snapshot(guest):
             method, why = "proxmox", "Proxmox can snapshot every disk"
         elif not unreadable:
             why = f"Proxmox cannot snapshot {blockers[0]}" if blockers else "the token has no VM.Snapshot right"
@@ -498,6 +536,37 @@ class ProxmoxPlatform(Platform):
             self.ssh_for_host(guest.host).run(f"{tool} unlock {shlex.quote(guest.id)}")
             self.api.delete_snapshot(guest, snapshot)
 
+    def release_snapshot(self, guest: Guest, snapshot: str) -> bool:
+        """Storage snapshots: those of zvols stay as the base of the next backup."""
+        if self._configured_method(guest) != "storage":
+            self.delete_snapshot(guest, snapshot)
+            return False
+        kept, errors = [], []
+        for src in self._plan(guest, snapshot)[1]:
+            if getattr(src, "keeps_base", False):
+                kept.append(src.volume)
+                continue
+            try:
+                src.drop_snapshot()
+            except Exception as exc:  # try the other volumes anyway
+                errors.append(f"{src.volume}: {exc}")
+        if errors:
+            raise PlatformError("; ".join(errors))
+        if kept:
+            log.info("%s: snapshot %s kept as the base of the next backup: %s", guest.label, snapshot, ", ".join(kept))
+        return bool(kept)
+
+    def drop_previous_bases(self, guest: Guest, snapshot: str) -> None:
+        errors = []
+        for src in self._plans.get(guest.id, ({}, []))[1]:
+            if isinstance(src, ZfsZvolSource) and src.base is not None:
+                try:
+                    src.drop_base()
+                except Exception as exc:
+                    errors.append(f"{src.volume}@{src.base[0]}: {exc}")
+        if errors:
+            raise PlatformError("; ".join(errors))
+
     def check_access(self, guests: list[Guest]) -> None:
         missing: list[str] = []
 
@@ -539,10 +608,13 @@ class ProxmoxPlatform(Platform):
 
     def leftover_snapshots(self, guest: Guest, prefix: str) -> list[str]:
         names = {s["name"] for s in self.api.list_snapshots(guest) if s.get("name", "").startswith(prefix)}
+        sources = self._plans.get(guest.id, ({}, []))[1]
         if self._configured_method(guest) == "storage":
             # Invisible to Proxmox: looked for on each volume (once per name; none via QEMU)
-            for src in self._plans.get(guest.id, ({}, []))[1]:
+            for src in sources:
                 names.update(n for n in src.snapshots() if n.startswith(prefix))
+        # The bases kept for incremental reads are expected
+        names -= {src.base[0] for src in sources if isinstance(src, ZfsZvolSource) and src.base}
         return sorted(names)
 
     def host_iowait(self, host: str) -> float:

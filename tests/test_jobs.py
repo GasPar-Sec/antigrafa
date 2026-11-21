@@ -205,7 +205,7 @@ class MemoryPlatform(Platform):
     def guests(self):
         return self._guests
 
-    def plan_backup(self, guest, snapshot, low_priority=True):
+    def plan_backup(self, guest, snapshot, low_priority=True, previous=None):
         self.log.append(("plan", guest.id, low_priority))
         return BackupPlan(config={"cpus": 2}, disks=self.disks[guest.id])
 
@@ -711,3 +711,99 @@ def test_a_failed_guest_leaves_nothing_announced(repo):
         runner.close()
     assert not result.ok
     assert progress.snapshot()["total"] is None and not progress.snapshot()["approximate"]
+
+
+# --------------------------------------------------------------------------- base snapshots (incremental reads)
+
+
+class BaseDisk(MemoryDisk):
+    """A disk whose snapshot stays as the base of the next backup."""
+
+    def manifest_extra(self):
+        return {"source_snapshot": {"name": "kept", "guid": "42"}}
+
+
+class BasePlatform(MemoryPlatform):
+    """Keeps the snapshot when the transfer succeeds; drops the old base once committed."""
+
+    def __init__(self, guests, disks):
+        super().__init__(guests, disks)
+        self.previous, self.released, self.dropped = [], [], []
+
+    def plan_backup(self, guest, snapshot, low_priority=True, previous=None):
+        self.previous.append(previous)
+        return super().plan_backup(guest, snapshot, low_priority)
+
+    def release_snapshot(self, guest, snapshot):
+        self.released.append(snapshot)
+        return True  # stays in self.snapshots
+
+    def drop_previous_bases(self, guest, snapshot):
+        self.dropped.append(snapshot)
+
+
+def test_snapshot_kept_as_base_and_previous_base_dropped_after_commit(repo):
+    import time as _time
+
+    guest = Guest("1", "vm", "web", "h1")
+    platform = BasePlatform([guest], {"1": [BaseDisk("disk0", os.urandom(DISK_SIZE))]})
+    [first] = _run(platform, repo, [guest])
+    _time.sleep(1.1)  # backups are named by the second
+    [second] = _run(platform, repo, [guest])
+    assert first.ok and second.ok, (first.error, second.error)
+
+    assert platform.previous[0] is None  # never backed up
+    assert platform.previous[1]["snapshot"] == platform.released[0]  # the manifest of the first one
+    assert platform.previous[1]["disks"][0]["source_snapshot"] == {"name": "kept", "guid": "42"}
+    assert platform.dropped == platform.released  # each one, once its own backup is complete
+    assert len(platform.snapshots) == 2  # kept: the platform drops the old one itself
+
+
+def test_kept_base_removed_when_the_backup_fails_after_all(repo, monkeypatch):
+    import antigrafa.jobs as jobs_module
+
+    def broken(directory, manifest):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(jobs_module, "write_manifest", broken)
+    guest = Guest("1", "vm", "web", "h1")
+    platform = BasePlatform([guest], {"1": [BaseDisk("disk0", os.urandom(DISK_SIZE))]})
+    [result] = _run(platform, repo, [guest])
+    assert not result.ok and "disk full" in result.error
+    assert platform.released and platform.snapshots == set()  # the base of no backup: deleted
+    assert platform.dropped == []  # the previous base still serves the previous backup
+
+
+def test_previous_base_not_deleted_is_only_a_warning(repo, caplog):
+    class Stubborn(BasePlatform):
+        def drop_previous_bases(self, guest, snapshot):
+            raise RuntimeError("dataset is busy")
+
+    guest = Guest("1", "vm", "web", "h1")
+    [result] = _run(Stubborn([guest], {"1": [BaseDisk("disk0", b"x" * 100)]}), repo, [guest])
+    assert result.ok  # the backup is complete either way
+    assert "previous base snapshot not deleted (remove it by hand): dataset is busy" in caplog.text
+
+
+def test_failed_transfer_deletes_the_whole_snapshot(repo):
+    class Broken(BaseDisk):
+        def open_stream(self):
+            raise OSError("read error")
+
+    guest = Guest("1", "vm", "web", "h1")
+    platform = BasePlatform([guest], {"1": [Broken("disk0", b"x")]})
+    [result] = _run(platform, repo, [guest])
+    assert not result.ok
+    assert platform.released == [] and platform.snapshots == set() and platform.dropped == []
+
+
+def test_read_mode_is_logged(repo, caplog):
+    import logging
+
+    class Told(MemoryDisk):
+        read_mode = "incremental since antigrafa_A: 2 of 8 chunks changed (3 ZFS records)"
+
+    caplog.set_level(logging.INFO)
+    guest = Guest("1", "vm", "web", "h1")
+    assert _backup_once(repo, guest, Told("disk0", b"x" * 100)).ok
+    assert "VM 1 (web): disk0: incremental since antigrafa_A: 2 of 8 chunks changed" in caplog.text

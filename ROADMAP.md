@@ -61,13 +61,15 @@ the bottleneck can be the read on the node, the network or the destination.
 
 ### Step 2: native incrementals (read only the changed blocks)
 
-- [ ] Keep the last Antigrafa snapshot on the source as the base of the next backup
-      (costs space on the source storage; delete it when the chain is broken)
+- [x] Keep the last Antigrafa snapshot on the source as the base of the next backup
+      (`incremental`, ZFS volumes; costs space on the source storage)
 - [ ] Ceph RBD: `rbd diff --from-snap` gives the changed extents directly
-- [ ] ZFS zvol: changed blocks from `zfs send -i`
+- [x] ZFS zvol: changed blocks from `zfs send -i` (read by `zstream dump -v`)
 - [ ] LVM-thin: changed blocks from `thin_delta`
-- [ ] Fall back to a full read when the base snapshot is missing or does not match the
+- [x] Fall back to a full read when the base snapshot is missing or does not match the
       previous backup
+- [ ] A command to remove the bases of a guest, before a Proxmox rollback to an older
+      snapshot (refused while a base exists)
 
 ## Features
 

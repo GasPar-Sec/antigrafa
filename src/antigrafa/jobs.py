@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeVar
 
 from . import __version__
 from .adaptive import MiB, SourceThrottle, WriteController, WriteTuning
@@ -33,6 +33,8 @@ from .targets import Repository
 log = logging.getLogger(__name__)
 
 SNAP_PREFIX = "antigrafa_"
+
+T = TypeVar("T")
 
 # Phases of a guest backup, in order (keys of GuestResult.timings)
 PHASES = ("wait", "prepare", "snapshot", "transfer", "cleanup", "flush")
@@ -56,6 +58,7 @@ class DiskResult:
     format: str
     size: int
     stats: StreamStats
+    extra: dict = field(default_factory=dict)  # added to its manifest entry (see DiskSource)
 
 
 @dataclass
@@ -210,13 +213,15 @@ class BackupRunner:
             with _timed(timings, "prepare"):
                 now = datetime.now(timezone.utc)
                 snapname = SNAP_PREFIX + now.strftime("%Y%m%dT%H%M%S")
-                plan = self.platform.plan_backup(g, snapname, self.tuning.low_priority)
+                previous_dir, previous = self._previous(g)
+                plan = self.platform.plan_backup(g, snapname, self.tuning.low_priority, previous=previous)
                 if not plan.disks:
                     raise BackupError("no disk to back up")
                 for src in plan.disks:
                     log.debug("%s: %s: %s, read by %s (%s)", g.label, src.key, src.volume, type(src).__name__, src.format)
                 self._warn_stale_snapshots(g)
                 dest = self.repo.create_snapshot_dir(self.platform.name, g.kind, g.id, now)
+            kept = False  # part of the snapshot stays as the base of the next backup
             try:
                 self._check_cancel()
                 log.info("%s: snapshot %s", g.label, snapname)
@@ -224,10 +229,13 @@ class BackupRunner:
                     self.platform.create_snapshot(g, snapname)
                 try:
                     with _timed(timings, "transfer"):
-                        results = [self._backup_disk(g, src, dest) for src in plan.disks]
-                finally:
+                        results = [self._backup_disk(g, src, dest, previous_dir, previous) for src in plan.disks]
+                except BaseException:
                     with _timed(timings, "cleanup"):
                         self._delete_snapshot(g, snapname)
+                    raise
+                with _timed(timings, "cleanup"):
+                    kept = self._retried(g, snapname, lambda: self.platform.release_snapshot(g, snapname))
                 with _timed(timings, "flush"):
                     t0 = time.monotonic()
                     self.repo.sync()
@@ -235,15 +243,24 @@ class BackupRunner:
                     write_manifest(dest, self._manifest(g, now, snapname, plan.config, results))
             except BaseException:
                 shutil.rmtree(dest, ignore_errors=True)  # chunks stay, the incomplete index goes
+                if kept:  # a base for a backup that does not exist: the previous one stays
+                    with contextlib.suppress(Exception):  # logged; the first error is the one to report
+                        self._delete_snapshot(g, snapname)
                 raise
         finally:
             slot.release()
 
+        try:  # the new backup is complete: the base the previous one kept is useless
+            self.platform.drop_previous_bases(g, snapname)
+        except Exception as exc:
+            log.warning("%s: previous base snapshot not deleted (remove it by hand): %s", g.label, exc)
         rel = str(dest.relative_to(self.repo.root))
         log.info("%s: backup complete -> %s", g.label, rel)
         return GuestResult(guest=g, ok=True, snapshot=rel, disks=results, timings=timings)
 
-    def _backup_disk(self, g: Guest, src: DiskSource, dest: Path) -> DiskResult:
+    def _backup_disk(
+        self, g: Guest, src: DiskSource, dest: Path, previous_dir: Path | None = None, previous: dict | None = None
+    ) -> DiskResult:
         try:
             src.prepare()
             size = src.size()
@@ -259,7 +276,7 @@ class BackupRunner:
                 name=f"{g.id}/{src.key}",
                 approximate=size is None,
             )
-            reference = self._reference(g, src)
+            reference = self._reference(g, src, previous_dir, previous)
 
             def advance(n: int) -> None:
                 task.advance(n)
@@ -268,6 +285,9 @@ class BackupRunner:
             with task:
                 self._check_cancel()
                 hashed = src.open_hashed_stream(reference, self.chunk_size) if reference else None
+                read_mode = getattr(src, "read_mode", "")
+                if read_mode:
+                    log.info("%s: %s: %s", g.label, src.key, read_mode)
                 if hashed is not None:
                     log.debug("%s: %s: hashed on the source, %d chunks of reference", g.label, src.key, len(reference))
                 else:
@@ -295,36 +315,59 @@ class BackupRunner:
         ext = "img" if src.format == "raw" else "tar"
         write_index(dest / f"{src.key}.{ext}.fidx", size, self.chunk_size, digests)
         rate = stats.bytes_read / MiB / stats.elapsed if stats.elapsed else 0.0
+        skipped = f", {stats.skipped_chunks} unchanged chunks not read" if stats.skipped_chunks else ""
         log.info(
-            "%s: %s: %.0f MiB in %.0f s (%.0f MiB/s), %d new chunks, %d reused, %.0f MiB sent",
+            "%s: %s: %.0f MiB in %.0f s (%.0f MiB/s), %d new chunks, %d reused, %.0f MiB sent%s",
             g.label, src.key, size / MiB, stats.elapsed, rate, stats.new_chunks, stats.reused_chunks,
-            stats.sent_bytes / MiB,
+            stats.sent_bytes / MiB, skipped,
         )
-        return DiskResult(key=src.key, volume=src.volume, format=src.format, size=size, stats=stats)
+        return DiskResult(
+            key=src.key, volume=src.volume, format=src.format, size=size, stats=stats, extra=getattr(src, "manifest_extra", dict)()
+        )
 
-    def _reference(self, g: Guest, src: DiskSource) -> list[bytes]:
-        """Digests of the same disk in the previous complete backup ([]: none usable)."""
+    def _previous(self, g: Guest) -> tuple[Path | None, dict | None]:
+        """Directory and manifest of the guest's last complete backup (None: none readable)."""
         previous = self.repo.latest_backup(self.platform.name, g.kind, g.id)
         if previous is None:
+            return None, None
+        try:
+            manifest = read_manifest(previous)
+        except (OSError, ValueError) as exc:
+            log.warning("%s: previous backup unreadable (%s): every chunk sent", g.label, exc)
+            return None, None
+        return previous, manifest if isinstance(manifest, dict) else None
+
+    def _reference(
+        self, g: Guest, src: DiskSource, previous_dir: Path | None = None, previous: dict | None = None
+    ) -> list[bytes]:
+        """Digests of the same disk in the previous complete backup ([]: none usable)."""
+        if previous_dir is None:
+            previous_dir, previous = self._previous(g)
+        if previous_dir is None or previous is None:
             return []
         try:
-            disks = read_manifest(previous)["disks"]
+            disks = previous["disks"]
             entry = next((d for d in disks if d["key"] == src.key and d["format"] == src.format), None)
             if entry is None:
                 return []
-            _, chunk_size, digests = read_index(previous / entry["index"])
+            _, chunk_size, digests = read_index(previous_dir / entry["index"])
         except (OSError, ValueError, KeyError, TypeError, IndexCorrupted) as exc:
             log.warning("%s: %s: previous backup unreadable (%s): every chunk sent", g.label, src.key, exc)
             return []
         return digests if chunk_size == self.chunk_size else []
 
     def _delete_snapshot(self, g: Guest, snapname: str) -> None:
-        # Tried again: after a stopped read (cancel, error), the reader on the host can
-        # keep the snapshot open a few more seconds ("dataset is busy" on ZFS).
+        self._retried(g, snapname, lambda: self.platform.delete_snapshot(g, snapname))
+
+    def _retried(self, g: Guest, snapname: str, action: Callable[[], T]) -> T:
+        """Delete (all or part of) the snapshot, tried again on failure.
+
+        After a stopped read (cancel, error), the reader on the host can keep the
+        snapshot open a few more seconds ("dataset is busy" on ZFS).
+        """
         for delay in (*self.delete_retry_delays, None):
             try:
-                self.platform.delete_snapshot(g, snapname)
-                return
+                return action()
             except Exception as exc:
                 if delay is None:
                     # A forgotten snapshot grows with every VM write: report it loudly.
@@ -359,6 +402,7 @@ class BackupRunner:
                     "size": r.size,
                     "index": f"{r.key}.{'img' if r.format == 'raw' else 'tar'}.fidx",
                     "stats": r.stats.as_dict(),
+                    **r.extra,
                 }
                 for r in results
             ],

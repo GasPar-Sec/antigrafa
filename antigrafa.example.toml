@@ -29,6 +29,11 @@ ca_file = "/etc/antigrafa/pve-root-ca.pem"
 # these that works: "proxmox" (if Proxmox can snapshot every disk and the token has
 # VM.Snapshot), else "storage", else "qemu". The choice is logged.
 snapshot_mode = "auto"           # default: "proxmox"
+# VM disks on ZFS (zvols): the snapshot of a backup stays on the node as the base of
+# the next one, which then reads only what ZFS says changed. "auto" takes storage
+# snapshots for those guests. While a base exists, Proxmox refuses to roll the disk
+# back to an older snapshot: delete the base first (the next backup reads it in full).
+# incremental = true
 # "qemu" mode: temporary images on the nodes, growing with what a VM writes during
 # its backup. If this filesystem fills up, the VM's writes fail: leave room. Created
 # 0700 if missing; refused if anyone but root can write to it.

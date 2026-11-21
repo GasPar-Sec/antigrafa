@@ -16,7 +16,7 @@ from typing import BinaryIO, Callable
 
 from .adaptive import SourceThrottle, WriteController
 from .chunkstore import ChunkStore, digest_of, encode_chunk
-from .delta import read_records
+from .delta import NOT_READ, read_records
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
 
@@ -28,6 +28,7 @@ class StreamStats:
     new_chunks: int = 0
     reused_chunks: int = 0  # already in the store (unchanged ones included)
     unchanged_chunks: int = 0  # same as the previous backup: not even sent
+    skipped_chunks: int = 0  # of those, not even read on the source (incremental)
     sent_bytes: int = 0  # chunk data that crossed the network
     stored_bytes: int = 0
     elapsed: float = 0.0
@@ -133,17 +134,20 @@ def backup_records(
 
     try:
         for digest, data, length in records:
-            # The source read the chunk either way: it counts for its load and the progress
-            if throttle is not None:
+            # A chunk the source read counts for its load, even unchanged; every chunk
+            # counts for the progress
+            skipped = data is NOT_READ
+            if throttle is not None and not skipped:
                 throttle.consume(length)
             if on_read is not None:
                 on_read(length)
             digests.append(digest)
             stats.bytes_read += length
             stats.chunks += 1
-            if data is None:  # unchanged since the previous backup, which stored it
+            if data is None or skipped:  # unchanged since the previous backup, which stored it
                 stats.reused_chunks += 1
                 stats.unchanged_chunks += 1
+                stats.skipped_chunks += skipped
                 continue
             stats.sent_bytes += length
             if digest in seen or store.has(digest):

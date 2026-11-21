@@ -50,7 +50,7 @@ class Minimal(Platform):
     def guests(self):
         return []
 
-    def plan_backup(self, guest, snapshot, low_priority=True):
+    def plan_backup(self, guest, snapshot, low_priority=True, previous=None):
         return BackupPlan(config={})
 
     def create_snapshot(self, guest, snapshot):
@@ -331,7 +331,7 @@ def test_platform_without_disk_sizes():
         def guests(self):
             return []
 
-        def plan_backup(self, guest, snapshot, low_priority=True):
+        def plan_backup(self, guest, snapshot, low_priority=True, previous=None):
             return BackupPlan(config={}, disks=[])
 
         def create_snapshot(self, guest, snapshot):
@@ -773,10 +773,12 @@ class AutoAPI(ModeAPI):
         return {"VM.Audit"} if self.no_snapshot_right else {"VM.Audit", "VM.Snapshot"}
 
 
-def _auto(api, ssh, guests=None):
+def _auto(api, ssh, guests=None, incremental=False):
+    """incremental=False: the choice between Proxmox, storage and QEMU snapshots alone."""
     from antigrafa.platforms.proxmox import GuestSettings
 
     settings = ProxmoxSettings(url="https://pve", token_id="a@pve!b", remote_hash=False, snapshot_mode="auto",
+                               incremental=incremental,
                                guests={g: GuestSettings(m) for g, m in (guests or {}).items()})
     return ProxmoxPlatform("c1", settings, api=api, ssh_for_host=lambda node: ssh)
 
@@ -862,3 +864,99 @@ def test_qemu_mode_settings_and_rights():
     api = PermAPI(CONFIGS, denied={"/vms/100": {"VM.Snapshot"}})
     settings = ProxmoxSettings(url="https://pve", token_id="a@pve!b", snapshot_mode="qemu")
     ProxmoxPlatform("c1", settings, api=api).check_access([VM])  # no VM.Snapshot: fine
+
+
+# --------------------------------------------------------------------------- incremental: ZFS base snapshots
+
+PREVIOUS = {
+    "snapshot": "antigrafa_A",
+    "disks": [
+        {"key": "scsi0", "volume": "local-zfs:vm-650-disk-0", "format": "raw", "size": 1024,
+         "source_snapshot": {"name": "antigrafa_A", "guid": "42"}},
+        {"key": "scsi1", "volume": "local-lvm:vm-650-disk-1", "format": "raw", "size": 8},
+    ],
+}
+BASE_GUID = {"zfs get -Hp -o value guid rpool/data/vm-650-disk-0@antigrafa_A": "42\n"}
+
+
+def test_auto_with_incremental_takes_storage_snapshots_of_zvols(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    plan = _auto(AutoAPI(ZFS_ONLY), _qemu_ssh(), incremental=True).plan_backup(RUNNING_VM, SNAP)
+    assert "captured by storage (incremental: the snapshot of scsi0 stays as the next base)" in caplog.text
+    assert plan.disks[0].keeps_base
+
+
+def test_auto_with_incremental_and_no_zvol_keeps_the_usual_choice(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    api = AutoAPI({"agent": "1", "scsi0": "local-lvm:vm-650-disk-1"})
+    _auto(api, _qemu_ssh(), incremental=True).plan_backup(RUNNING_VM, SNAP)
+    assert "captured by proxmox" in caplog.text
+
+
+def test_storage_mode_keeps_zvol_snapshots_as_bases_and_drops_the_previous_one():
+    ssh = NodeSSH(replies=BASE_GUID)
+    platform = _platform(ModeAPI(), ssh)
+    zvol, thin = platform.plan_backup(RUNNING_VM, SNAP, previous=PREVIOUS).disks
+    assert zvol.keeps_base and zvol.base == ("antigrafa_A", "42") and zvol.base_size == 1024
+    assert not getattr(thin, "keeps_base", False)  # LVM-thin: no incremental reads
+
+    assert platform.release_snapshot(RUNNING_VM, SNAP) is True
+    assert not any(f"zfs destroy rpool/data/vm-650-disk-0@{SNAP}" in c for c in ssh.commands)  # kept
+    assert any(f"lvremove -f pve/snap_vm-650-disk-1_{SNAP}" in c for c in ssh.commands)  # deleted
+
+    platform.drop_previous_bases(RUNNING_VM, SNAP)
+    assert "zfs destroy rpool/data/vm-650-disk-0@antigrafa_A" in ssh.commands
+    platform.delete_snapshot(RUNNING_VM, SNAP)  # the backup failed after all: the new base goes too
+    assert any(f"zfs destroy rpool/data/vm-650-disk-0@{SNAP}" in c for c in ssh.commands)
+
+
+def test_base_not_reused_for_another_volume_or_without_incremental():
+    moved = {"disks": [{**PREVIOUS["disks"][0], "volume": "other-zfs:vm-650-disk-0"}]}
+    platform = _platform(ModeAPI(), NodeSSH())
+    assert platform.plan_backup(RUNNING_VM, SNAP, previous=moved).disks[0].base is None
+
+    settings = ProxmoxSettings(url="https://pve", token_id="a@pve!b", snapshot_mode="storage", incremental=False)
+    ssh = NodeSSH()
+    plain = ProxmoxPlatform("c1", settings, api=ModeAPI(), ssh_for_host=lambda node: ssh)
+    zvol = plain.plan_backup(RUNNING_VM, SNAP, previous=PREVIOUS).disks[0]
+    assert not zvol.keeps_base and zvol.base == ("antigrafa_A", "42")  # still read since it, and dropped
+    assert plain.release_snapshot(RUNNING_VM, SNAP) is False
+    assert any(f"zfs destroy rpool/data/vm-650-disk-0@{SNAP}" in c for c in ssh.commands)
+
+
+def test_proxmox_snapshots_are_never_kept():
+    api = ModeAPI({"agent": "1", "scsi0": "local-zfs:vm-650-disk-0"})
+    platform = _platform(api, NodeSSH(), mode="proxmox")
+    plan = platform.plan_backup(RUNNING_VM, SNAP)
+    assert not plan.disks[0].keeps_base
+    assert platform.release_snapshot(RUNNING_VM, SNAP) is False
+    assert api.api_calls == [("delete", SNAP)]
+
+
+def test_kept_bases_are_not_reported_as_leftovers():
+    ssh = NodeSSH(replies={
+        "zfs list -H -o name -t snapshot -d 1": "rpool/data/vm-650-disk-0@antigrafa_A\nrpool/data/vm-650-disk-0@antigrafa_C\n",
+    })
+    platform = _platform(ModeAPI(), ssh)
+    platform.plan_backup(RUNNING_VM, SNAP, previous=PREVIOUS)
+    assert platform.leftover_snapshots(RUNNING_VM, "antigrafa_") == ["antigrafa_C"]
+
+
+def test_previous_base_deletion_reports_failures():
+    ssh = NodeSSH(replies=BASE_GUID, fail={"zfs destroy": 1})
+    platform = _platform(ModeAPI(), ssh)
+    platform.plan_backup(RUNNING_VM, SNAP, previous=PREVIOUS)
+    with pytest.raises(PlatformError, match="vm-650-disk-0@antigrafa_A: .*refused"):
+        platform.drop_previous_bases(RUNNING_VM, SNAP)
+
+
+def test_incremental_must_be_true_or_false():
+    from antigrafa.config import ConfigError
+    from antigrafa.platforms.proxmox import parse_settings
+
+    with pytest.raises(ConfigError, match="incremental must be true or false"):
+        parse_settings("c1", {"url": "https://pve", "token_id": "a@pve!b", "incremental": "yes"})
