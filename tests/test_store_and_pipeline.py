@@ -259,3 +259,76 @@ def test_delta_backup_sends_and_stores_only_changes(store, tmp_path):
     with open(out, "wb") as f:
         restore_stream(store, digests, f, len(new))
     assert out.read_bytes() == new
+
+
+# --------------------------------------------------------------------------- parallel restore
+
+
+def test_in_order_keeps_the_order_whatever_finishes_first():
+    import random
+    import time
+
+    from antigrafa.pipeline import in_order
+
+    def slow(i):
+        time.sleep(random.random() / 100)
+        return i * 10
+
+    with ThreadPoolExecutor(4) as pool:
+        assert list(in_order(pool, slow, range(40), ahead=8)) == [i * 10 for i in range(40)]
+
+
+def test_in_order_stops_reading_when_the_consumer_stops():
+    import threading
+
+    from antigrafa.pipeline import in_order
+
+    started = []
+    gate = threading.Event()
+
+    def read(i):
+        started.append(i)
+        if i == 0:
+            gate.wait(5)
+        return i
+
+    with ThreadPoolExecutor(1) as pool:
+        results = in_order(pool, read, range(1000), ahead=3)
+        gate.set()
+        assert next(results) == 0
+        results.close()  # an error or a cancel on the writing side
+    assert len(started) <= 4  # never the whole disk read for nothing
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_parallel_restore_gives_the_same_image(store, tmp_path, workers):
+    image = os.urandom(CHUNK * 3) + bytes(CHUNK * 2) + os.urandom(CHUNK) + bytes(100)
+    digests = [store.insert(image[i : i + CHUNK]) for i in range(0, len(image), CHUNK)]
+    out = tmp_path / f"restored-{workers}.img"
+    seen = []
+    with open(out, "wb") as f:
+        restore_stream(store, digests, f, len(image), on_chunk=seen.append, workers=workers, chunk_size=CHUNK)
+    assert out.read_bytes() == image
+    assert seen == [CHUNK] * 6 + [100]
+
+
+def test_all_zero_chunks_are_known_by_their_digest_and_not_read(store, tmp_path):
+    from antigrafa.chunkstore import digest_of
+
+    zero = digest_of(bytes(CHUNK))
+    data = os.urandom(CHUNK)
+    digests = [zero, store.insert(data), zero]  # the zero chunk is not even in the store
+    recorder = _WriteRecorder()
+    restore_stream(store, digests, recorder, 3 * CHUNK, chunk_size=CHUNK)
+    assert recorder.written == CHUNK  # holes for the zeros
+    plain = io.BytesIO()
+    restore_stream(store, digests, plain, 3 * CHUNK, sparse=False, chunk_size=CHUNK)
+    assert plain.getvalue() == bytes(CHUNK) + data + bytes(CHUNK)
+
+
+def test_restore_stops_on_a_damaged_chunk(store, tmp_path):
+    good = store.insert(os.urandom(CHUNK))
+    bad = store.insert(os.urandom(CHUNK))
+    store.path_for(bad).write_bytes(b"garbage")
+    with pytest.raises(ChunkCorrupted):
+        restore_stream(store, [good, bad] + [good] * 50, io.BytesIO(), 52 * CHUNK, workers=4, chunk_size=CHUNK)

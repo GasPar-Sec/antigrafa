@@ -617,6 +617,11 @@ class ProxmoxPlatform(Platform):
         names -= {src.base[0] for src in sources if isinstance(src, ZfsZvolSource) and src.base}
         return sorted(names)
 
+    def restore_guest(self, manifest: dict, disks, request, progress, cancel) -> str:
+        from .restore import ProxmoxRestore
+
+        return ProxmoxRestore(self, manifest, disks, request, progress, cancel).run()
+
     def host_iowait(self, host: str) -> float:
         return self.api.node_iowait(host)
 

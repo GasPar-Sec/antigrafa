@@ -56,6 +56,56 @@ class RemoteStream:
         self.close(abort=exc_type is not None)
 
 
+class RemoteSink:
+    """Standard input of a remote command (writing a disk back), fed as data comes."""
+
+    def __init__(self, host: str, command: str, proc: subprocess.Popen, stdout_file, stderr_file) -> None:
+        self.host = host
+        self.command = command
+        self.proc = proc
+        self._stdout = stdout_file
+        self._stderr = stderr_file
+
+    def write(self, data) -> None:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[self.proc.stdin.write(view) :]
+        except (BrokenPipeError, OSError):
+            # The command stopped reading: its exit status and message tell why
+            self.close()
+            raise RemoteCommandError(self.host, self.command, self.proc.returncode or 1, "stopped reading its input")
+
+    def _output(self, f) -> str:
+        f.seek(0)
+        text = f.read().decode(errors="replace")
+        f.close()
+        return text
+
+    def close(self, abort: bool = False) -> str:
+        """End of the data: wait for the command; its output. ``abort``: kill it."""
+        if self.proc.stdin.closed:
+            return ""
+        if abort and self.proc.poll() is None:
+            self.proc.kill()
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        rc = self.proc.wait()
+        out, err = self._output(self._stdout), self._output(self._stderr)
+        if rc != 0 and not abort:
+            raise RemoteCommandError(self.host, self.command, rc, err)
+        return out
+
+    def __enter__(self) -> "RemoteSink":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is not None:
+            self.close(abort=True)
+
+
 @dataclass
 class SSHHost:
     host: str
@@ -103,6 +153,17 @@ class SSHHost:
         if input is not None:
             _send(proc.stdin, input)
         return RemoteStream(self.host, command, proc, stderr_file)
+
+
+    def sink(self, command: str) -> RemoteSink:
+        """Start ``command``, to be fed through ``RemoteSink.write``, then ``close``."""
+        stdout_file, stderr_file = tempfile.TemporaryFile(), tempfile.TemporaryFile()
+        log.debug("ssh %s@%s (sink): %s", self.user, self.host, _short(command))
+        # Argument list without a shell, as in run()
+        proc = subprocess.Popen(  # nosec B603
+            self._argv(command), bufsize=0, stdin=subprocess.PIPE, stdout=stdout_file, stderr=stderr_file
+        )
+        return RemoteSink(self.host, command, proc, stdout_file, stderr_file)
 
 
 def _send(pipe, data: bytes) -> None:

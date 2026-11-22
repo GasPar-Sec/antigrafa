@@ -284,7 +284,51 @@ antigrafa backup --source cluster2 --all  # --source: when several sources are c
 antigrafa list --target nas
 antigrafa verify --target nas             # re-read every chunk and check its digest
 antigrafa restore --target nas cluster1/vm/100/2026-11-17T22-30-00Z scsi0 /tmp/scsi0.raw
+antigrafa restore-guest --target nas cluster1/vm/100/2026-11-17T22-30-00Z   # back into Proxmox
+antigrafa restore-guest cluster1/vm/100/2026-11-17T22-30-00Z --id 100 --overwrite --stop --start
+antigrafa restore-guest cluster1/vm/100/2026-11-17T22-30-00Z --id 100 --disk-only
 ```
+
+`restore` and `verify` read, decompress and check several chunks at a time (`--jobs`,
+4 by default); a chunk of zeros is known by its digest and not even read.
+
+### Restoring a guest into Proxmox VE
+
+`restore-guest` recreates the guest from its backup: its configuration, and each disk
+written back to a storage of the node. The guest id is asked on a terminal, the
+original one by default (`--id` to give it); the node is the one the guest was on
+(`--host`), each disk goes back to its original storage (`--storage` for another one).
+
+- Everything is checked before anything changes: the id is free, every target storage
+  is supported, holds this kind of content and is available on the node.
+- When the id is taken, the restore is refused unless you choose:
+  - `--overwrite`: the guest is replaced, disks included. It must be on that node, of
+    the same kind, and without snapshots. Its previous disks (and `unusedN` volumes)
+    are deleted once the restored guest is complete; disks that were not backed up
+    (`backup=0`) stay attached as they are, and a volume of another guest (a linked
+    clone's base) is never deleted.
+  - `--disk-only`: nothing changes in the guest, the disks of the backup are added to
+    it as unused disks (`unused0`...), to attach or copy from in Proxmox. The guest may
+    be running or have snapshots.
+- With `--overwrite`, a running guest keeps running, locked, while its disks are
+  copied. It is shut down only then, just before it is replaced (stopped hard if the
+  shutdown does not finish in 5 minutes). If it cannot be stopped within 2 more minutes,
+  it is not replaced: the copied disks stay attached to it as unused disks, and it is
+  unlocked, with nothing else changed.
+- To shut it down before the restore starts instead: `--stop` (clean shutdown; the
+  restore fails, having changed nothing, if it is still running after 5 minutes) or
+  `--force-stop` (then a hard stop; fails after 2 more minutes).
+- A restore that fails or is interrupted (Ctrl+C, cancel) unlocks the guest first, then
+  removes what it created.
+- The configuration is an exact copy: same MAC addresses, SMBIOS UUID and vmgenid. Do
+  not run the original and the copy on the same network. A copy restored under another
+  id has start at boot (`onboot`) turned off, so it does not start next to its original.
+- The guest is not started, unless `--start` (once the restore is done; if it does not
+  start, the restored guest stays). On failure, or Ctrl+C, the volumes created are freed
+  and the id released.
+- Supported: VM disks to ZFS, LVM-thin, LVM and directory storages (dir, NFS, CIFS:
+  raw files); container files to ZFS. Done over SSH as root (`pvesm`, the cluster
+  configuration files); the API token only reads.
 
 Output, for every command (options go before the command name):
 

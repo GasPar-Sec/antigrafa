@@ -9,16 +9,20 @@ itself. The VM never waits.
 from __future__ import annotations
 
 import time
+from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
-from concurrent.futures import Executor, Future
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import BinaryIO, Callable
+from typing import BinaryIO, Callable, TypeVar
 
 from .adaptive import SourceThrottle, WriteController
 from .chunkstore import ChunkStore, digest_of, encode_chunk
 from .delta import NOT_READ, read_records
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 
 @dataclass
@@ -172,6 +176,24 @@ def backup_records(
 
 _ZEROS: dict[int, bytes] = {}
 
+# Chunks read ahead per reader thread (restore, verify)
+READ_AHEAD = 2
+
+
+def in_order(pool: Executor, fn: Callable[[T], R], items: Iterable[T], ahead: int) -> Iterator[R]:
+    """``fn(item)`` for each item, run ``ahead`` at a time in ``pool``, yielded in order."""
+    pending: deque[Future] = deque()
+    try:
+        for item in items:
+            pending.append(pool.submit(fn, item))
+            if len(pending) >= ahead:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
+    finally:
+        for fut in pending:  # stopped early (error, cancel): nothing more to read
+            fut.cancel()
+
 
 def restore_stream(
     store: ChunkStore,
@@ -180,20 +202,37 @@ def restore_stream(
     size: int,
     sparse: bool = True,
     on_chunk: Callable[[int], None] | None = None,
+    workers: int = 4,
+    chunk_size: int | None = None,
 ) -> None:
     """Rebuild the original stream. All-zero chunks become holes when the output allows it.
 
-    ``on_chunk(n)`` is called after each chunk, written or skipped (progress).
+    ``workers`` threads read, decompress and check the chunks ahead, written in order.
+    With ``chunk_size`` (from the index), an all-zero chunk is known by its digest and
+    not even read. ``on_chunk(n)`` is called after each chunk, written or skipped.
     """
     sparse = sparse and out.seekable()
-    for digest in digests:
-        data = store.read(digest)
-        zeros = _ZEROS.get(len(data)) or _ZEROS.setdefault(len(data), bytes(len(data)))
-        if sparse and data == zeros:
-            out.seek(len(data), 1)
-        else:
-            out.write(data)
-        if on_chunk is not None:
-            on_chunk(len(data))
+    zero = digest_of(bytes(chunk_size)) if chunk_size else None
+
+    def load(digest: bytes) -> bytes | None:
+        return None if digest == zero else store.read(digest)
+
+    with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="restore") as pool:
+        for data in in_order(pool, load, digests, max(1, workers) * READ_AHEAD):
+            if data is None:  # an all-zero chunk, by its digest
+                length = chunk_size or 0
+                if sparse:
+                    out.seek(length, 1)
+                else:
+                    out.write(_ZEROS.get(length) or _ZEROS.setdefault(length, bytes(length)))
+            else:
+                length = len(data)
+                zeros = _ZEROS.get(length) or _ZEROS.setdefault(length, bytes(length))
+                if sparse and data == zeros:
+                    out.seek(length, 1)
+                else:
+                    out.write(data)
+            if on_chunk is not None:
+                on_chunk(length)
     if sparse:
         out.truncate(size)
