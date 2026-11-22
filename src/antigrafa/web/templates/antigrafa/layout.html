@@ -1,7 +1,18 @@
 {% extends "antigrafa/base.html" %}
+{% comment %}
+The pages of the interface (backup, restore): the header with the tabs, the page's own form, then the
+run panel and the list of the page's runs. One run at a time for the whole server: the other page's
+running run is pointed to, not shown.
+{% endcomment %}
 {% block body %}
 <header>
-  <h1>Antigrafa</h1>
+  <div class="brand">
+    <h1>Antigrafa</h1>
+    <nav>
+      <a href="{% url 'index' %}"{% if page == "backup" %} aria-current="page"{% endif %}>Backup</a>
+      <a href="{% url 'restore_page' %}"{% if page == "restore" %} aria-current="page"{% endif %}>Restore</a>
+    </nav>
+  </div>
   <div class="who">
     <span>{{ user.get_username }}</span>
     <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button type="submit">Sign out</button></form>
@@ -9,43 +20,18 @@
 </header>
 <main>
   {% if config_error %}<section><p class="error">Configuration: {{ config_error }}</p></section>{% endif %}
+  <section id="other-run" class="hidden"><p id="other-run-text" style="margin: 0;"></p></section>
 
-  <section id="start">
-    <h2>Start a backup</h2>
-    <div class="row">
-      <div>
-        <label for="source">Source</label>
-        <select id="source">{% for name in choices.sources %}<option>{{ name }}</option>{% endfor %}</select>
-      </div>
-      <div>
-        <label for="target">Destination</label>
-        <select id="target">{% for name in choices.targets %}<option>{{ name }}</option>{% endfor %}</select>
-      </div>
-      <div style="flex: 0 0 auto;"><button id="load-guests" type="button">Reload guests</button></div>
-    </div>
-    <div class="row" style="margin: 14px 0 8px;">
-      <label style="display: inline; color: inherit;"><input type="radio" name="mode" value="all" checked> Every guest</label>
-      <label style="display: inline; color: inherit;"><input type="radio" name="mode" value="chosen"> Chosen guests</label>
-      <span class="muted" id="mode-help"></span>
-    </div>
-    <p class="muted" id="guests-message">Loading guests…</p>
-    <table id="guests" class="hidden">
-      <thead><tr><th id="check-header"></th><th>ID</th><th>Type</th><th>Name</th><th>Node</th><th>Status</th></tr></thead>
-      <tbody></tbody>
-    </table>
-    <div class="row" style="margin-top: 14px;">
-      <div style="flex: 0 0 auto;"><button id="start-button" class="primary" type="button">Start the backup</button></div>
-      <div><p class="error" id="start-error"></p></div>
-    </div>
-  </section>
+  {% block content %}{% endblock %}
 
   <section id="run" class="hidden">
     <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 8px;">
-      <h2 style="margin: 0;">Backup <span id="run-id"></span> <span id="run-state" class="badge"></span></h2>
+      <h2 style="margin: 0;"><span id="run-kind">Backup</span> <span id="run-id"></span> <span id="run-state" class="badge"></span></h2>
       <button id="cancel-button" class="danger hidden" type="button">Cancel</button>
     </div>
     <p class="muted" id="run-info"></p>
     <p class="error" id="run-error"></p>
+    <p id="run-message" class="state-ok"></p>
     <div id="progress"></div>
     <table id="results" class="hidden" style="margin-top: 12px;">
       <thead><tr><th style="width: 22%;">Guest</th><th style="width: 9%;">Result</th><th style="width: 9%;">Time</th><th>Details</th></tr></thead>
@@ -62,10 +48,10 @@
   </section>
 
   <section>
-    <h2>Recent backups</h2>
+    <h2>{% if page == "restore" %}Recent restores{% else %}Recent backups{% endif %}</h2>
     <p class="muted" id="runs-empty">None since the server started.</p>
     <table id="runs" class="hidden">
-      <thead><tr><th>#</th><th>Started</th><th>By</th><th>Source → destination</th><th>Guests</th><th>State</th></tr></thead>
+      <thead><tr><th>#</th><th>Started</th><th>By</th><th>{% if page == "restore" %}From → to{% else %}Source → destination{% endif %}</th><th>Guests</th><th>State</th></tr></thead>
       <tbody></tbody>
     </table>
   </section>
@@ -73,12 +59,21 @@
 
 <script>
 "use strict";
+const PAGE = "{{ page }}";  // the kind of runs this page shows: backup or restore
+const PAGES = {backup: "{% url 'index' %}", restore: "{% url 'restore_page' %}"};
 const CSRF = document.querySelector('meta[name="csrf-token"]').content;
 const $ = (id) => document.getElementById(id);
-let selectedRun = null;   // run shown; null: the most recent one
+let selectedRun = null;   // run shown; null: the most recent one of this page
 let shownRun = null;      // run whose log is on screen
 let logTotal = 0;         // log lines of that run already shown
 let timer = null;
+let busy = false;         // a backup or a restore is running (one at a time)
+let onStatus = () => {};  // the page's own reaction to busy changing
+
+{
+  const asked = Number(new URLSearchParams(window.location.search).get("run"));
+  if (Number.isInteger(asked) && asked > 0) selectedRun = asked;  // a link from the other page
+}
 
 function el(tag, text, cls) {
   const node = document.createElement(tag);
@@ -117,68 +112,6 @@ async function call(url, options = {}) {
   return data;
 }
 
-// ------------------------------------------------------------------ guests
-
-function mode() { return document.querySelector('input[name="mode"]:checked').value; }
-
-function showMode() {
-  const all = mode() === "all";
-  $("check-header").textContent = all ? "Exclude" : "Back up";
-  $("mode-help").textContent = all
-    ? "Every guest of the source, including new ones; tick the ones to leave out."
-    : "Only the ticked guests.";
-  for (const box of document.querySelectorAll("#guests tbody input")) box.checked = false;
-}
-
-async function loadGuests() {
-  const tbody = $("guests").querySelector("tbody");
-  tbody.replaceChildren();
-  $("guests").classList.add("hidden");
-  $("guests-message").textContent = "Loading guests…";
-  $("guests-message").className = "muted";
-  try {
-    const data = await call(`{% url 'guests' %}?source=${encodeURIComponent($("source").value)}`);
-    for (const g of data.guests) {
-      const tr = el("tr");
-      const box = el("input");
-      box.type = "checkbox";
-      box.value = g.id;
-      const cell = el("td");
-      cell.append(box);
-      tr.append(cell, el("td", g.id), el("td", g.kind.toUpperCase()), el("td", g.name), el("td", g.host), el("td", g.status));
-      tbody.append(tr);
-    }
-    $("guests-message").textContent = data.guests.length ? "" : "No guest on this source.";
-    $("guests").classList.toggle("hidden", !data.guests.length);
-  } catch (e) {
-    $("guests-message").textContent = e.message;
-    $("guests-message").className = "error";
-  }
-}
-
-async function startBackup() {
-  const ticked = [...document.querySelectorAll("#guests tbody input:checked")].map((b) => b.value);
-  const all = mode() === "all";
-  if (!all && !ticked.length) { $("start-error").textContent = "Tick at least one guest."; return; }
-  $("start-error").textContent = "";
-  $("start-button").disabled = true;
-  try {
-    const data = await call("{% url 'start' %}", {
-      method: "POST",
-      body: JSON.stringify({
-        source: $("source").value, target: $("target").value,
-        all: all, guests: all ? [] : ticked, exclude: all ? ticked : [],
-      }),
-    });
-    selectedRun = data.run;
-    await refresh();
-  } catch (e) {
-    $("start-error").textContent = e.message;
-  } finally {
-    $("start-button").disabled = false;
-  }
-}
-
 // ------------------------------------------------------------------ runs
 
 function progressLine(name, p, cls) {
@@ -201,7 +134,8 @@ function showProgress(run) {
   box.replaceChildren();
   const p = run.progress;
   if (!p) return;
-  const overall = progressLine(`${run.guests_done}/${run.guests_total} guests`, p, "overall");
+  const name = run.kind === "restore" ? "Restore" : `${run.guests_done}/${run.guests_total} guests`;
+  const overall = progressLine(name, p, "overall");
   overall.querySelector(".numbers").textContent += `  ·  ${duration(p.elapsed)}`;
   box.append(overall);
   for (const t of p.tasks) box.append(progressLine(t.name, t));
@@ -228,15 +162,26 @@ function showRun(run) {
   $("run").classList.toggle("hidden", !run);
   if (!run) return;
   if (shownRun !== run.id) { shownRun = run.id; logTotal = 0; $("log").textContent = ""; }
+  const restoring = run.kind === "restore";
+  $("run-kind").textContent = restoring ? "Restore" : "Backup";
   $("run-id").textContent = `#${run.id}`;
   $("run-state").textContent = run.state;
   $("run-state").className = `badge state-${run.state}`;
   let info = `${run.source} → ${run.target} · started ${time(run.started)} by ${run.user}`;
+  if (restoring) {
+    const r = run.restore, g = run.guests[0] || {};
+    const how = {new: "new guest", overwrite: "replacing the guest", "disk-only": "disks added as unused"}[r.mode] || r.mode;
+    info = `${run.backup} (${run.target}) → ${(g.kind || "").toUpperCase()} ${r.guest_id} on ${g.host || "?"}`
+      + ` · ${how}${r.stop ? " · " + r.stop + " first" : ""}${r.start ? " · start after" : ""}`
+      + ` · started ${time(run.started)} by ${run.user}`;
+  }
   if (run.finished) info += ` · ended ${time(run.finished)}`;
   if (run.cancelled_by) info += ` · cancelled by ${run.cancelled_by}`;
   $("run-info").textContent = info;
   $("run-error").textContent = run.error;
+  $("run-message").textContent = run.message || "";
   $("cancel-button").classList.toggle("hidden", run.state !== "running");
+  $("cancel-button").dataset.kind = run.kind;
   $("cancel-button").dataset.run = run.id;
   showProgress(run);
   showResults(run);
@@ -258,20 +203,39 @@ function showRuns(runs) {
     const tr = el("tr");
     tr.style.cursor = "pointer";
     tr.addEventListener("click", () => { selectedRun = r.id; refresh(); });
-    const guests = `${r.guests_done}/${r.guests_total}` + (r.guests_failed ? ` (${r.guests_failed} failed)` : "");
+    const restoring = r.kind === "restore";
+    const guests = restoring ? r.guest
+      : `${r.guests_done}/${r.guests_total}` + (r.guests_failed ? ` (${r.guests_failed} failed)` : "");
     tr.append(el("td", `#${r.id}`), el("td", time(r.started)), el("td", r.user),
-      el("td", `${r.source} → ${r.target}`), el("td", guests), el("td", r.state, `state-${r.state}`));
+      el("td", restoring ? `${r.target} → ${r.source}` : `${r.source} → ${r.target}`),
+      el("td", guests), el("td", r.state, `state-${r.state}`));
     tbody.append(tr);
   }
   $("runs").classList.toggle("hidden", !runs.length);
   $("runs-empty").classList.toggle("hidden", runs.length > 0);
 }
 
+// The run of the other page that keeps this one from starting
+function showOtherRun(active) {
+  const other = active && active.kind !== PAGE ? active : null;
+  $("other-run").classList.toggle("hidden", !other);
+  if (!other) return;
+  const what = other.kind === "restore" ? "Restore" : "Backup";
+  const text = $("other-run-text");
+  text.replaceChildren(
+    el("span", `${what} #${other.id} is running (started by ${other.user}): `
+      + `a ${PAGE} can start once it has ended. `),
+  );
+  const link = el("a", `See ${what.toLowerCase()} #${other.id}`);
+  link.href = `${PAGES[other.kind]}?run=${encodeURIComponent(other.id)}`;
+  text.append(link);
+}
+
 async function refresh() {
   clearTimeout(timer);
   let active = false;
   try {
-    const params = new URLSearchParams();
+    const params = new URLSearchParams({kind: PAGE});
     if (selectedRun !== null) params.set("run", selectedRun);
     const target = selectedRun !== null ? selectedRun : shownRun;
     if (target !== null && target === shownRun) params.set("logs_after", logTotal);
@@ -283,8 +247,10 @@ async function refresh() {
     }
     showRuns(data.runs);
     showRun(data.run);
+    showOtherRun(data.active);
     active = data.busy;
-    $("start-button").disabled = data.busy;
+    busy = data.busy;
+    onStatus();
   } catch (e) {
     $("run-error").textContent = e.message;
   } finally {
@@ -294,7 +260,10 @@ async function refresh() {
 
 async function cancelRun() {
   const id = $("cancel-button").dataset.run;
-  if (!confirm(`Cancel backup #${id}? The snapshots are deleted and the unfinished backups removed.`)) return;
+  const question = $("cancel-button").dataset.kind === "restore"
+    ? `Cancel restore #${id}? What it created is removed and the guest unlocked (a guest it already stopped stays stopped).`
+    : `Cancel backup #${id}? The snapshots are deleted and the unfinished backups removed.`;
+  if (!confirm(question)) return;
   try {
     await call(`/api/backups/${encodeURIComponent(id)}/cancel`, {method: "POST"});
   } catch (e) {
@@ -303,13 +272,7 @@ async function cancelRun() {
   refresh();
 }
 
-for (const radio of document.querySelectorAll('input[name="mode"]')) radio.addEventListener("change", showMode);
-$("source").addEventListener("change", loadGuests);
-$("load-guests").addEventListener("click", loadGuests);
-$("start-button").addEventListener("click", startBackup);
 $("cancel-button").addEventListener("click", cancelRun);
-showMode();
-if ($("source").options.length) loadGuests(); else $("guests-message").textContent = "No source configured.";
-refresh();
 </script>
+{% block script %}{% endblock %}
 {% endblock %}

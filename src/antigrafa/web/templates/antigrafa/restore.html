@@ -1,0 +1,367 @@
+{% extends "antigrafa/layout.html" %}
+{% block title %}Restore · Antigrafa{% endblock %}
+{% block content %}
+  <section id="restore">
+    <h2>Restore a guest</h2>
+    <div class="row">
+      <div>
+        <label for="restore-target">Destination holding the backups</label>
+        <select id="restore-target">{% for name in choices.targets %}<option>{{ name }}</option>{% endfor %}</select>
+      </div>
+      <div>
+        <label for="restore-filter">Filter</label>
+        <input type="text" id="restore-filter" placeholder="ID, name, source or node" autocomplete="off">
+      </div>
+      <div style="flex: 0 0 auto;"><button id="load-backups" type="button">Reload backups</button></div>
+    </div>
+    <p class="muted" id="backups-message">Loading backups…</p>
+    <div class="table-box">
+      <table id="backups" class="hidden">
+        <thead><tr><th></th><th>Guest</th><th>Source</th><th>Node</th><th>Backed up</th><th>Size</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div id="restore-form" class="hidden">
+      <p id="restore-chosen"></p>
+      <div class="row">
+        <div>
+          <label for="restore-id">Restore as guest ID</label>
+          <input type="text" id="restore-id" inputmode="numeric" autocomplete="off">
+        </div>
+        <div>
+          <label for="restore-host">Node</label>
+          <select id="restore-host"></select>
+        </div>
+        <div>
+          <label for="restore-storage">Storage</label>
+          <select id="restore-storage"></select>
+        </div>
+      </div>
+      <p id="restore-id-info" class="muted"></p>
+      <p id="restore-location-info" class="muted"></p>
+      <div class="choices">
+        <label><input type="radio" name="restore-mode" value="new"> New guest <span class="muted">— the ID must be free</span></label>
+        <label><input type="radio" name="restore-mode" value="overwrite"> Replace the existing guest
+          <span class="muted">— its configuration and disks; the previous disks are deleted once the restore is complete</span></label>
+        <label><input type="radio" name="restore-mode" value="disk-only"> Add the disks to the existing guest
+          <span class="muted">— as unused disks, nothing else changes</span></label>
+      </div>
+      <div id="restore-stop-box" class="hidden" style="margin-top: 10px;">
+        <label for="restore-stop">If the guest is running</label>
+        <select id="restore-stop">
+          <option value="">Keep it running while its disks are copied, then shut it down (or stop it) just before replacing it</option>
+          <option value="stop">Shut it down before the restore starts (fail if it is still running after 5 minutes)</option>
+          <option value="force-stop">Shut it down before the restore starts, and stop it hard if it does not shut down</option>
+        </select>
+      </div>
+      <div class="choices">
+        <label><input type="checkbox" id="restore-start"> Start the guest once restored</label>
+      </div>
+      <p class="muted" id="restore-note"></p>
+      <div class="row" style="margin-top: 10px;">
+        <div style="flex: 0 0 auto;"><button id="restore-button" class="primary" type="button">Restore</button></div>
+        <div><p class="error" id="restore-error"></p></div>
+      </div>
+    </div>
+  </section>
+{% endblock %}
+
+{% block script %}
+<script>
+"use strict";
+
+const MAX_ROWS = 300;       // backups listed at once: the filter narrows them
+let backupList = [];
+let chosen = null;          // the backup to restore
+const sourceGuests = {};    // source -> {guests} | {error} | {loading}
+const restoreLocations = {}; // "source/kind" -> {locations} | {error} | {loading}
+
+function locationsOf(b) { return restoreLocations[`${b.source}/${b.kind}`] || {loading: true}; }
+function originalStorages(b) {
+  return [...new Set(b.disks.map((d) => (d.volume || "").split(":")[0]).filter(Boolean))];
+}
+
+async function loadLocations(b) {
+  const key = `${b.source}/${b.kind}`;
+  restoreLocations[key] = {loading: true};
+  try {
+    const params = new URLSearchParams({source: b.source, kind: b.kind});
+    const data = await call(`{% url 'restore_locations' %}?${params}`);
+    restoreLocations[key] = {locations: data.locations};
+  } catch (e) {
+    restoreLocations[key] = {error: e.message};
+  }
+}
+
+function option(text, value, disabled) {
+  const node = el("option", text);
+  node.value = value;
+  node.disabled = !!disabled;
+  return node;
+}
+
+// The nodes of the source: the one the guest was on by default; offline ones greyed out
+function fillNodes() {
+  const select = $("restore-host");
+  const known = locationsOf(chosen);
+  select.replaceChildren();
+  if (!known.locations) {  // loading, or not listed: the original node only
+    select.append(option(known.loading ? "Loading nodes…" : `${chosen.host || "?"} (original)`, chosen.host || ""));
+    select.disabled = !!known.loading;
+    return;
+  }
+  for (const loc of known.locations) {
+    const text = `${loc.host}${loc.host === chosen.host ? " (original)" : ""}${loc.online ? "" : " — offline"}`;
+    select.append(option(text, loc.host, !loc.online));
+  }
+  if (chosen.host && !known.locations.some((l) => l.host === chosen.host)) {
+    select.append(option(`${chosen.host} (original) — not in this cluster`, chosen.host, true));
+  }
+  const usable = known.locations.filter((l) => l.online);
+  const original = usable.find((l) => l.host === chosen.host);
+  select.value = original ? original.host : usable.length ? usable[0].host : "";
+  select.disabled = false;
+}
+
+// The storages of the chosen node that can hold this guest's disks, with their free space
+function fillStorages() {
+  const select = $("restore-storage");
+  const previous = select.value;
+  const known = locationsOf(chosen);
+  const originals = originalStorages(chosen);
+  const loc = known.locations ? known.locations.find((l) => l.host === $("restore-host").value) : null;
+  const here = loc ? loc.storages.map((s) => s.id) : null;
+  const missing = here ? originals.filter((s) => !here.includes(s)) : [];
+  select.replaceChildren();
+  let text = `Original storage of each disk (${originals.join(", ") || "?"})`;
+  if (missing.length) text += ` — ${missing.join(", ")} not usable on this node`;
+  select.append(option(text, "", missing.length > 0));
+  for (const s of loc ? loc.storages : []) {
+    let label = `${s.id} (${s.type}${s.avail !== null ? ", " + bytes(s.avail) + " free" : ""})`;
+    if (s.avail !== null && s.avail < chosen.size) label += " — may be too small";
+    select.append(option(label, s.id));
+  }
+  const values = [...select.options].filter((o) => !o.disabled).map((o) => o.value);
+  select.value = values.includes(previous) ? previous : values.length ? values[0] : "";
+  select.disabled = !!known.loading || !values.length;
+  let info = "";
+  if (known.error) info = `Could not list the nodes and storages (${known.error}): the original ones are used.`;
+  else if (loc && loc.error) info = `Could not list the storages of ${loc.host}: ${loc.error}`;
+  else if (loc && !values.length) info = `No storage of ${loc.host} can hold the disks of this ${chosen.kind.toUpperCase()}.`;
+  $("restore-location-info").textContent = info;
+  $("restore-location-info").className = info && !known.error ? "error" : "muted";
+}
+
+function when(b) { return b.time ? time(b.time) : b.path.split("/").pop(); }
+function guestName(b) { return `${b.kind.toUpperCase()} ${b.id}${b.name ? " (" + b.name + ")" : ""}`; }
+function modeRadios() { return [...document.querySelectorAll('input[name="restore-mode"]')]; }
+function restoreMode() {
+  const radio = document.querySelector('input[name="restore-mode"]:checked');
+  return radio ? radio.value : "";
+}
+
+async function loadBackups() {
+  chosen = null;
+  $("restore-form").classList.add("hidden");
+  $("backups").classList.add("hidden");
+  $("backups-message").textContent = "Loading backups…";
+  $("backups-message").className = "muted";
+  try {
+    const data = await call(`{% url 'start' %}?target=${encodeURIComponent($("restore-target").value)}`);
+    backupList = data.backups;
+    showBackups();
+  } catch (e) {
+    backupList = [];
+    $("backups-message").textContent = e.message;
+    $("backups-message").className = "error";
+  }
+}
+
+function showBackups() {
+  const words = $("restore-filter").value.toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = backupList.filter((b) => {
+    const text = `${b.kind} ${b.id} ${b.name} ${b.source} ${b.host} ${b.path}`.toLowerCase();
+    return words.every((w) => text.includes(w));
+  });
+  const tbody = $("backups").querySelector("tbody");
+  tbody.replaceChildren();
+  for (const b of shown.slice(0, MAX_ROWS)) {
+    const tr = el("tr");
+    tr.style.cursor = "pointer";
+    const radio = el("input");
+    radio.type = "radio";
+    radio.name = "backup";
+    radio.checked = chosen !== null && chosen.path === b.path;
+    radio.setAttribute("aria-label", b.path);
+    const cell = el("td");
+    cell.append(radio);
+    tr.addEventListener("click", () => { radio.checked = true; choose(b); });
+    tr.append(cell, el("td", guestName(b)), el("td", b.source), el("td", b.host), el("td", when(b)), el("td", bytes(b.size)));
+    tbody.append(tr);
+  }
+  let message = "";
+  if (!backupList.length) message = "No backup on this destination.";
+  else if (!shown.length) message = "No backup matches the filter.";
+  else if (shown.length > MAX_ROWS) message = `${shown.length - MAX_ROWS} more: narrow the filter.`;
+  $("backups-message").textContent = message;
+  $("backups-message").className = "muted";
+  $("backups").classList.toggle("hidden", !shown.length);
+}
+
+async function loadSourceGuests(source) {
+  sourceGuests[source] = {loading: true};
+  try {
+    const data = await call(`{% url 'guests' %}?source=${encodeURIComponent(source)}`);
+    sourceGuests[source] = {guests: data.guests};
+  } catch (e) {
+    sourceGuests[source] = {error: e.message};
+  }
+}
+
+async function choose(b) {
+  chosen = b;
+  $("restore-form").classList.remove("hidden");
+  const disks = b.disks.map((d) => `${d.key} ${bytes(d.size || 0)}${d.volume ? " (" + d.volume + ")" : ""}`).join(", ");
+  $("restore-chosen").textContent = `Backup of ${guestName(b)}, ${when(b)}, source ${b.source} · ${disks}`;
+  $("restore-id").value = b.id;  // the original id by default
+  $("restore-stop").value = "";
+  $("restore-start").checked = false;
+  $("restore-error").textContent = "";
+  $("restore-storage").value = "";
+  for (const radio of modeRadios()) radio.checked = false;
+  delete restoreLocations[`${b.source}/${b.kind}`];
+  fillNodes();
+  fillStorages();
+  updateRestoreForm();
+  // Each time: guests, nodes and free space change
+  await Promise.all([loadSourceGuests(b.source), loadLocations(b)]);
+  if (chosen !== b) return;  // another backup chosen meanwhile
+  fillNodes();
+  fillStorages();
+  updateRestoreForm();
+}
+
+function nodeChanged() {
+  fillStorages();
+  updateRestoreForm();
+}
+
+function updateRestoreForm() {
+  if (!chosen) return;
+  const id = $("restore-id").value.trim() || chosen.id;
+  const known = sourceGuests[chosen.source] || {loading: true};
+  const existing = known.guests ? known.guests.find((g) => g.id === id) : undefined;
+  const info = $("restore-id-info");
+  let allowed = ["new", "overwrite", "disk-only"];
+  let problem = "";
+  info.className = "muted";
+  if (!/^\d+$/.test(id) || Number(id) < 100) {
+    problem = "A guest ID is a number, 100 or more.";
+  } else if (known.loading) {
+    info.textContent = `Checking whether ID ${id} is taken…`;
+  } else if (known.error) {
+    info.textContent = `Could not check whether ID ${id} is taken (${known.error}); the restore checks it.`;
+  } else if (!existing) {
+    info.textContent = `ID ${id} is free: a new guest is created.`;
+    allowed = ["new"];
+  } else if (existing.kind !== chosen.kind) {
+    problem = `ID ${id} is ${existing.label}: this backup is a ${chosen.kind.toUpperCase()}.`;
+  } else {
+    info.textContent = `ID ${id} is taken: ${existing.label} on ${existing.host}, ${existing.status}. `
+      + "Replace it, or add the disks to it.";
+    allowed = ["overwrite", "disk-only"];
+  }
+  if (problem) {
+    info.textContent = problem;
+    info.className = "error";
+    allowed = [];
+  }
+  for (const radio of modeRadios()) {
+    radio.disabled = !allowed.includes(radio.value);
+    if (radio.disabled) radio.checked = false;
+  }
+  if (allowed.length === 1) modeRadios().find((r) => r.value === allowed[0]).checked = true;
+  const hostSelect = $("restore-host");
+  if (locationsOf(chosen).locations) {
+    if (existing && existing.kind === chosen.kind) {
+      // A guest that exists is replaced, or gets the disks, on its own node
+      if (hostSelect.value !== existing.host) {
+        hostSelect.value = existing.host;
+        fillStorages();
+      }
+      hostSelect.disabled = true;
+    } else {
+      hostSelect.disabled = false;
+    }
+  }
+  const storageOk = !$("restore-storage").disabled;
+  const mode = restoreMode();
+  $("restore-stop-box").classList.toggle("hidden", mode !== "overwrite");
+  $("restore-start").disabled = mode === "disk-only";
+  if (mode === "disk-only") $("restore-start").checked = false;
+  let note = "";
+  if (mode === "new" && id !== chosen.id) {
+    note = `A copy of ${chosen.kind.toUpperCase()} ${chosen.id}, with the same MAC addresses (and the same IP addresses `
+      + "inside the guest): start at boot is turned off. Do not run both on the same network.";
+  } else if (mode === "overwrite" && existing && existing.status === "running" && !$("restore-stop").value) {
+    note = "It keeps running while its disks are copied, then is shut down (stopped hard after 5 minutes) just "
+      + "before being replaced. If it cannot be stopped, the copied disks stay attached to it as unused disks.";
+  }
+  $("restore-note").textContent = note;
+  $("restore-button").disabled = busy || !mode || !storageOk;
+}
+
+async function startRestore() {
+  if (!chosen) return;
+  const mode = restoreMode();
+  if (!mode) { $("restore-error").textContent = "Choose how to restore it."; return; }
+  const id = $("restore-id").value.trim() || chosen.id;
+  const host = $("restore-host").value.trim();
+  const kind = chosen.kind.toUpperCase();
+  const what = `${guestName(chosen)} of ${when(chosen)}`;
+  const where = host || chosen.host || "its node";
+  const start = $("restore-start").checked && mode !== "disk-only";
+  let question = `Restore the backup of ${what} as a new ${kind} ${id} on ${where}?`;
+  if (mode === "overwrite") {
+    question = `Replace ${kind} ${id} on ${where} with the backup of ${what}?\n\nIts configuration and disks are `
+      + "replaced, and its previous disks deleted once the restore is complete. If it is running, it is shut down.";
+  } else if (mode === "disk-only") {
+    question = `Add the disks of the backup of ${what} to ${kind} ${id} on ${where}, as unused disks?`;
+  }
+  if (start) question += "\n\nIt is started once restored.";
+  if (!confirm(question)) return;
+  $("restore-error").textContent = "";
+  $("restore-button").disabled = true;
+  try {
+    const data = await call("{% url 'restore' %}", {
+      method: "POST",
+      body: JSON.stringify({
+        target: $("restore-target").value, backup: chosen.path, guest_id: id, host: host,
+        storage: $("restore-storage").value.trim(), mode: mode,
+        stop: mode === "overwrite" ? $("restore-stop").value : "", start: start,
+      }),
+    });
+    selectedRun = data.run;
+    await refresh();
+    $("run").scrollIntoView({behavior: "smooth", block: "start"});
+  } catch (e) {
+    $("restore-error").textContent = e.message;
+  } finally {
+    updateRestoreForm();
+  }
+}
+
+onStatus = updateRestoreForm;
+$("restore-target").addEventListener("change", loadBackups);
+$("load-backups").addEventListener("click", loadBackups);
+$("restore-filter").addEventListener("input", showBackups);
+$("restore-id").addEventListener("input", updateRestoreForm);
+$("restore-host").addEventListener("change", nodeChanged);
+$("restore-stop").addEventListener("change", updateRestoreForm);
+for (const radio of modeRadios()) radio.addEventListener("change", updateRestoreForm);
+$("restore-button").addEventListener("click", startRestore);
+if ($("restore-target").options.length) loadBackups(); else $("backups-message").textContent = "No destination configured.";
+refresh();
+</script>
+{% endblock %}

@@ -419,8 +419,8 @@ account), the command still runs and prints a warning.
 
 ## Web interface
 
-A web page to start backups, follow them live and cancel them, served over HTTPS only,
-on Linux and Windows:
+A web page to start backups and restores, follow them live and cancel them, served over
+HTTPS only, on Linux and Windows:
 
 ```sh
 pip install '.[web]'                 # Django, cheroot (HTTPS server), cryptography
@@ -428,14 +428,30 @@ antigrafa web adduser admin          # asks for the password (12 characters or m
 antigrafa web serve                  # https://<this machine>:8443/
 ```
 
-- **Start**: source, destination, then every guest (with exclusions) or the chosen
+Two pages, **Backup** (`/`) and **Restore** (`/restore/`), each with its own form and
+its own recent runs.
+
+- **Start** (Backup page): source, destination, then every guest (with exclusions) or the chosen
   ones. The configuration, the destination, the guests and the token's rights are
   checked before the page says it started: an error shows up at once.
 - **Follow**: one bar per disk being read and an overall bar (percentage, rate, ETA),
   each guest's result as it ends, the log, then the full report.
 - **Cancel**: the disks being read stop at the next chunk, the snapshots are deleted
   and the unfinished backups removed; guests not started yet are skipped.
-- One backup at a time. The last 20 runs stay listed until the server stops.
+- **Restore** (Restore page): the backups of a destination, the most recent first (filter by id, name,
+  source or node). Choose one: the guest id is the original one by default. The node is
+  chosen from the cluster's nodes (the original one by default, offline ones greyed
+  out), and the storage from that node's storages that can hold the guest's disks, with
+  their free space (by default each disk's original storage, when that node has it).
+  The page checks whether the id is taken: if it is
+  free, a new guest is created; if it is taken, choose between replacing that guest
+  and adding the disks to it as unused disks (as `restore-guest --overwrite` and
+  `--disk-only`), with the stop options and start after the restore. Every choice is
+  confirmed before anything starts; the restore is then followed and cancelled like a
+  backup.
+- One run at a time (a backup or a restore): while a backup runs, the Restore page says
+  so with a link to it, and the other way round. The last 20 runs stay listed until the
+  server stops.
 
 **Certificate.** Without one, a self-signed certificate is created on the first start
 (ECDSA P-256, valid 397 days, renewed by Antigrafa 30 days before it expires) for the
@@ -448,8 +464,9 @@ certificate live in `data_dir`: `/var/lib/antigrafa/web` on Linux (mode 0700),
 `%PROGRAMDATA%\antigrafa\web` on Windows (rights limited to SYSTEM, Administrators and
 the account running Antigrafa).
 
-**Stopping.** Ctrl+C, or SIGTERM (`systemctl stop`): a running backup is cancelled
-first, so that its snapshots are deleted.
+**Stopping.** Ctrl+C, or SIGTERM (`systemctl stop`): a running backup or restore is
+cancelled first, so that its snapshots are deleted (backup), or the guest unlocked and
+what it created removed (restore).
 
 | Command | Effect |
 |---|---|

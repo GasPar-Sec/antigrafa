@@ -301,6 +301,54 @@ def test_vm_restored_as_a_new_guest(tmp_path):
     assert config.endswith("901.conf.tmp.antigrafa /etc/pve/nodes/pve1/qemu-server/901.conf")
 
 
+class ClusterAPI:
+    """Nodes and their storages, as Proxmox lists them."""
+
+    def __init__(self, fail_on=""):
+        self.fail_on, self.asked = fail_on, []
+
+    def nodes(self):
+        return [{"node": "pve2", "status": "online"}, {"node": "pve1", "status": "online"},
+                {"node": "pve3", "status": "offline"}]
+
+    def node_storages(self, node, content):
+        from antigrafa.platforms.proxmox.api import ProxmoxError
+
+        self.asked.append((node, content))
+        if node == self.fail_on:
+            raise ProxmoxError("timeout")
+        return [
+            {"storage": "local-zfs", "type": "zfspool", "avail": 100 << 30, "total": 200 << 30, "active": 1},
+            {"storage": "data", "type": "lvmthin", "avail": "5", "total": "10", "active": 1},
+            {"storage": "ceph", "type": "rbd", "avail": 1, "total": 2, "active": 1},  # not supported yet
+            {"storage": "nfs", "type": "nfs", "active": 0, "shared": 1},  # not mounted
+        ]
+
+
+def test_restore_locations_for_a_vm():
+    api = ClusterAPI()
+    locations = pr.restore_locations(api, "vm")
+    assert [(l["host"], l["online"]) for l in locations] == [("pve1", True), ("pve2", True), ("pve3", False)]
+    assert locations[0]["storages"] == [
+        {"id": "data", "type": "lvmthin", "avail": 5, "total": 10, "shared": False},
+        {"id": "local-zfs", "type": "zfspool", "avail": 100 << 30, "total": 200 << 30, "shared": False},
+    ]
+    assert locations[2]["storages"] == [] and ("pve3", "images") not in api.asked  # offline: not asked
+    assert ("pve1", "images") in api.asked
+
+
+def test_restore_locations_for_a_container_and_errors():
+    api = ClusterAPI(fail_on="pve2")
+    locations = pr.restore_locations(api, "ct")
+    assert [s["id"] for s in locations[0]["storages"]] == ["local-zfs"]  # container files: ZFS only
+    assert ("pve1", "rootdir") in api.asked
+    assert locations[1]["storages"] == [] and locations[1]["error"] == "timeout"  # the others still listed
+    with pytest.raises(RestoreError, match="unknown guest kind"):
+        pr.restore_locations(api, "pod")
+    platform = ProxmoxPlatform("c1", ProxmoxSettings(url="https://pve", token_id="a@pve!b"), api=ClusterAPI())
+    assert platform.restore_locations("vm")[0]["host"] == "pve1"
+
+
 def test_thick_lvm_gets_its_zeros_written(tmp_path):
     node = Node(tmp_path)
     _restore(node, API(), RestoreRequest("901", storage="thick"))

@@ -96,8 +96,8 @@ the bottleneck can be the read on the node, the network or the destination.
 - [ ] qcow2 (through `qemu-nbd` on the snapshot)
 - [ ] Automatic abort when the snapshot grows too large on the source storage
 - [x] Web interface (HTTPS, login): start, follow and cancel backups
-- [ ] Web interface: limit login attempts, keep the run history across restarts, list
-      and restore backups, schedules
+- [x] Web interface: list the backups and restore a guest (new, replace, or disks only)
+- [ ] Web interface: limit login attempts, keep the run history across restarts, schedules
 - [ ] Scheduling, notifications, client-side encryption
 - [x] Direct restore to Proxmox (`restore-guest`): VM disks to ZFS, LVM-thin, LVM and
       directory storages, containers to ZFS
