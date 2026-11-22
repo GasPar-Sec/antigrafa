@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from collections.abc import Iterator
 from typing import BinaryIO, Protocol
 
 KINDS = ("vm", "ct")  # virtual machine, container
@@ -113,6 +114,35 @@ class DiskSource(ABC):
 
 
 @dataclass
+class RestoreRequest:
+    """Where a backup goes back: which guest id, host, storage, and whether it may replace one."""
+
+    guest_id: str
+    host: str = ""  # "": the host the guest was on
+    storage: str = ""  # "": each disk on the storage it came from
+    overwrite: bool = False  # the guest id exists: replace it, disks included (stopped)
+    disk_only: bool = False  # the guest id exists: only add the disks to it, as unused
+    start: bool = False  # start the guest once restored
+    # The guest replaced is running: "" it keeps running while its disks are copied, then
+    # is shut down (stopped hard if needed) just before it is replaced; "stop" shut it down
+    # before the restore starts (or fail), "force-stop" the same, stopped hard if needed
+    stop: str = ""
+
+
+class RestoreDisk(ABC):
+    """One disk of a backup, as the platform writes it back."""
+
+    key: str  # name of the disk in the guest: scsi0, rootfs...
+    format: str  # "raw" or "tar"
+    size: int  # bytes of the stream
+    chunk_size: int
+
+    @abstractmethod
+    def chunks(self) -> Iterator[bytes | None]:
+        """The stream, chunk by chunk, in order; None: a whole chunk of zeros (not read)."""
+
+
+@dataclass
 class BackupPlan:
     config: dict  # guest configuration, kept in the manifest to recreate the guest
     disks: list[DiskSource] = field(default_factory=list)
@@ -176,6 +206,16 @@ class Platform(ABC):
     def leftover_snapshots(self, guest: Guest, prefix: str) -> list[str]:
         """Names of snapshots starting with ``prefix`` (left by an interrupted run)."""
         return []
+
+    def restore_guest(
+        self, manifest: dict, disks: list[RestoreDisk], request: RestoreRequest, progress, cancel
+    ) -> str:
+        """Recreate the guest of ``manifest`` from its ``disks``; returns what was created.
+
+        Checks everything it can before changing anything; on failure, removes what it
+        created. ``progress``: a ``Progress`` (one task per disk); ``cancel``: an Event.
+        """
+        raise PlatformError(f"restoring guests is not supported on {self.type}")
 
     def host_iowait(self, host: str) -> float | None:
         """Fraction of CPU time ``host`` spends waiting on disks (0.0 to 1.0).

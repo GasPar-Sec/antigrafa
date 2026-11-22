@@ -116,9 +116,22 @@ class Repository:
         self.store = ChunkStore(self.root, sync_each=sync_each)
 
     def open(self) -> None:
-        """Check that the destination is usable before writing anything."""
+        """Check that the destination is usable before writing anything.
+
+        A missing local directory is created, but only its last level: when its parent
+        is missing too (a drive not plugged in, a share not mounted), the target is
+        unavailable rather than created somewhere else. An NFS target is never created.
+        """
         if not self.root.is_dir():
-            raise TargetUnavailable(f"{self.cfg.name}: {self.root} does not exist")
+            if self.cfg.kind != "local" or not self.root.parent.is_dir():
+                raise TargetUnavailable(f"{self.cfg.name}: {self.root} does not exist")
+            try:
+                self.root.mkdir()
+            except FileExistsError:
+                raise TargetUnavailable(f"{self.cfg.name}: {self.root} is not a directory") from None
+            except OSError as exc:
+                raise TargetUnavailable(f"{self.cfg.name}: {self.root} cannot be created: {exc}") from None
+            log.info("target %s: %s created", self.cfg.name, self.root)
         if self.cfg.kind == "nfs":
             # Safety net: if the share is not mounted we would write to the local disk.
             fstype = mount_fstype(str(self.root))

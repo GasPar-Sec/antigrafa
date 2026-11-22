@@ -180,7 +180,7 @@ def test_missing_config_file(tmp_path, caplog):
 
 def test_unavailable_target(tmp_path, caplog):
     path = tmp_path / "antigrafa.toml"
-    path.write_text(f'[target.usb]\npath = "{(tmp_path / "absent").as_posix()}"\n')
+    path.write_text(f'[target.usb]\npath = "{(tmp_path / "absent" / "antigrafa").as_posix()}"\n')
     assert cli.main(["-c", str(path), "list"]) == 1
     assert "does not exist" in caplog.text
 

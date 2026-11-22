@@ -99,7 +99,11 @@ the bottleneck can be the read on the node, the network or the destination.
 - [ ] Web interface: limit login attempts, keep the run history across restarts, list
       and restore backups, schedules
 - [ ] Scheduling, notifications, client-side encryption
-- [ ] Direct restore to Proxmox
+- [x] Direct restore to Proxmox (`restore-guest`): VM disks to ZFS, LVM-thin, LVM and
+      directory storages, containers to ZFS
+- [ ] Restore: containers to LVM, LVM-thin and directory storages (file system created,
+      then extracted), VM disks to Ceph RBD
+- [ ] Restore checked against a real Proxmox VE (optional test, like `test_zfs_live.py`)
 - [ ] Replication between 2 antigrafa servers
 
 ## Validation

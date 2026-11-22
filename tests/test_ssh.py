@@ -159,3 +159,64 @@ def test_stream_remembers_it_was_aborted():
         with _local("printf abc", "echo abc") as s:
             raise ValueError("cancelled")
     assert s.aborted is True
+
+
+# --------------------------------------------------------------------------- feeding a remote command (restore)
+# A local python3 in place of ssh: the same on every system.
+
+
+def _sink(code: str):
+    from antigrafa.ssh import RemoteSink
+
+    out, err = tempfile.TemporaryFile(), tempfile.TemporaryFile()
+    proc = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=out, stderr=err, bufsize=0)
+    return RemoteSink("local", "python3", proc, out, err)
+
+
+COUNT = "import sys; data = sys.stdin.buffer.read(); print(len(data))"
+
+
+def test_sink_feeds_the_command_and_returns_its_output():
+    sink = _sink(COUNT)
+    for _ in range(64):
+        sink.write(b"x" * 65536)  # more than a pipe holds: written as the command reads
+    assert sink.close().strip() == str(64 * 65536)
+    assert sink.close() == ""  # closed once
+
+
+def test_sink_failure_is_reported_with_stderr():
+    sink = _sink("import sys; sys.stdin.buffer.read(); sys.stderr.write('no space left'); sys.exit(4)")
+    sink.write(b"data")
+    with pytest.raises(RemoteCommandError, match="no space left") as exc:
+        sink.close()
+    assert exc.value.returncode == 4
+
+
+def test_sink_command_that_stops_reading():
+    sink = _sink("import sys; sys.stderr.write('device gone'); sys.exit(5)")
+    with pytest.raises(RemoteCommandError):
+        for _ in range(1000):  # sooner or later the pipe is broken
+            sink.write(b"y" * 65536)
+
+
+def test_sink_abort_kills_the_command():
+    with pytest.raises(ValueError):
+        with _sink("import time; time.sleep(60)") as sink:
+            raise ValueError("cancelled")
+    assert sink.proc.returncode is not None
+
+
+def test_sink_runs_the_ssh_command(monkeypatch):
+    from antigrafa import ssh
+
+    seen = {}
+
+    class Proc:
+        def __init__(self, argv, **kwargs):
+            seen.update(argv=argv, kwargs=kwargs)
+
+    monkeypatch.setattr(ssh.subprocess, "Popen", Proc)
+    sink = SSHHost("pve1", port=2222).sink("tar -xf -")
+    assert seen["argv"][-2:] == ["root@pve1", "tar -xf -"] and "2222" in seen["argv"]
+    assert seen["kwargs"]["stdin"] == subprocess.PIPE
+    assert sink.command == "tar -xf -"

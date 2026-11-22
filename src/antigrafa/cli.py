@@ -6,15 +6,17 @@ import argparse
 import logging
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from . import operations
 from .config import Config, ConfigError, default_config_path, load_config
 from .index import read_index, read_manifest
-from .pipeline import restore_stream
+from .pipeline import READ_AHEAD, in_order, restore_stream
 from .operations import new_data_line, open_platform, open_repository, report_lines, select_guests
 from .platforms.base import AccessDenied, PlatformError
 from .progress import Progress, ProgressLogHandler, human_bytes, human_duration
+from .ssh import RemoteCommandError
 from .targets import TargetUnavailable
 
 log = logging.getLogger("antigrafa")
@@ -99,26 +101,31 @@ def cmd_verify(cfg: Config, args) -> int:
         plan.append((snap, [read_index(snap_dir / d["index"])[2] for d in m["disks"]]))
     progress = args.progress_bar
     progress.unit = "chunks"
-    unique = {digest for _, disks in plan for digests in disks for digest in digests}
-    checked: dict[bytes, bool] = {}
+    # Sorted: chunks of the same directory are read together
+    unique = sorted({digest for _, disks in plan for digests in disks for digest in digests})
+
+    def check(digest: bytes) -> str:
+        try:
+            repo.store.read(digest)
+            return ""
+        except Exception as exc:
+            return str(exc) or type(exc).__name__
+
+    errors: dict[bytes, str] = {}
+    jobs = max(1, args.jobs)
+    with progress.task(len(unique)) as task, ThreadPoolExecutor(jobs, thread_name_prefix="verify") as pool:
+        for digest, error in zip(unique, in_order(pool, check, unique, jobs * READ_AHEAD)):
+            if error:
+                errors[digest] = error
+            task.advance(1)
     bad = 0
-    with progress.task(len(unique)) as task:
-        for snap, disks in plan:
-            snap_bad = 0
-            for digests in disks:
-                for digest in digests:
-                    if digest not in checked:
-                        try:
-                            repo.store.read(digest)
-                            checked[digest] = True
-                        except Exception as exc:
-                            log.error("%s: chunk %s: %s", snap, digest.hex(), exc)
-                            checked[digest] = False
-                        task.advance(1)
-                    snap_bad += not checked[digest]
-            with progress.paused():
-                print(f"{'OK   ' if not snap_bad else 'ERROR'} {snap}" + (f" ({snap_bad} bad chunks)" if snap_bad else ""))
-            bad += snap_bad
+    for snap, disks in plan:
+        damaged = [d for digests in disks for d in digests if d in errors]
+        for digest in dict.fromkeys(damaged):
+            log.error("%s: chunk %s: %s", snap, digest.hex(), errors[digest])
+        with progress.paused():
+            print(f"{'OK   ' if not damaged else 'ERROR'} {snap}" + (f" ({len(damaged)} bad chunks)" if damaged else ""))
+        bad += len(damaged)
     progress.finish()
     return 1 if bad else 0
 
@@ -130,17 +137,46 @@ def cmd_restore(cfg: Config, args) -> int:
     disk = next((d for d in m["disks"] if d["key"] == args.disk), None)
     if disk is None:
         raise ConfigError(f"no disk {args.disk}; available: {', '.join(d['key'] for d in m['disks'])}")
-    size, _, digests = read_index(snap_dir / disk["index"])
+    size, chunk_size, digests = read_index(snap_dir / disk["index"])
     progress = args.progress_bar
     task = progress.task(size, name=args.disk)
     with open(args.output, "xb") as out, task:  # "x": never overwrite
-        restore_stream(repo.store, digests, out, size, on_chunk=task.advance)
+        restore_stream(repo.store, digests, out, size, on_chunk=task.advance, workers=args.jobs, chunk_size=chunk_size)
     progress.finish()
     print(f"{args.output}: {_human(size)} restored ({disk['format']})")
     return 0
 
 
-WEB_MISSING = "the web interface needs its extra dependencies: pip install 'antigrafa[web]'"
+def _ask_guest_id(default: str, ask=input) -> str:
+    """The id to restore as: asked on a terminal, the original one by default."""
+    if not sys.stdin.isatty():
+        return default
+    answer = ask(f"Restore as guest id [{default}]: ").strip()
+    return answer or default
+
+
+def cmd_restore_guest(cfg: Config, args) -> int:
+    from .platforms.base import RestoreRequest
+    from .restore import restore_guest
+
+    repo = _repo(cfg, args.target)
+    manifest = read_manifest(repo.resolve(args.backup))
+    original = str((manifest.get("guest") or {}).get("id", ""))
+    guest_id = args.id or _ask_guest_id(original)
+    platform = _platform(cfg, args.source or manifest.get("source"))
+    request = RestoreRequest(guest_id=guest_id, host=args.host or "", storage=args.storage or "",
+                             overwrite=args.overwrite, disk_only=args.disk_only, stop=args.stop or "",
+                             start=args.start)
+    progress = args.progress_bar
+    try:
+        done = restore_guest(platform, repo, args.backup, request, progress, jobs=args.jobs)
+    finally:
+        progress.finish()
+    print(done)
+    return 0
+
+
+WEB_MISSING ="the web interface needs its extra dependencies: pip install 'antigrafa[web]'"
 
 
 def _web(module: str):
@@ -238,17 +274,43 @@ def build_parser() -> argparse.ArgumentParser:
     ls.add_argument("--target")
     ls.set_defaults(func=cmd_list)
 
+    jobs_help = "chunks read, decompressed and checked at the same time (default: %(default)s)"
     v = sub.add_parser("verify", help="re-read chunks and check their digests")
     v.add_argument("--target")
+    v.add_argument("--jobs", type=int, default=4, help=jobs_help)
     v.add_argument("snapshot", nargs="?")
     v.set_defaults(func=cmd_verify)
 
     r = sub.add_parser("restore", help="restore one disk to a file (raw image or tar)")
     r.add_argument("--target")
+    r.add_argument("--jobs", type=int, default=4, help=jobs_help)
     r.add_argument("snapshot", help="e.g. cluster1/vm/100/2026-11-17T22-30-00Z")
     r.add_argument("disk", help="e.g. scsi0, rootfs")
     r.add_argument("output")
     r.set_defaults(func=cmd_restore)
+
+    rg = sub.add_parser("restore-guest", help="recreate a guest from its backup on its platform (Proxmox VE)")
+    rg.add_argument("backup", help="e.g. cluster1/vm/100/2026-11-17T22-30-00Z (see 'list')")
+    rg.add_argument("--target")
+    rg.add_argument("--source", help="default: the source the backup came from")
+    rg.add_argument("--id", help="guest id to restore as (asked on a terminal; default: the original one)")
+    rg.add_argument("--host", help="node to restore on (default: the one the guest was on)")
+    rg.add_argument("--storage", help="storage for every disk (default: each disk's original storage)")
+    existing = rg.add_mutually_exclusive_group()
+    existing.add_argument("--overwrite", action="store_true",
+                          help="replace the guest with that id, disks included (its previous disks are deleted)")
+    existing.add_argument("--disk-only", action="store_true",
+                          help="only add the backed-up disks to the guest with that id, as unused disks")
+    rg.add_argument("--start", action="store_true", help="start the guest once restored")
+    stop = rg.add_mutually_exclusive_group()
+    stop.add_argument("--stop", action="store_const", const="stop", dest="stop",
+                      help="with --overwrite: shut the running guest down before the restore starts "
+                           "(fails after 5 minutes); by default it runs until its disks are copied")
+    stop.add_argument("--force-stop", action="store_const", const="force-stop", dest="stop",
+                      help="with --overwrite: shut it down before the restore starts, then stop it hard "
+                           "if it is still running after 5 minutes (fails after 2 more)")
+    rg.add_argument("--jobs", type=int, default=4, help=jobs_help)
+    rg.set_defaults(func=cmd_restore_guest)
 
     w = sub.add_parser("web", help="web interface (HTTPS): start and follow backups")
     wsub = w.add_subparsers(dest="web_cmd", required=True)
@@ -265,7 +327,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "stop", None) and not args.overwrite:
+        parser.error(f"--{args.stop} only applies with --overwrite")
+    if getattr(args, "start", False) and getattr(args, "disk_only", False):
+        parser.error("--start does not apply with --disk-only (the guest is not changed)")
     verbosity = -1 if args.quiet else min(args.verbose, 2)
     # Shown on a terminal unless --no-progress; -q hides it unless --progress
     enabled = args.progress if args.progress is not None else (None if verbosity >= 0 else False)
@@ -290,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     except AccessDenied as exc:
         log.error("%s", exc)
         return 3
-    except (TargetUnavailable, PlatformError, FileExistsError, FileNotFoundError) as exc:
+    except (TargetUnavailable, PlatformError, RemoteCommandError, FileExistsError, FileNotFoundError) as exc:
         log.error("%s", exc)
         return 1
     except KeyboardInterrupt:

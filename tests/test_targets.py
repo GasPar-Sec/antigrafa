@@ -61,8 +61,31 @@ def test_mount_fstype_longest_match(mounts, monkeypatch):
 
 
 def test_open_refuses_missing_directory(tmp_path):
-    repo = Repository(TargetConfig(name="usb", path=str(tmp_path / "absent")))
+    # Its parent is missing too (a drive not plugged in): never created elsewhere
+    repo = Repository(TargetConfig(name="usb", path=str(tmp_path / "absent" / "antigrafa")))
     with pytest.raises(TargetUnavailable, match="usb: .* does not exist"):
+        repo.open()
+    assert not (tmp_path / "absent").exists()
+
+
+def test_open_creates_a_missing_local_directory(tmp_path):
+    repo = Repository(TargetConfig(name="local", path=str(tmp_path / "antigrafa")))
+    repo.open()
+    assert (tmp_path / "antigrafa" / ".chunks").is_dir()
+    repo.open()  # already there: fine
+
+
+def test_open_never_creates_an_nfs_target(tmp_path):
+    repo = Repository(TargetConfig(name="nas", path=str(tmp_path / "antigrafa"), kind="nfs"))
+    with pytest.raises(TargetUnavailable, match="does not exist"):
+        repo.open()
+    assert not (tmp_path / "antigrafa").exists()
+
+
+def test_open_refuses_a_file_in_place_of_the_directory(tmp_path):
+    (tmp_path / "antigrafa").write_text("x")
+    repo = Repository(TargetConfig(name="local", path=str(tmp_path / "antigrafa")))
+    with pytest.raises(TargetUnavailable, match="is not a directory"):
         repo.open()
 
 
