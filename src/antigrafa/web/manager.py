@@ -1,12 +1,12 @@
-"""Backups started from the web interface: one at a time, run in the background.
+"""Backups and restores started from the web interface: one at a time, in the background.
 
 Nothing here depends on Django: the views only call ``BackupManager``.
 
-Everything that can be checked quickly is checked before ``start`` returns (the
-configuration, the destination, the guests, the token's rights), so that the page
-shows the error at once. The backup then runs in its own thread; the page follows
-it through ``status``. The last runs (state, results, log, report) stay in memory
-until the server stops.
+Everything that can be checked quickly is checked before ``start`` (or
+``start_restore``) returns (the configuration, the destination, the guests, the
+token's rights, the backup to restore), so that the page shows the error at once.
+The run then goes on in its own thread; the page follows it through ``status``. The
+last runs (state, results, log, report) stay in memory until the server stops.
 """
 
 from __future__ import annotations
@@ -20,10 +20,12 @@ from datetime import datetime
 from typing import Callable
 
 from ..config import Config, ConfigError, load_config
+from ..index import read_manifest
 from ..jobs import BackupRunner, GuestResult
 from ..operations import new_data_line, open_platform, open_repository, report_lines, select_guests
-from ..platforms.base import Guest
+from ..platforms.base import Guest, RestoreRequest
 from ..progress import Progress
+from ..restore import restore_guest
 
 log = logging.getLogger(__name__)
 
@@ -32,8 +34,12 @@ LOG_LINES = 2000  # log lines kept per run
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(message)s"
 
 
+RESTORE_MODES = ("new", "overwrite", "disk-only")
+STOP_MODES = ("", "stop", "force-stop")
+
+
 class Busy(Exception):
-    """A backup is already starting or running."""
+    """A backup or a restore is already starting or running."""
 
 
 def _now() -> datetime:
@@ -85,6 +91,11 @@ class Run:
     report: list[str] = field(default_factory=list)
     logs: deque = field(default_factory=lambda: deque(maxlen=LOG_LINES))  # the last lines
     log_total: int = 0  # lines ever logged (the oldest may be gone from ``logs``)
+    kind: str = "backup"  # or "restore"
+    # A restore: the backup restored (path in the target), what was asked, what was done
+    backup: str = ""
+    request: RestoreRequest | None = None
+    message: str = ""
 
     def add_log(self, line: str) -> None:
         self.logs.append(line)
@@ -95,9 +106,15 @@ class Run:
         return self.state in ("running", "cancelling")
 
     def summary(self) -> dict:
-        ok = sum(1 for r in self.results if r.ok)
+        if self.kind == "restore":
+            done = 0 if self.active else 1
+            ok = 1 if self.state == "ok" else 0
+        else:
+            done = len(self.results)
+            ok = sum(1 for r in self.results if r.ok)
         return {
             "id": self.id,
+            "kind": self.kind,
             "user": self.user,
             "source": self.source,
             "target": self.target,
@@ -105,9 +122,10 @@ class Run:
             "started": self.started.isoformat(),
             "finished": self.finished.isoformat() if self.finished else None,
             "guests_total": len(self.guests),
-            "guests_done": len(self.results),
+            "guests_done": done,
             "guests_ok": ok,
-            "guests_failed": len(self.results) - ok,
+            "guests_failed": done - ok,
+            "guest": self.guests[0].label if self.kind == "restore" and self.guests else "",
         }
 
     def details(self, logs_after: int = 0) -> dict:
@@ -122,9 +140,36 @@ class Run:
             "progress": self.progress.snapshot() if self.active else None,
             "results": [result_dict(r) for r in self.results],
             "report": self.report,
+            "backup": self.backup,
+            "restore": _request_dict(self.request) if self.request else None,
+            "message": self.message,
             "log_total": total,
             "logs": lines[max(logs_after - first, 0) :] if logs_after <= total else lines,
         }
+
+
+def _request_dict(r: RestoreRequest) -> dict:
+    mode = "overwrite" if r.overwrite else "disk-only" if r.disk_only else "new"
+    return {"guest_id": r.guest_id, "host": r.host, "storage": r.storage, "mode": mode, "stop": r.stop,
+            "start": r.start}
+
+
+def backup_dict(path: str, manifest: dict) -> dict:
+    """One backup of a target, as the restore page lists it."""
+    guest = manifest.get("guest") or {}
+    disks = manifest.get("disks") or []
+    parts = path.split("/")
+    return {
+        "path": path,
+        "source": manifest.get("source") or parts[0],
+        "kind": guest.get("kind") or (parts[1] if len(parts) > 1 else ""),
+        "id": str(guest.get("id") or (parts[2] if len(parts) > 2 else "")),
+        "name": guest.get("name") or "",
+        "host": guest.get("host") or "",
+        "time": manifest.get("time") or "",
+        "size": sum(int(d.get("size") or 0) for d in disks),
+        "disks": [{"key": d.get("key"), "volume": d.get("volume"), "size": d.get("size")} for d in disks],
+    }
 
 
 class _RunLog(logging.Handler):
@@ -180,6 +225,18 @@ class BackupManager:
             platform.check_access([])  # nothing visible: no guest, or no right?
         return [guest_dict(g) for g in guests]
 
+    def backups(self, target: str | None) -> list[dict]:
+        """The complete backups of a target, the most recent first."""
+        repo = open_repository(self.config(), target or None)
+        found = [backup_dict(path.replace("\\", "/"), manifest) for path, manifest in repo.list_snapshots()]
+        return sorted(found, key=lambda b: (b["time"], b["path"]), reverse=True)
+
+    def restore_locations(self, source: str | None, kind: str) -> list[dict]:
+        """The nodes of a source and, for each, the storages a guest of ``kind`` can go to."""
+        if kind not in ("vm", "ct"):
+            raise ConfigError(f"unknown guest kind {kind!r}")
+        return open_platform(self.config(), source or None).restore_locations(kind)
+
     def run(self, run_id: int) -> Run | None:
         with self._lock:
             return next((r for r in self._runs if r.id == run_id), None)
@@ -202,10 +259,7 @@ class BackupManager:
         user: str = "",
     ) -> Run:
         """Check everything, then start the backup in the background (raises on error)."""
-        with self._lock:
-            if self._busy:
-                raise Busy("a backup is already running: wait for it to end, or cancel it")
-            self._busy = True
+        self._claim()
         try:
             cfg = self.config()
             platform = open_platform(cfg, source or None)
@@ -233,6 +287,90 @@ class BackupManager:
         log.info("backup %d started by %s: %d guest(s) of %s to %s", run.id, user, len(selected), run.source, run.target)
         return run
 
+    def _claim(self) -> None:
+        with self._lock:
+            if self._busy:
+                running = self.current.kind if self.current else "backup"
+                raise Busy(f"a {running} is already running: wait for it to end, or cancel it")
+            self._busy = True
+
+    def start_restore(
+        self,
+        *,
+        target: str | None,
+        backup: str,
+        guest_id: str = "",
+        host: str = "",
+        storage: str = "",
+        mode: str = "new",
+        stop: str = "",
+        start: bool = False,
+        user: str = "",
+    ) -> Run:
+        """Check the request and the backup, then restore it in the background (raises on error).
+
+        ``mode``: "new" (the id must be free), "overwrite" or "disk-only"; ``guest_id``:
+        "" for the original id. The platform checks the rest (id, storages) when it starts.
+        """
+        if mode not in RESTORE_MODES:
+            raise ConfigError(f"unknown restore mode {mode!r}")
+        if stop not in STOP_MODES:
+            raise ConfigError(f"unknown stop mode {stop!r}")
+        if stop and mode != "overwrite":
+            raise ConfigError("stopping the guest first only applies when replacing it")
+        if start and mode == "disk-only":
+            raise ConfigError("disk-only does not change the guest: nothing to start")
+        if guest_id and not guest_id.isdigit():
+            raise ConfigError(f"{guest_id!r} is not a guest id")
+        self._claim()
+        try:
+            cfg = self.config()
+            repo = open_repository(cfg, target or None)
+            try:
+                backup_dir = repo.resolve(backup)
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from None
+            if not backup_dir.is_dir():
+                raise ConfigError(f"no backup {backup} in target {repo.cfg.name}")
+            manifest = read_manifest(backup_dir)
+            platform = open_platform(cfg, manifest.get("source") or None)
+            original = manifest.get("guest") or {}
+            request = RestoreRequest(
+                guest_id=guest_id or str(original.get("id", "")), host=host, storage=storage,
+                overwrite=mode == "overwrite", disk_only=mode == "disk-only", stop=stop, start=start,
+            )
+            guest = Guest(request.guest_id, str(original.get("kind", "")), str(original.get("name", "")),
+                          host or str(original.get("host", "")))
+            with self._lock:
+                run = Run(self._next_id, user, platform.name, repo.cfg.name, [guest], kind="restore",
+                          backup=backup, request=request)
+                run.progress = Progress(label="restore", enabled=False)
+                self._next_id += 1
+            thread = threading.Thread(target=self._execute_restore, args=(run, platform, repo),
+                                      name=f"restore-{run.id}", daemon=True)
+            with self._lock:
+                self._runs.appendleft(run)
+                self._threads[run.id] = thread
+                self.current = run
+            thread.start()
+        except BaseException:
+            with self._lock:
+                self._busy = False
+            raise
+        log.info("restore %d started by %s: %s from %s as %s (%s)", run.id, user, backup, run.target,
+                 request.guest_id, mode)
+        return run
+
+    def _execute_restore(self, run: Run, platform, repo) -> None:
+        start = time.monotonic()
+        try:
+            run.message = restore_guest(platform, repo, run.backup, run.request, run.progress, run.cancel)
+        except BaseException as exc:  # shown on the page; the platform cleaned up what it created
+            logging.getLogger("antigrafa.restore").error("restore %d failed: %s", run.id, exc or type(exc).__name__)
+            run.error = str(exc) or type(exc).__name__
+        finally:
+            self._finish(run, None, time.monotonic() - start)
+
     def _execute(self, run: Run, runner) -> None:
         start = time.monotonic()
         try:
@@ -247,15 +385,19 @@ class BackupManager:
                 self._finish(run, runner, time.monotonic() - start)
 
     def _finish(self, run: Run, runner, elapsed: float) -> None:
-        try:
-            run.report = report_lines(run.results, run.started, elapsed)[1:]
-            new_data = new_data_line(runner.controller.stats())
-            if new_data:
-                run.report.append(new_data)
-        except Exception as exc:  # pragma: no cover - a report problem never hides the end of the run
-            run.report = [f"report unavailable: {exc}"]
+        if run.kind == "backup":
+            try:
+                run.report = report_lines(run.results, run.started, elapsed)[1:]
+                new_data = new_data_line(runner.controller.stats())
+                if new_data:
+                    run.report.append(new_data)
+            except Exception as exc:  # pragma: no cover - a report problem never hides the end of the run
+                run.report = [f"report unavailable: {exc}"]
         run.finished = _now()
-        if run.cancel.is_set():
+        if run.kind == "restore":
+            # Cancelled only if it stopped: a cancel that came too late leaves a finished restore
+            run.state = "ok" if not run.error else "cancelled" if run.cancel.is_set() else "failed"
+        elif run.cancel.is_set():
             run.state = "cancelled"
         elif run.error or len(run.results) < len(run.guests) or not all(r.ok for r in run.results):
             run.state = "failed"
@@ -265,10 +407,11 @@ class BackupManager:
             self.current = None
             self._threads.pop(run.id, None)
             self._busy = False
-        log.info("backup %d ended: %s", run.id, run.state)
+        log.info("%s %d ended: %s", run.kind, run.id, run.state)
 
     def cancel(self, run_id: int, user: str = "") -> bool:
-        """Ask the running backup to stop (snapshots deleted, partial backups removed)."""
+        """Ask the running backup to stop (snapshots deleted, partial backups removed), or the
+        running restore (what it created removed, the guest replaced unlocked)."""
         with self._lock:
             run = self.current
             if run is None or run.id != run_id or run.state != "running":
@@ -276,7 +419,7 @@ class BackupManager:
             run.state = "cancelling"
             run.cancelled_by = user
             run.cancel.set()
-        logging.getLogger("antigrafa.jobs").warning("backup %d: cancel requested by %s", run_id, user or "?")
+        logging.getLogger("antigrafa.jobs").warning("%s %d: cancel requested by %s", run.kind, run_id, user or "?")
         return True
 
     def shutdown(self, timeout: float | None = None) -> None:

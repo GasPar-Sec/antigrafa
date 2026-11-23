@@ -171,6 +171,16 @@ def test_storage(server, api):
     assert fake.requests[0].full_url.endswith("/api2/json/storage")
 
 
+def test_nodes_and_their_storages(server, api):
+    fake = server([{"node": "pve1", "status": "online"}], [{"storage": "local-zfs", "type": "zfspool"}], None)
+    assert api.nodes() == [{"node": "pve1", "status": "online"}]
+    assert fake.requests[0].full_url.endswith("/api2/json/nodes")
+    assert api.node_storages("pve 1", "rootdir") == [{"storage": "local-zfs", "type": "zfspool"}]
+    assert fake.requests[1].full_url.split("?")[0].endswith("/api2/json/nodes/pve%201/storage")
+    assert _query(fake.requests[1]) == {"content": ["rootdir"], "enabled": ["1"]}
+    assert api.node_storages("pve1", "images") == []  # nothing visible
+
+
 def test_storage_not_visible(server, api):
     server([{"storage": "local", "type": "dir"}])
     with pytest.raises(ProxmoxError, match="storage ceph: not found, or not visible to the token"):

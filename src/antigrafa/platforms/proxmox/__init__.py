@@ -622,6 +622,11 @@ class ProxmoxPlatform(Platform):
 
         return ProxmoxRestore(self, manifest, disks, request, progress, cancel).run()
 
+    def restore_locations(self, kind: str) -> list[dict]:
+        from .restore import restore_locations
+
+        return restore_locations(self.api, kind)
+
     def host_iowait(self, host: str) -> float:
         return self.api.node_iowait(host)
 

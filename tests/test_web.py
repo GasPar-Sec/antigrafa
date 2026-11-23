@@ -22,7 +22,7 @@ from cryptography.x509.oid import NameOID
 
 from antigrafa import cli
 from antigrafa.config import Config, ConfigError, Tuning, WebConfig
-from antigrafa.platforms.base import AccessDenied, Guest
+from antigrafa.platforms.base import AccessDenied, Guest, PlatformError
 from antigrafa.targets import TargetConfig
 from antigrafa.web import certs, files, manager as manager_module, server, settings as web_settings, views
 from antigrafa.web.manager import BackupManager, Busy
@@ -391,6 +391,132 @@ def test_manager_guests_checks_rights_when_nothing_is_visible(lab):
         lab.manager.guests("lab")
 
 
+def _backed_up(lab):
+    """A backup of the container in the lab repository; its listing entry."""
+    run = lab.manager.start(source="lab", target=None, guests=["2"], user="alice")
+    _wait(lambda: not run.active)
+    [backup] = lab.manager.backups("local")
+    return backup
+
+
+class FakeRestore:
+    """Stands for the engine's restore_guest: holds until the test lets it go."""
+
+    def __init__(self, error=None):
+        self.calls, self.error = [], error
+        self.started, self.go = threading.Event(), threading.Event()
+
+    def __call__(self, platform, repo, backup, request, progress, cancel):
+        self.calls.append((platform, backup, request))
+        with progress.task(100, name="rootfs") as task:
+            task.advance(40)
+            self.started.set()
+            self.go.wait(10)
+        if cancel.is_set():
+            raise PlatformError("cancelled")
+        if self.error:
+            raise self.error
+        return f"CT {request.guest_id} restored on h2 (1 disk(s)); not started"
+
+
+def test_manager_lists_the_backups_of_a_target(lab):
+    backup = _backed_up(lab)
+    assert backup["path"].startswith("lab/ct/2/") and "\\" not in backup["path"]
+    assert {k: backup[k] for k in ("source", "kind", "id", "name", "host", "size")} == {
+        "source": "lab", "kind": "ct", "id": "2", "name": "dns", "host": "h2", "size": 5000}
+    assert backup["time"] and backup["disks"] == [{"key": "rootfs", "volume": "memory:rootfs", "size": 5000}]
+    with pytest.raises(ConfigError, match="unknown target"):
+        lab.manager.backups("nope")
+
+
+def test_manager_restores_a_backup_and_reports_it(lab, monkeypatch):
+    backup = _backed_up(lab)
+    fake = FakeRestore()
+    monkeypatch.setattr(manager_module, "restore_guest", fake)
+    m = lab.manager
+    run = m.start_restore(target=None, backup=backup["path"], user="bob")  # no id: the original one
+    fake.started.wait(10)
+    status = m.status()
+    assert status["busy"] and status["runs"][0]["kind"] == "restore" and status["runs"][0]["guest"] == "CT 2 (dns)"
+    with pytest.raises(Busy, match="a restore is already running"):
+        m.start(source="lab", target=None, every=True)
+    details = run.details()
+    assert details["backup"] == backup["path"] and details["user"] == "bob"
+    assert details["restore"] == {"guest_id": "2", "host": "", "storage": "", "mode": "new", "stop": "",
+                                  "start": False}
+    assert details["progress"]["tasks"][0]["name"] == "rootfs"
+    fake.go.set()
+    _wait(lambda: not run.active)
+    assert run.state == "ok" and run.message == "CT 2 restored on h2 (1 disk(s)); not started"
+    assert run.summary()["guests_ok"] == 1 and not m.status()["busy"]
+    platform, path, request = fake.calls[0]
+    assert platform is lab.platform and path == backup["path"] and lab.opened[-1] == "lab"  # its own source
+
+    fake.go.clear()
+    fake.started.clear()
+    run = m.start_restore(target="local", backup=backup["path"], guest_id="902", host="h1", storage="ZFS",
+                          mode="overwrite", stop="force-stop", start=True, user="bob")
+    fake.go.set()
+    _wait(lambda: not run.active)
+    request = fake.calls[-1][2]
+    assert (request.guest_id, request.host, request.storage, request.overwrite, request.disk_only,
+            request.stop, request.start) == ("902", "h1", "ZFS", True, False, "force-stop", True)
+    assert run.guests[0].host == "h1"
+
+
+def test_manager_restore_cancel_and_failure(lab, monkeypatch):
+    backup = _backed_up(lab)
+    fake = FakeRestore()
+    monkeypatch.setattr(manager_module, "restore_guest", fake)
+    m = lab.manager
+    run = m.start_restore(target=None, backup=backup["path"], mode="disk-only", user="bob")
+    fake.started.wait(10)
+    assert m.cancel(run.id, "carol")
+    fake.go.set()
+    _wait(lambda: not run.active)
+    assert run.state == "cancelled" and run.cancelled_by == "carol" and run.error == "cancelled"
+    assert any("restore %d: cancel requested by carol" % run.id in line for line in run.logs)
+
+    fake = FakeRestore(PlatformError("id 2 is taken"))
+    fake.go.set()
+    monkeypatch.setattr(manager_module, "restore_guest", fake)
+    run = m.start_restore(target=None, backup=backup["path"], user="bob")
+    _wait(lambda: not run.active)
+    assert run.state == "failed" and run.error == "id 2 is taken" and run.summary()["guests_failed"] == 1
+    assert any("restore %d failed: id 2 is taken" % run.id in line for line in run.logs)
+
+
+def test_manager_restore_locations(lab, monkeypatch):
+    with pytest.raises(PlatformError, match="not supported on memory"):  # the base platform
+        lab.manager.restore_locations("lab", "vm")
+    monkeypatch.setattr(lab.platform, "restore_locations", lambda kind: [{"host": "h1", "kind": kind}], raising=False)
+    assert lab.manager.restore_locations("lab", "ct") == [{"host": "h1", "kind": "ct"}]
+    assert lab.opened[-1] == "lab"
+    with pytest.raises(ConfigError, match="unknown guest kind"):
+        lab.manager.restore_locations("lab", "")
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"mode": "replace"}, "unknown restore mode"),
+        ({"mode": "overwrite", "stop": "now"}, "unknown stop mode"),
+        ({"stop": "stop"}, "only applies when replacing it"),
+        ({"mode": "disk-only", "start": True}, "nothing to start"),
+        ({"guest_id": "abc"}, "is not a guest id"),
+        ({"backup": "../outside"}, "invalid backup path"),
+        ({"backup": "lab/ct/2/2000-01-01T00-00-00Z"}, "no backup lab/ct/2/2000-01-01T00-00-00Z in target local"),
+        ({"target": "nope"}, "unknown target"),
+    ],
+)
+def test_manager_restore_refused_before_it_starts(lab, monkeypatch, options, message):
+    backup = _backed_up(lab)
+    monkeypatch.setattr(manager_module, "restore_guest", lambda *a: pytest.fail("never started"))
+    with pytest.raises(ConfigError, match=message):
+        lab.manager.start_restore(**{"target": None, "backup": backup["path"], **options})
+    assert not lab.manager.status()["busy"]  # a refused restore never blocks the next run
+
+
 # --------------------------------------------------------------------------- pages and API
 
 
@@ -446,6 +572,23 @@ class FakeManager:
     def cancel(self, run_id, user):
         self.cancelled.append((run_id, user))
         return run_id == 7
+
+    def backups(self, target):
+        if self.error:
+            raise self.error
+        self.listed = target
+        return [{"path": "lab/ct/2/2026-11-21T20-40-09Z", "source": "lab", "kind": "ct", "id": "2"}]
+
+    def restore_locations(self, source, kind):
+        if self.error:
+            raise self.error
+        return [{"host": "h1", "online": True, "storages": [], "source": source, "kind": kind}]
+
+    def start_restore(self, **kwargs):
+        if self.error:
+            raise self.error
+        self.restores = getattr(self, "restores", []) + [kwargs]
+        return self.run_obj
 
 
 @pytest.fixture
@@ -536,6 +679,116 @@ def test_start_errors_become_json(client, error, status):
     _login(client)
     client.fake.error = error
     response = client.post("/api/backups", "{}", content_type="application/json")
+    assert response.status_code == status and response.json() == {"error": str(error)}
+
+
+def test_backups_listed_for_the_restore(client):
+    assert client.get("/api/backups?target=nas").status_code == 401
+    _login(client)
+    data = client.get("/api/backups?target=nas").json()
+    assert data["backups"][0]["path"] == "lab/ct/2/2026-11-21T20-40-09Z" and client.fake.listed == "nas"
+    client.get("/api/backups")
+    assert client.fake.listed is None  # the default target
+    assert client.put("/api/backups").status_code == 405
+    client.fake.error = OSError("nas gone")
+    assert client.get("/api/backups").status_code == 502
+
+
+def test_restore_locations_listed(client):
+    assert client.get("/api/restore-locations?source=lab&kind=ct").status_code == 401
+    _login(client)
+    [location] = client.get("/api/restore-locations?source=lab&kind=ct").json()["locations"]
+    assert (location["host"], location["source"], location["kind"]) == ("h1", "lab", "ct")
+    assert client.get("/api/restore-locations?kind=vm").json()["locations"][0]["source"] is None  # default source
+    assert client.post("/api/restore-locations").status_code == 405
+    client.fake.error = PlatformError("pve unreachable")
+    assert client.get("/api/restore-locations?kind=vm").status_code == 502
+
+
+def test_restore_has_its_own_page(client):
+    response = client.get("/restore/")
+    assert response.status_code == 302 and response["Location"].startswith("/login/")
+    _login(client)
+    page = client.get("/restore/").content.decode()
+    assert "Restore a guest" in page and 'id="restore-target"' in page and "/api/restores" in page
+    assert "<option>nas</option>" in page and 'const PAGE = "restore"' in page
+    assert "Start a backup" not in page and "Recent restores" in page
+    assert '<a href="/restore/" aria-current="page">Restore</a>' in page
+    backup = client.get("/").content.decode()
+    assert "Start a backup" in backup and 'const PAGE = "backup"' in backup and "Recent backups" in backup
+    assert "Restore a guest" not in backup and 'id="restore-target"' not in backup
+    assert '<a href="/" aria-current="page">Backup</a>' in backup and 'href="/restore/"' in backup
+    client.fake.error = ConfigError("bad config")
+    assert "Configuration: bad config" in client.get("/restore/").content.decode()
+    assert client.post("/restore/").status_code == 405
+
+
+def test_status_of_one_kind_of_run(client):
+    _login(client)
+    restore = manager_module.Run(8, "bob", "lab", "local", [GUESTS[1]], kind="restore", state="failed")
+    backup = client.fake.run_obj  # 7, running
+    client.fake.status = lambda: {"busy": True, "runs": [restore.summary(), backup.summary()]}
+    client.fake.run = lambda run_id: {7: backup, 8: restore}.get(run_id)
+    data = client.get("/api/status").json()
+    assert [r["id"] for r in data["runs"]] == [8, 7] and data["run"]["id"] == 8
+    data = client.get("/api/status?kind=backup").json()
+    assert [r["id"] for r in data["runs"]] == [7] and data["run"]["id"] == 7
+    data = client.get("/api/status?kind=restore").json()
+    # Its own runs, and the most recent of them; the running backup is pointed to
+    assert [r["id"] for r in data["runs"]] == [8] and data["run"]["id"] == 8
+    assert data["active"]["id"] == 7 and data["active"]["kind"] == "backup"
+    backup.state = "cancelling"  # still running
+    assert client.get("/api/status?kind=restore").json()["active"]["id"] == 7
+    backup.state = "failed"
+    assert client.get("/api/status?kind=restore").json()["active"] is None
+    assert client.get("/api/status?kind=restore&run=7").json()["run"]["id"] == 7  # asked for: shown
+    assert client.get("/api/status?kind=other").status_code == 400
+
+
+def test_start_a_restore(client):
+    body = {"target": "local", "backup": "lab/ct/2/2026-11-21T20-40-09Z", "guest_id": " 902 ", "mode": "overwrite",
+            "stop": "stop", "start": True}
+    assert client.post("/api/restores", json.dumps(body), content_type="application/json").status_code == 401
+    _login(client)
+    response = client.post("/api/restores", json.dumps(body), content_type="application/json")
+    assert response.status_code == 202 and response.json() == {"run": 7}
+    assert client.fake.restores == [{
+        "target": "local", "backup": "lab/ct/2/2026-11-21T20-40-09Z", "guest_id": "902", "host": "", "storage": "",
+        "mode": "overwrite", "stop": "stop", "start": True, "user": "alice"}]
+    # The defaults: the original id, node and storages, a new guest
+    client.post("/api/restores", json.dumps({"backup": "x"}), content_type="application/json")
+    assert client.fake.restores[-1] == {"target": None, "backup": "x", "guest_id": "", "host": "", "storage": "",
+                                        "mode": "new", "stop": "", "start": False, "user": "alice"}
+    assert client.get("/api/restores").status_code == 405
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"backup": ""},
+        {"backup": 3},
+        {"backup": "x", "guest_id": 902},
+        {"backup": "x", "mode": ["new"]},
+        {"backup": "x", "start": "yes"},
+        {"backup": "x", "target": 1},
+    ],
+)
+def test_restore_rejects_bad_requests(client, body):
+    _login(client)
+    response = client.post("/api/restores", json.dumps(body), content_type="application/json")
+    assert response.status_code == 400
+    assert getattr(client.fake, "restores", []) == []
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [(Busy("running"), 409), (ConfigError("config"), 400), (PlatformError("pve"), 502)],
+)
+def test_restore_errors_become_json(client, error, status):
+    _login(client)
+    client.fake.error = error
+    response = client.post("/api/restores", json.dumps({"backup": "x"}), content_type="application/json")
     assert response.status_code == status and response.json() == {"error": str(error)}
 
 

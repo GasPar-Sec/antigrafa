@@ -122,6 +122,40 @@ class RestoreError(PlatformError):
     pass
 
 
+def _bytes(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def restore_locations(api, kind: str) -> list[dict]:
+    """Each node, and its storages a guest of ``kind`` can be restored to (see
+    ``Platform.restore_locations``): enabled on the node, holding that content (VM disks:
+    images; container files: rootdir), of a supported type. An offline node lists none."""
+    if kind not in PVE_TYPES:
+        raise RestoreError(f"unknown guest kind {kind!r}")
+    content, supported = ("images", VM_STORAGES) if kind == "vm" else ("rootdir", CT_STORAGES)
+    locations = []
+    for entry in sorted(api.nodes(), key=lambda n: str(n.get("node", ""))):
+        node = str(entry.get("node", ""))
+        online = entry.get("status") == "online"
+        storages, error = [], ""
+        if online:
+            try:
+                found = api.node_storages(node, content)
+            except PlatformError as exc:
+                found, error = [], str(exc)
+            storages = [
+                {"id": str(s["storage"]), "type": s.get("type", ""), "avail": _bytes(s.get("avail")),
+                 "total": _bytes(s.get("total")), "shared": bool(s.get("shared"))}
+                for s in sorted(found, key=lambda s: str(s.get("storage", "")))
+                if s.get("storage") and s.get("type") in supported and s.get("active", 1)
+            ]
+        locations.append({"host": node, "online": online, "storages": storages, "error": error})
+    return locations
+
+
 def size_option(size: int) -> str:
     """Bytes as Proxmox writes a disk size: 32G, 528K..."""
     for unit, factor in (("T", 1 << 40), ("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)):

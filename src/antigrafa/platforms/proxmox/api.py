@@ -141,6 +141,16 @@ class ProxmoxAPI:
                 return entry
         raise ProxmoxError(f"storage {storage_id}: not found, or not visible to the token (Datastore.Audit)")
 
+    def nodes(self) -> list[dict]:
+        """The nodes of the cluster: ``node``, ``status`` (online, offline...)."""
+        return list(self.get("/nodes") or [])
+
+    def node_storages(self, node: str, content: str) -> list[dict]:
+        """Storages enabled on ``node`` that hold ``content`` (images, rootdir), with their
+        ``type``, ``active``, ``avail`` and ``total`` (bytes). Only those the token sees."""
+        params = {"content": content, "enabled": 1}
+        return list(self.get(f"/nodes/{urllib.parse.quote(node)}/storage", params) or [])
+
     # --- Permissions -------------------------------------------------------
 
     def permissions(self, path: str) -> set[str]:

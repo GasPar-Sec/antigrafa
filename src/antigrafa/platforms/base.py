@@ -217,6 +217,15 @@ class Platform(ABC):
         """
         raise PlatformError(f"restoring guests is not supported on {self.type}")
 
+    def restore_locations(self, kind: str) -> list[dict]:
+        """Where a guest of ``kind`` can be restored: each host, and its storages that can
+        hold its disks.
+
+        ``[{"host", "online", "storages": [{"id", "type", "avail", "total", "shared"}]}]``,
+        sizes in bytes (None: unknown).
+        """
+        raise PlatformError(f"restoring guests is not supported on {self.type}")
+
     def host_iowait(self, host: str) -> float | None:
         """Fraction of CPU time ``host`` spends waiting on disks (0.0 to 1.0).
 
