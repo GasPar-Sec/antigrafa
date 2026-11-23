@@ -272,6 +272,13 @@ async function cancelRun() {
   refresh();
 }
 
+// For the page scripts, which never assign the variables above themselves
+function setStatusHandler(handler) { onStatus = handler; }
+async function showStartedRun(id) {
+  selectedRun = id;
+  await refresh();
+}
+
 $("cancel-button").addEventListener("click", cancelRun);
 </script>
 {% block script %}{% endblock %}

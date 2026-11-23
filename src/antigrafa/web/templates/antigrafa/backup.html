@@ -86,8 +86,7 @@ async function startBackup() {
         all: all, guests: all ? [] : ticked, exclude: all ? ticked : [],
       }),
     });
-    selectedRun = data.run;
-    await refresh();
+    await showStartedRun(data.run);
   } catch (e) {
     $("start-error").textContent = e.message;
   } finally {
@@ -95,7 +94,7 @@ async function startBackup() {
   }
 }
 
-onStatus = () => { $("start-button").disabled = busy; };
+setStatusHandler(() => { $("start-button").disabled = busy; });
 for (const radio of document.querySelectorAll('input[name="mode"]')) radio.addEventListener("change", showMode);
 $("source").addEventListener("change", loadGuests);
 $("load-guests").addEventListener("click", loadGuests);

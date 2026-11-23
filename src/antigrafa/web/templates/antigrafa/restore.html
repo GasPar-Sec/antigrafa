@@ -342,8 +342,7 @@ async function startRestore() {
         stop: mode === "overwrite" ? $("restore-stop").value : "", start: start,
       }),
     });
-    selectedRun = data.run;
-    await refresh();
+    await showStartedRun(data.run);
     $("run").scrollIntoView({behavior: "smooth", block: "start"});
   } catch (e) {
     $("restore-error").textContent = e.message;
@@ -352,7 +351,7 @@ async function startRestore() {
   }
 }
 
-onStatus = updateRestoreForm;
+setStatusHandler(updateRestoreForm);
 $("restore-target").addEventListener("change", loadBackups);
 $("load-backups").addEventListener("click", loadBackups);
 $("restore-filter").addEventListener("input", showBackups);
