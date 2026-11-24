@@ -1,6 +1,7 @@
 import logging
 import os
 import tarfile
+import time
 import zipfile
 
 import pytest
@@ -26,6 +27,16 @@ def _handler(logger, path, **kwargs):
     h = ArchivingFileHandler(path, **options)
     logger.addHandler(h)
     return h
+
+
+def _rename(src, dst):
+    # Windows: an antivirus or the indexer may hold the file just written for a moment
+    for _ in range(50):
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            time.sleep(0.05)
+    return os.replace(src, dst)
 
 
 def _member(archive):
@@ -132,7 +143,7 @@ def test_file_archived_by_another_process(tmp_path, logger):
     logger.info("before")
     # Another process (the web interface, a cron backup) archived it: never held open
     # here, so the rename works on every system, and the next record starts a new file
-    os.replace(path, tmp_path / "elsewhere.log")
+    _rename(path, tmp_path / "elsewhere.log")
     logger.info("after")
     assert "after" in path.read_text(encoding="utf-8")
     assert "after" not in (tmp_path / "elsewhere.log").read_text(encoding="utf-8")
@@ -166,18 +177,41 @@ def test_rename_refused_is_tried_again_later(tmp_path, logger, monkeypatch):
         return real_replace(src, dst)
 
     monkeypatch.setattr(logfile.os, "replace", refuse)
+    monkeypatch.setattr(logfile, "RENAME_PAUSE", 0)
     clock = [1000.0]
     monkeypatch.setattr(logfile.time, "monotonic", lambda: clock[0])
     logger.info("t" * 300)
     logger.info("one")
     logger.info("two")
-    assert len(calls) == 1  # not on every line
+    assert len(calls) == logfile.RENAME_ATTEMPTS  # a few quick tries, not on every line
     assert "two" in path.read_text(encoding="utf-8")  # nothing lost meanwhile
     clock[0] += logfile.RETRY_DELAY
     monkeypatch.setattr(logfile.os, "replace", real_replace)
     logger.info("three")
     h.wait()
     assert len(h.archives()) == 1
+
+
+def test_rename_refused_for_a_moment_is_retried_at_once(tmp_path, logger, monkeypatch):
+    # Windows: an antivirus reads the file just written, for a few milliseconds
+    path = tmp_path / "antigrafa.log"
+    h = _handler(logger, path)
+    real_replace = os.replace
+    refused = []
+
+    def once(src, dst):
+        if str(src) == str(path) and not refused:
+            refused.append(src)
+            raise PermissionError("scanned")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(logfile.os, "replace", once)
+    monkeypatch.setattr(logfile, "RENAME_PAUSE", 0)
+    logger.info("q" * 300)
+    logger.info("next")
+    h.wait()
+    assert len(refused) == 1
+    assert len(h.archives()) == 1  # archived now, not RETRY_DELAY later
 
 
 def test_failed_archive_keeps_the_text_and_is_reported(tmp_path, logger, monkeypatch):

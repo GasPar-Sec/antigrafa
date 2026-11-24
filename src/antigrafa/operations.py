@@ -41,6 +41,34 @@ def select_guests(
     return [g for g in guests if g.id not in excluded]
 
 
+def prepare_backup(
+    cfg: Config,
+    source: str | None,
+    target: str | None,
+    guests: list[str] | None = None,
+    every: bool = False,
+    exclude: list[str] | None = None,
+) -> tuple[Platform, Repository, list[Guest]]:
+    """Everything checked before the first snapshot: the source, the target, the guests and
+    every right of the token (missing one stops everything)."""
+    platform = open_platform(cfg, source or None)
+    repo = open_repository(cfg, target or None)
+    selected = select_guests(platform.guests(), guests, every, exclude)
+    if not selected:
+        raise ConfigError("no guest to back up")
+    platform.check_access(selected)
+    return platform, repo, selected
+
+
+def backup_state(guests: int, results, error: str = "", cancelled: bool = False) -> str:
+    """How a backup ended: ok, failed (a guest failed, or the run itself) or cancelled."""
+    if cancelled:
+        return "cancelled"
+    if error or len(results) < guests or not all(r.ok for r in results):
+        return "failed"
+    return "ok"
+
+
 PHASE_LABELS = {
     "wait": "waiting for host",
     "prepare": "preparation",

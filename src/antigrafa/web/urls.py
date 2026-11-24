@@ -14,4 +14,6 @@ urlpatterns = [
     path("api/backups/<int:run_id>/cancel", views.cancel, name="cancel"),  # any run: backup or restore
     path("api/restores", views.restore, name="restore"),
     path("api/restore-locations", views.restore_locations, name="restore_locations"),
+    path("api/jobs", views.jobs, name="jobs"),
+    path("api/jobs/<str:name>/run", views.run_job, name="run_job"),
 ]

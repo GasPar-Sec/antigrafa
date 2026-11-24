@@ -29,6 +29,20 @@
       <div><p class="error" id="start-error"></p></div>
     </div>
   </section>
+
+  <section id="jobs-box">
+    <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 8px;">
+      <h2 style="margin: 0;">Scheduled jobs</h2>
+      <button id="load-jobs" type="button">Reload</button>
+    </div>
+    <p id="scheduler-state" class="muted"></p>
+    <p class="muted" id="jobs-message">Loading jobs…</p>
+    <table id="jobs" class="hidden">
+      <thead><tr><th>Job</th><th>What</th><th>When</th><th>Next run</th><th>Last run</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p class="error" id="jobs-error"></p>
+  </section>
 {% endblock %}
 
 {% block script %}
@@ -94,7 +108,91 @@ async function startBackup() {
   }
 }
 
-setStatusHandler(() => { $("start-button").disabled = busy; });
+// ------------------------------------------------------------------ scheduled jobs
+
+let jobsBusy = null;  // busy when the jobs were last loaded: reloaded when a run ends
+
+function lastRun(last) {
+  if (!last) return el("td", "never ran", "muted");
+  const cell = el("td");
+  cell.append(el("span", last.state, `state-${last.state}`));
+  const by = last.by === "web" ? `from the page${last.user ? " by " + last.user : ""}`
+    : last.by === "cli" ? "from the command line" : "by the scheduler";
+  let text = ` ${time(last.started)} · ${last.guests_ok}/${last.guests_total} OK · ${by}`;
+  if (last.error) text += ` · ${last.error}`;
+  cell.append(el("span", text));
+  return cell;
+}
+
+function showScheduler(s) {
+  const p = $("scheduler-state");
+  if (s.alive) {
+    let text = `Scheduler running since ${time(s.started)}.`;
+    if (s.running) text += ` Running: ${s.running}.`;
+    if (s.queue.length) text += ` Waiting: ${s.queue.join(", ")}.`;
+    p.textContent = text;
+    p.className = "muted";
+  } else {
+    p.textContent = "The scheduler is not running: jobs only run at their times while "
+      + "`antigrafa scheduler` runs (as a service)." + (s.stopped ? ` It stopped at ${time(s.stopped)}.` : "");
+    p.className = "error";
+  }
+}
+
+async function loadJobs() {
+  jobsBusy = busy;
+  try {
+    const data = await call("{% url 'jobs' %}");
+    showScheduler(data.scheduler);
+    const tbody = $("jobs").querySelector("tbody");
+    tbody.replaceChildren();
+    for (const j of data.jobs) {
+      const tr = el("tr");
+      const name = el("td", j.name);
+      if (!j.enabled) name.append(el("span", " (disabled)", "muted"));
+      const button = el("button", "Run now");
+      button.type = "button";
+      button.disabled = busy;
+      button.addEventListener("click", () => runJob(j.name, button));
+      const action = el("td");
+      action.append(button);
+      const running = data.scheduler.running === j.name;
+      tr.append(name, el("td", j.what), el("td", j.schedule),
+        el("td", running ? "running now" : j.next ? time(j.next) : "—"), lastRun(j.last), action);
+      tbody.append(tr);
+    }
+    $("jobs-message").textContent = data.jobs.length ? ""
+      : "No job: add [job.<name>] sections to the configuration (see antigrafa.example.toml).";
+    $("jobs").classList.toggle("hidden", !data.jobs.length);
+    $("jobs-error").textContent = "";
+  } catch (e) {
+    $("jobs-message").textContent = "";
+    $("jobs-error").textContent = e.message;
+  }
+}
+
+async function runJob(name, button) {
+  if (!confirm(`Run job ${name} now?`)) return;
+  $("jobs-error").textContent = "";
+  button.disabled = true;
+  try {
+    const data = await call(`/api/jobs/${encodeURIComponent(name)}/run`, {method: "POST"});
+    await showStartedRun(data.run);
+    $("run").scrollIntoView({behavior: "smooth", block: "start"});
+  } catch (e) {
+    $("jobs-error").textContent = e.message;
+    button.disabled = busy;
+  }
+}
+
+setStatusHandler(() => {
+  $("start-button").disabled = busy;
+  for (const b of document.querySelectorAll("#jobs tbody button")) b.disabled = busy;
+  if (jobsBusy !== null && jobsBusy !== busy) loadJobs();  // a run started or ended: last results
+});
+$("load-jobs").addEventListener("click", loadJobs);
+setInterval(loadJobs, 30000);  // the scheduler's heartbeat, its queue, the next runs
+loadJobs();
 for (const radio of document.querySelectorAll('input[name="mode"]')) radio.addEventListener("change", showMode);
 $("source").addEventListener("change", loadGuests);
 $("load-guests").addEventListener("click", loadGuests);

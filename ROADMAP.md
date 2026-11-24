@@ -97,8 +97,12 @@ the bottleneck can be the read on the node, the network or the destination.
 - [ ] Automatic abort when the snapshot grows too large on the source storage
 - [x] Web interface (HTTPS, login): start, follow and cancel backups
 - [x] Web interface: list the backups and restore a guest (new, replace, or disks only)
-- [ ] Web interface: limit login attempts, keep the run history across restarts, schedules
-- [ ] Scheduling, notifications, client-side encryption
+- [x] Recurring backups: `[job.<name>]` sections (cron, every, at), the `scheduler`
+      service, `job list` / `job run`, one run at a time with the web interface
+- [x] Web interface: the jobs (next run, last result, scheduler state) and "run now"
+- [ ] Web interface: limit login attempts, keep the run history across restarts, edit
+      the jobs from the page
+- [ ] Notifications (a job that fails), client-side encryption
 - [x] Direct restore to Proxmox (`restore-guest`): VM disks to ZFS, LVM-thin, LVM and
       directory storages, containers to ZFS
 - [ ] Restore: containers to LVM, LVM-thin and directory storages (file system created,

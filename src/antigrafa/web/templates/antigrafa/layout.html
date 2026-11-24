@@ -136,7 +136,8 @@ function showProgress(run) {
   if (!p) return;
   const name = run.kind === "restore" ? "Restore" : `${run.guests_done}/${run.guests_total} guests`;
   const overall = progressLine(name, p, "overall");
-  overall.querySelector(".numbers").textContent += `  ·  ${duration(p.elapsed)}`;
+  overall.querySelector(".numbers").textContent += `  ·  ${duration(p.elapsed)}`
+    + (run.kind === "restore" && p.status ? `  ·  ${p.status}` : "");  // e.g. the disk still being written
   box.append(overall);
   for (const t of p.tasks) box.append(progressLine(t.name, t));
 }
@@ -167,7 +168,8 @@ function showRun(run) {
   $("run-id").textContent = `#${run.id}`;
   $("run-state").textContent = run.state;
   $("run-state").className = `badge state-${run.state}`;
-  let info = `${run.source} → ${run.target} · started ${time(run.started)} by ${run.user}`;
+  let info = `${run.job ? "job " + run.job + " · " : ""}${run.source} → ${run.target}`
+    + ` · started ${time(run.started)} by ${run.user}`;
   if (restoring) {
     const r = run.restore, g = run.guests[0] || {};
     const how = {new: "new guest", overwrite: "replacing the guest", "disk-only": "disks added as unused"}[r.mode] || r.mode;
@@ -207,7 +209,7 @@ function showRuns(runs) {
     const guests = restoring ? r.guest
       : `${r.guests_done}/${r.guests_total}` + (r.guests_failed ? ` (${r.guests_failed} failed)` : "");
     tr.append(el("td", `#${r.id}`), el("td", time(r.started)), el("td", r.user),
-      el("td", restoring ? `${r.target} → ${r.source}` : `${r.source} → ${r.target}`),
+      el("td", (restoring ? `${r.target} → ${r.source}` : `${r.source} → ${r.target}`) + (r.job ? ` (job ${r.job})` : "")),
       el("td", guests), el("td", r.state, `state-${r.state}`));
     tbody.append(tr);
   }
@@ -215,15 +217,24 @@ function showRuns(runs) {
   $("runs-empty").classList.toggle("hidden", runs.length > 0);
 }
 
-// The run of the other page that keeps this one from starting
-function showOtherRun(active) {
+// The run of the other page, or of the scheduler, that keeps this one from starting
+function showOtherRun(active, external) {
   const other = active && active.kind !== PAGE ? active : null;
-  $("other-run").classList.toggle("hidden", !other);
-  if (!other) return;
+  // A job of the scheduler is in the runs list, followed like the others: no banner for it
+  const elsewhere = external && !(active && external.run === active.id) ? external : null;
+  $("other-run").classList.toggle("hidden", !other && !elsewhere);
+  if (!other) {
+    if (elsewhere) {
+      const since = elsewhere.since ? ` since ${time(elsewhere.since)}` : "";
+      $("other-run-text").textContent = `${elsewhere.label[0].toUpperCase()}${elsewhere.label.slice(1)} is running`
+        + `${since}: a ${PAGE} can start once it has ended.`;
+    }
+    return;
+  }
   const what = other.kind === "restore" ? "Restore" : "Backup";
   const text = $("other-run-text");
   text.replaceChildren(
-    el("span", `${what} #${other.id} is running (started by ${other.user}): `
+    el("span", `${what} #${other.id} is running (${other.job ? "job " + other.job + ", " : ""}started by ${other.user}): `
       + `a ${PAGE} can start once it has ended. `),
   );
   const link = el("a", `See ${what.toLowerCase()} #${other.id}`);
@@ -247,7 +258,7 @@ async function refresh() {
     }
     showRuns(data.runs);
     showRun(data.run);
-    showOtherRun(data.active);
+    showOtherRun(data.active, data.external);
     active = data.busy;
     busy = data.busy;
     onStatus();

@@ -18,6 +18,19 @@ def _log_file_in_tmp(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "default_log_file", default_log_file)
 
 
+@pytest.fixture(autouse=True)
+def _scheduler_dir_in_tmp(tmp_path, monkeypatch):
+    """The default scheduler directory (run lock, job states) is never the system one in tests."""
+    from antigrafa import config
+
+    real = config.default_scheduler_dir
+
+    def default_scheduler_dir(*args, **kwargs):
+        return real(*args, **kwargs) if args or kwargs else str(tmp_path / "scheduler")
+
+    monkeypatch.setattr(config, "default_scheduler_dir", default_scheduler_dir)
+
+
 # Stands in for the rar and 7z programs, rarely installed (rar is not even free): it
 # takes their arguments and writes a zip (readable by the tests), with the level as
 # comment. FAKE_ARCHIVER_FAIL set: fails the way they do.
