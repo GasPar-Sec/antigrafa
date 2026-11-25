@@ -239,7 +239,10 @@ class LiveRun:
             stopped = isinstance(exc, KeyboardInterrupt) or self.cancel.is_set()
             self.finish("cancelled" if stopped else "failed", str(exc or "") or (kind.__name__ if kind else ""))
         self.publish()
-        self.cancel_path.unlink(missing_ok=True)
+        try:
+            self.cancel_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------- the web side
