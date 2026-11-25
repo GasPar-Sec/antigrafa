@@ -42,6 +42,11 @@ FILE_DATEFMT = "%Y-%m-%d %H:%M:%S"
 # Seconds before trying again when the file could not be renamed (Windows: another
 # process was writing a record at that very moment)
 RETRY_DELAY = 5.0
+# Windows: an antivirus or the search indexer opens a freshly written file for a few
+# milliseconds, and a rename fails meanwhile. Tried this many times, this far apart,
+# before waiting RETRY_DELAY.
+RENAME_ATTEMPTS = 4
+RENAME_PAUSE = 0.05
 
 log = logging.getLogger(__name__)
 
@@ -141,15 +146,20 @@ class ArchivingFileHandler(logging.Handler):
         self.wait()  # one archive at a time
         stamp = datetime.now().strftime(STAMP)
         pending = self.path.with_name(f"{self.path.name}.{os.getpid()}.{stamp}.rotating")
-        try:
-            os.replace(self.path, pending)
-        except FileNotFoundError:
-            return  # another process archived it first
-        except PermissionError:
-            # Windows: another process is writing a record. The file grows a little
-            # past the limit; try again shortly rather than on every line.
-            self._next_try = time.monotonic() + RETRY_DELAY
-            return
+        for attempt in range(RENAME_ATTEMPTS):
+            try:
+                os.replace(self.path, pending)
+                break
+            except FileNotFoundError:
+                return  # another process archived it first
+            except PermissionError:
+                if attempt + 1 < RENAME_ATTEMPTS:
+                    time.sleep(RENAME_PAUSE)  # a scanner reading it: gone in a moment
+                    continue
+                # Windows: another process is writing a record. The file grows a
+                # little past the limit; try again shortly rather than on every line.
+                self._next_try = time.monotonic() + RETRY_DELAY
+                return
         # Compressing 1 GiB takes a while: the backups keep logging meanwhile
         self._worker = threading.Thread(target=self._archive, args=(pending, stamp), name="log-archive")
         self._worker.start()

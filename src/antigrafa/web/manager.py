@@ -7,6 +7,15 @@ Everything that can be checked quickly is checked before ``start`` (or
 token's rights, the backup to restore), so that the page shows the error at once.
 The run then goes on in its own thread; the page follows it through ``status``. The
 last runs (state, results, log, report) stay in memory until the server stops.
+
+One run at a time, with the scheduler too: a run holds the run lock of the scheduler's
+directory (see ``antigrafa.runlock``); while a scheduled job runs, nothing starts here.
+A job started from the page ("run now") records its start and result in the job's
+state, as the scheduler does.
+
+The jobs run by the scheduler (or ``antigrafa job run``) show among the runs of this
+server, with their progress, results and log, and can be cancelled from here: their
+process writes them to the scheduler's directory (see ``antigrafa.liverun``).
 """
 
 from __future__ import annotations
@@ -22,10 +31,14 @@ from typing import Callable
 from ..config import Config, ConfigError, load_config
 from ..index import read_manifest
 from ..jobs import BackupRunner, GuestResult
-from ..operations import new_data_line, open_platform, open_repository, report_lines, select_guests
+from .. import liverun
+from .. import scheduler as jobs_state
+from ..liverun import guest_dict, result_dict
+from ..operations import backup_state, new_data_line, open_platform, open_repository, report_lines, select_guests
 from ..platforms.base import Guest, RestoreRequest
 from ..progress import Progress
 from ..restore import restore_guest
+from ..runlock import RunLock, describe
 
 log = logging.getLogger(__name__)
 
@@ -44,32 +57,6 @@ class Busy(Exception):
 
 def _now() -> datetime:
     return datetime.now().astimezone()
-
-
-def guest_dict(g: Guest) -> dict:
-    return {"id": g.id, "kind": g.kind, "name": g.name, "host": g.host, "status": g.status, "label": g.label}
-
-
-def result_dict(r: GuestResult) -> dict:
-    return {
-        "guest": guest_dict(r.guest),
-        "ok": r.ok,
-        "error": r.error,
-        "snapshot": r.snapshot,
-        "duration": r.duration,
-        "timings": r.timings,
-        "disks": [
-            {
-                "key": d.key,
-                "size": d.size,
-                "elapsed": d.stats.elapsed,
-                "new_chunks": d.stats.new_chunks,
-                "reused_chunks": d.stats.reused_chunks,
-                "sent_bytes": d.stats.sent_bytes,
-            }
-            for d in r.disks
-        ],
-    }
 
 
 @dataclass
@@ -96,6 +83,8 @@ class Run:
     backup: str = ""
     request: RestoreRequest | None = None
     message: str = ""
+    job: str = ""  # a [job.<name>] started from the page
+    lock: RunLock | None = field(default=None, repr=False)
 
     def add_log(self, line: str) -> None:
         self.logs.append(line)
@@ -126,6 +115,7 @@ class Run:
             "guests_ok": ok,
             "guests_failed": done - ok,
             "guest": self.guests[0].label if self.kind == "restore" and self.guests else "",
+            "job": self.job,
         }
 
     def details(self, logs_after: int = 0) -> dict:
@@ -146,6 +136,36 @@ class Run:
             "log_total": total,
             "logs": lines[max(logs_after - first, 0) :] if logs_after <= total else lines,
         }
+
+
+class ExternalRun:
+    """A job run by another process (the scheduler, ``antigrafa job run``), as its file says."""
+
+    def __init__(self, run_id: int, uid: str, data: dict) -> None:
+        self.id = run_id
+        self.uid = uid
+        self.data = data
+        self.kind = data.get("kind") or "backup"
+        self.state = data.get("state") or "failed"
+        self.started = data.get("started") or ""
+
+    @property
+    def active(self) -> bool:
+        return self.state in liverun.ACTIVE
+
+    def summary(self) -> dict:
+        return {"id": self.id, **{k: self.data.get(k) for k in liverun.SUMMARY_KEYS}, "external": True}
+
+    def details(self, logs_after: int = 0) -> dict:
+        lines = list(self.data.get("logs") or [])
+        total = int(self.data.get("log_total") or 0)
+        first = total - len(lines)
+        out = {k: v for k, v in self.data.items() if k not in ("pid", "heartbeat")}
+        return {**out, **self.summary(), "logs": lines[max(logs_after - first, 0):] if logs_after <= total else lines}
+
+
+def _started(run) -> str:
+    return run.started if isinstance(run, ExternalRun) else run.started.isoformat()
 
 
 def _request_dict(r: RestoreRequest) -> dict:
@@ -202,6 +222,8 @@ class BackupManager:
         self._threads: dict[int, threading.Thread] = {}
         self._next_id = 1
         self.current: Run | None = None
+        self._external_ids: dict[str, int] = {}  # file of a job run elsewhere -> its id here
+        self._external_cache: dict = {}  # the files already read (see liverun.read_runs)
         self._log = _RunLog(self)
         logging.getLogger("antigrafa").addHandler(self._log)
 
@@ -237,14 +259,72 @@ class BackupManager:
             raise ConfigError(f"unknown guest kind {kind!r}")
         return open_platform(self.config(), source or None).restore_locations(kind)
 
-    def run(self, run_id: int) -> Run | None:
+    def run(self, run_id: int) -> Run | ExternalRun | None:
         with self._lock:
-            return next((r for r in self._runs if r.id == run_id), None)
+            run = next((r for r in self._runs if r.id == run_id), None)
+        if run is None:
+            run = next((r for r in self._external_runs() if r.id == run_id), None)
+        return run
+
+    def _directory(self):
+        try:
+            return self.config().scheduler.directory
+        except ConfigError:
+            return None
+
+    def _external_runs(self, directory=None) -> list[ExternalRun]:
+        """The jobs run by the scheduler or ``antigrafa job run``, oldest first."""
+        directory = directory if directory is not None else self._directory()
+        if directory is None:
+            return []
+        now = _now()
+        found = []
+        for uid, data in liverun.read_runs(directory, self._external_cache):
+            with self._lock:
+                if uid not in self._external_ids:
+                    self._external_ids[uid] = self._next_id
+                    self._next_id += 1
+                run_id = self._external_ids[uid]
+            found.append(ExternalRun(run_id, uid, liverun.shown(data, now)))
+        return found
 
     def status(self) -> dict:
+        """The runs of this server and of the scheduler, newest first; "external": what runs
+        elsewhere (the scheduler), if anything, with "run": its id in the list when it is a job."""
         with self._lock:
-            runs = list(self._runs)
-        return {"busy": self._busy, "runs": [r.summary() for r in runs]}
+            own = list(self._runs)
+            busy = self._busy
+        directory = self._directory()
+        others = self._external_runs(directory) if directory is not None else []
+        runs = sorted(own + others, key=_started, reverse=True)[:HISTORY]
+        external = None
+        if not busy and directory is not None:
+            try:
+                holder = RunLock(directory).holder()
+            except OSError:
+                holder = None
+            if holder is not None:
+                external = {**holder, "label": describe(holder)}
+                running = next((r for r in others if r.active and r.data.get("job") == holder.get("job")), None)
+                if running is not None:
+                    external["run"] = running.id
+        return {"busy": busy or external is not None, "runs": [r.summary() for r in runs], "external": external}
+
+    def jobs(self) -> dict:
+        """The [job.<name>] sections: what, when, next and last run; and the scheduler's state."""
+        cfg = self.config()
+        return {
+            "scheduler": jobs_state.scheduler_status(cfg.scheduler.directory),
+            "jobs": jobs_state.job_summaries(cfg),
+        }
+
+    def start_job(self, name: str, user: str = "") -> Run:
+        """Run a job now, from the page: followed here like any backup."""
+        job = self.config().jobs.get(name)
+        if job is None:
+            raise ConfigError(f"unknown job {name}")
+        return self.start(source=job.source or None, target=job.target or None, guests=job.guests, every=job.all,
+                          exclude=job.exclude, user=user, job=name)
 
     # ----------------------------------------------------------------- control
 
@@ -257,9 +337,10 @@ class BackupManager:
         every: bool = False,
         exclude: list[str] | None = None,
         user: str = "",
+        job: str = "",
     ) -> Run:
         """Check everything, then start the backup in the background (raises on error)."""
-        self._claim()
+        lock = self._claim("backup", user, job)
         try:
             cfg = self.config()
             platform = open_platform(cfg, source or None)
@@ -269,7 +350,7 @@ class BackupManager:
                 raise ConfigError("no guest to back up")
             platform.check_access(selected)  # every right, before the first snapshot
             with self._lock:
-                run = Run(self._next_id, user, platform.name, repo.cfg.name, selected)
+                run = Run(self._next_id, user, platform.name, repo.cfg.name, selected, job=job, lock=lock)
                 self._next_id += 1
             runner = self._runner_class(
                 cfg.tuning, platform, repo, progress=run.progress, cancel=run.cancel, on_result=run.results.append
@@ -279,20 +360,43 @@ class BackupManager:
                 self._runs.appendleft(run)
                 self._threads[run.id] = thread
                 self.current = run
+            if job:
+                jobs_state.record_start(cfg.scheduler.directory, job, run.started)
             thread.start()
         except BaseException:
-            with self._lock:
-                self._busy = False
+            self._unclaim(lock)
             raise
-        log.info("backup %d started by %s: %d guest(s) of %s to %s", run.id, user, len(selected), run.source, run.target)
+        log.info("backup %d started by %s: %d guest(s) of %s to %s%s", run.id, user, len(selected), run.source,
+                 run.target, f" (job {job})" if job else "")
         return run
 
-    def _claim(self) -> None:
+    def _claim(self, what: str, user: str, job: str = "") -> RunLock:
+        """Nothing runs here nor elsewhere (the scheduler): the run lock is ours."""
         with self._lock:
             if self._busy:
                 running = self.current.kind if self.current else "backup"
                 raise Busy(f"a {running} is already running: wait for it to end, or cancel it")
             self._busy = True
+        try:
+            directory = self.config().scheduler.directory
+            lock = RunLock(directory)
+            try:
+                got = lock.try_acquire({"by": "web", "what": what, "user": user, "job": job})
+            except OSError as exc:
+                raise ConfigError(f"cannot take the run lock in {directory} ([scheduler] data_dir): {exc}") from None
+            if not got:
+                raise Busy(f"{describe(lock.holder())} is running: wait for it to end")
+        except BaseException:
+            with self._lock:
+                self._busy = False
+            raise
+        return lock
+
+    def _unclaim(self, lock: RunLock | None) -> None:
+        if lock is not None:
+            lock.release()
+        with self._lock:
+            self._busy = False
 
     def start_restore(
         self,
@@ -322,7 +426,7 @@ class BackupManager:
             raise ConfigError("disk-only does not change the guest: nothing to start")
         if guest_id and not guest_id.isdigit():
             raise ConfigError(f"{guest_id!r} is not a guest id")
-        self._claim()
+        lock = self._claim("restore", user)
         try:
             cfg = self.config()
             repo = open_repository(cfg, target or None)
@@ -343,7 +447,7 @@ class BackupManager:
                           host or str(original.get("host", "")))
             with self._lock:
                 run = Run(self._next_id, user, platform.name, repo.cfg.name, [guest], kind="restore",
-                          backup=backup, request=request)
+                          backup=backup, request=request, lock=lock)
                 run.progress = Progress(label="restore", enabled=False)
                 self._next_id += 1
             thread = threading.Thread(target=self._execute_restore, args=(run, platform, repo),
@@ -354,8 +458,7 @@ class BackupManager:
                 self.current = run
             thread.start()
         except BaseException:
-            with self._lock:
-                self._busy = False
+            self._unclaim(lock)
             raise
         log.info("restore %d started by %s: %s from %s as %s (%s)", run.id, user, backup, run.target,
                  request.guest_id, mode)
@@ -396,30 +499,53 @@ class BackupManager:
         run.finished = _now()
         if run.kind == "restore":
             # Cancelled only if it stopped: a cancel that came too late leaves a finished restore
-            run.state = "ok" if not run.error else "cancelled" if run.cancel.is_set() else "failed"
-        elif run.cancel.is_set():
-            run.state = "cancelled"
-        elif run.error or len(run.results) < len(run.guests) or not all(r.ok for r in run.results):
-            run.state = "failed"
+            state = "ok" if not run.error else "cancelled" if run.cancel.is_set() else "failed"
         else:
-            run.state = "ok"
+            state = backup_state(len(run.guests), run.results, run.error, run.cancel.is_set())
+        if run.job:  # before the run shows as ended: the job's result is there when the page looks
+            try:
+                directory = self.config().scheduler.directory
+            except ConfigError as exc:
+                log.warning("job %s: its result is not recorded: %s", run.job, exc)
+            else:
+                jobs_state.record_end(directory, run.job, jobs_state.job_result(
+                    run.started, state, len(run.guests), run.results, by="web", user=run.user, error=run.error))
         with self._lock:
             self.current = None
             self._threads.pop(run.id, None)
-            self._busy = False
+        self._unclaim(run.lock)
+        run.lock = None
+        run.state = state  # last: a run seen ended never keeps the next one from starting
         log.info("%s %d ended: %s", run.kind, run.id, run.state)
 
     def cancel(self, run_id: int, user: str = "") -> bool:
         """Ask the running backup to stop (snapshots deleted, partial backups removed), or the
-        running restore (what it created removed, the guest replaced unlocked)."""
+        running restore (what it created removed, the guest replaced unlocked). A job of the
+        scheduler: its process is asked, and stops it within a second."""
         with self._lock:
             run = self.current
-            if run is None or run.id != run_id or run.state != "running":
+            own = run is not None and run.id == run_id
+        if not own:
+            return self._cancel_external(run_id, user)
+        with self._lock:
+            if run.state != "running":
                 return False
             run.state = "cancelling"
             run.cancelled_by = user
             run.cancel.set()
         logging.getLogger("antigrafa.jobs").warning("%s %d: cancel requested by %s", run.kind, run_id, user or "?")
+        return True
+
+    def _cancel_external(self, run_id: int, user: str) -> bool:
+        directory = self._directory()
+        run = next((r for r in self._external_runs(directory) if r.id == run_id), None)
+        if run is None or run.state != "running":
+            return False
+        try:
+            liverun.request_cancel(directory, run.uid, user)
+        except OSError as exc:
+            raise ConfigError(f"cannot ask the scheduler to cancel job {run.data.get('job')}: {exc}") from None
+        log.warning("job %s (run %d): cancel requested by %s", run.data.get("job"), run_id, user or "?")
         return True
 
     def shutdown(self, timeout: float | None = None) -> None:

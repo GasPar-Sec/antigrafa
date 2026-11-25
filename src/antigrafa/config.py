@@ -1,8 +1,10 @@
 """Loading the TOML configuration (see ``antigrafa.example.toml``).
 
 Generic sections: ``[source.<name>]`` (one per cluster or host, with its ``type``),
-``[target.<name>]``, ``[tuning]``, ``[web]`` (the web interface) and ``[log]`` (the log file). The rest of a source section belongs to its
-platform, which validates it (see ``antigrafa.platforms``).
+``[target.<name>]``, ``[tuning]``, ``[web]`` (the web interface), ``[log]`` (the log file),
+``[job.<name>]`` (recurring backups) and ``[scheduler]`` (the service that runs them). The
+rest of a source section belongs to its platform, which validates it (see
+``antigrafa.platforms``).
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from .platforms.base import check_name
+from .schedule import Schedule, parse_schedule
 from .targets import TargetConfig
 
 
@@ -36,6 +39,10 @@ def default_config_path(platform: str = sys.platform, environ=os.environ) -> str
 
 def default_web_dir(platform: str = sys.platform, environ=os.environ) -> str:
     return str(_system_dir("/var/lib/antigrafa", "web", platform=platform, environ=environ))
+
+
+def default_scheduler_dir(platform: str = sys.platform, environ=os.environ) -> str:
+    return str(_system_dir("/var/lib/antigrafa", "scheduler", platform=platform, environ=environ))
 
 
 def default_log_file(platform: str = sys.platform, environ=os.environ) -> str:
@@ -156,12 +163,67 @@ class LogConfig:
 
 
 @dataclass
+class SchedulerConfig:
+    """The service that runs the jobs (``antigrafa scheduler``), and what it shares with the
+    web interface: the lock that keeps one run at a time, and the state of each job."""
+
+    data_dir: str = ""  # "": default_scheduler_dir(); writable by the scheduler and the web interface
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data_dir, str):
+            raise ValueError("data_dir must be a string")
+
+    @property
+    def directory(self) -> Path:
+        return Path(self.data_dir or default_scheduler_dir())
+
+
+def _ids(value, name: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, (str, int)) and not isinstance(v, bool) for v in value):
+        raise ValueError(f"{name} must be a list of guest ids")
+    return [str(v).strip() for v in value]
+
+
+@dataclass
+class JobConfig:
+    """A recurring backup: which guests, from which source to which target, and when."""
+
+    name: str
+    source: str = ""  # "": the only source
+    target: str = ""  # "": the only target
+    guests: list[str] = field(default_factory=list)  # these ids...
+    all: bool = False  # ...or every guest of the source (new ones included)...
+    exclude: list[str] = field(default_factory=list)  # ...but these
+    schedule: str = ""  # cron: "0 2 * * *"
+    every: str = ""  # or an interval: "6h"
+    at: str | list[str] = ""  # or times of the day: "02:00", ["02:00", "14:00"]
+    days: list[str] = field(default_factory=list)  # with at: ["mon", "fri"]; []: every day
+    enabled: bool = True
+    timing: Schedule = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        for name in ("source", "target", "schedule", "every"):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f"{name} must be a string")
+        for name in ("all", "enabled"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be true or false")
+        self.guests = _ids(self.guests, "guests")
+        self.exclude = _ids(self.exclude, "exclude")
+        if self.all == bool(self.guests):
+            raise ValueError("set all = true, or the guests to back up (guests = [...])")
+        self.timing = parse_schedule(self.schedule, self.every, self.at, self.days)
+
+
+@dataclass
 class Config:
     sources: dict[str, SourceConfig]
     targets: dict[str, TargetConfig]
     tuning: Tuning
     web: WebConfig = field(default_factory=WebConfig)
     log: LogConfig = field(default_factory=LogConfig)
+    jobs: dict[str, JobConfig] = field(default_factory=dict)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
     def source(self, name: str | None) -> SourceConfig:
         return _pick(self.sources, name, "source")
@@ -240,7 +302,7 @@ def load_config(path: str | Path) -> Config:
             f"[{'], ['.join(sorted(old))}]: these sections moved into [source.<name>] "
             'with type = "proxmox" (see antigrafa.example.toml)'
         )
-    unknown = set(raw) - {"source", "target", "tuning", "web", "log"}
+    unknown = set(raw) - {"source", "target", "tuning", "web", "log", "job", "scheduler"}
     if unknown:
         raise ConfigError(f"unknown sections: {', '.join(sorted(unknown))}")
 
@@ -251,10 +313,31 @@ def load_config(path: str | Path) -> Config:
     if not targets:
         raise ConfigError("at least one [target.<name>] section is required")
 
+    sources = {name: _source(name, data) for name, data in _tables(raw, "source").items()}
     return Config(
-        sources={name: _source(name, data) for name, data in _tables(raw, "source").items()},
+        sources=sources,
         targets=targets,
         tuning=build_section(Tuning, raw.get("tuning", {}), "tuning"),
         web=build_section(WebConfig, raw.get("web", {}), "web"),
         log=build_section(LogConfig, raw.get("log", {}), "log"),
+        jobs={name: _job(name, data, sources, targets) for name, data in _tables(raw, "job").items()},
+        scheduler=build_section(SchedulerConfig, raw.get("scheduler", {}), "scheduler"),
     )
+
+
+def _job(name: str, data: dict, sources: dict, targets: dict) -> JobConfig:
+    section = f"job.{name}"
+    try:
+        check_name(name, "job name")
+    except ValueError as exc:
+        raise ConfigError(f"[{section}]: {exc}") from None
+    job = build_section(JobConfig, data, section, name=name)
+    # The source and the target exist: a job never fails at 2 a.m. on a typo
+    for what, items in (("source", sources), ("target", targets)):
+        chosen = getattr(job, what)
+        if chosen and chosen not in items:
+            raise ConfigError(f"[{section}]: unknown {what} {chosen!r} ({', '.join(sorted(items)) or 'none configured'})")
+        if not chosen and len(items) != 1:
+            raise ConfigError(f"[{section}]: several {what}s configured, set {what} ({', '.join(sorted(items))})"
+                              if items else f"[{section}]: a [{what}.<name>] section is required")
+    return job

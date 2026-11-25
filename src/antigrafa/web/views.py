@@ -181,6 +181,21 @@ def cancel(request: HttpRequest, run_id: int):
     return JsonResponse({"run": run_id, "state": "cancelling"})
 
 
+@require_GET
+@api
+def jobs(request: HttpRequest):
+    """The [job.<name>] sections (what, when, next and last run) and the scheduler's state."""
+    return JsonResponse(get_manager().jobs())
+
+
+@require_POST
+@api
+def run_job(request: HttpRequest, name: str):
+    """Run a job now, followed on the page like any backup."""
+    run = get_manager().start_job(name, user=request.user.get_username())
+    return JsonResponse({"run": run.id}, status=202)
+
+
 def _json(request: HttpRequest) -> dict:
     try:
         body = json.loads(request.body or b"{}")

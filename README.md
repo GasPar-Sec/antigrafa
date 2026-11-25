@@ -287,6 +287,9 @@ antigrafa restore --target nas cluster1/vm/100/2026-11-17T22-30-00Z scsi0 /tmp/s
 antigrafa restore-guest --target nas cluster1/vm/100/2026-11-17T22-30-00Z   # back into Proxmox
 antigrafa restore-guest cluster1/vm/100/2026-11-17T22-30-00Z --id 100 --overwrite --stop --start
 antigrafa restore-guest cluster1/vm/100/2026-11-17T22-30-00Z --id 100 --disk-only
+antigrafa scheduler                       # run the [job.<name>] sections at their times
+antigrafa job list                        # the jobs, their next run and last result
+antigrafa job run nightly                 # one job now
 ```
 
 `restore` and `verify` read, decompress and check several chunks at a time (`--jobs`,
@@ -449,9 +452,17 @@ its own recent runs.
   `--disk-only`), with the stop options and start after the restore. Every choice is
   confirmed before anything starts; the restore is then followed and cancelled like a
   backup.
-- One run at a time (a backup or a restore): while a backup runs, the Restore page says
-  so with a link to it, and the other way round. The last 20 runs stay listed until the
-  server stops.
+- **Scheduled jobs** (Backup page): each job of the configuration, with what it backs
+  up, when, its next run and its last result, and whether the scheduler is running.
+  **Run now** starts a job at once, followed like any backup; its result is the job's
+  last result (see [Recurring backups](#recurring-backups)).
+- **Jobs of the scheduler** (and of `antigrafa job run`) show on the Backup page among
+  the other runs, followed the same way: guests, progress, results, log and report, with
+  **Cancel**. The last 20 stay listed, even across restarts of the web server.
+- One run at a time (a backup or a restore), with the scheduler too: while a backup
+  runs, the Restore page says so with a link to it, and the other way round; nothing
+  starts while the scheduler runs a job. The last 20 runs started from the page stay
+  listed until the server stops.
 
 **Certificate.** Without one, a self-signed certificate is created on the first start
 (ECDSA P-256, valid 397 days, renewed by Antigrafa 30 days before it expires) for the
@@ -492,6 +503,100 @@ WantedBy=multi-user.target
 On Windows, `antigrafa web serve` runs in a console, or at startup through the Task
 Scheduler (run whether the user is logged on or not, with the account that has the SSH
 key). See the `[web]` section of [antigrafa.example.toml](antigrafa.example.toml).
+
+## Recurring backups
+
+Jobs are `[job.<name>]` sections of the configuration: which guests, from which
+source to which destination, and when. The scheduler, a service of its own, runs them:
+
+```toml
+[job.nightly]
+source = "cluster1"
+target = "nas"
+all = true                # every guest, new ones included...
+exclude = [9000]          # ...but these
+schedule = "0 2 * * *"    # cron: every day at 2:00
+
+[job.databases]
+guests = [101, 102]       # only these (source and target: the only ones configured)
+every = "6h"
+```
+
+| When | Example | Meaning |
+|---|---|---|
+| `schedule` | `"0 2 * * *"`, `"0 */6 * * *"`, `"30 1 * * mon-fri"`, `"@daily"` | cron, 5 fields: minute, hour, day of the month, month, day of the week. Lists, ranges, steps and names (`jan`, `mon`); 0 and 7 are Sunday. When both days are restricted, either one matches, as in cron |
+| `every` | `"30m"`, `"6h"`, `"1d"` | from the start of the previous run (kept across restarts); a job that never ran is due as soon as the scheduler starts |
+| `at` | `"02:00"`, `["02:00", "14:00"]`, with `days = ["mon", "fri"]` | times of the day, every day without `days` |
+
+Times are those of the machine running the scheduler. `enabled = false` keeps a job
+without running it. A job is checked when the configuration is read: an unknown
+source or destination, or a cron expression that never matches (`0 0 31 2 *`), is
+refused at once rather than at 2 a.m.
+
+| Command | Effect |
+|---|---|
+| `antigrafa scheduler` | run the jobs at their times, until Ctrl+C or SIGTERM (as a service) |
+| `antigrafa job list` | each job: what, when, next run, last result; and whether the scheduler runs |
+| `antigrafa job run <name>` | run a job now, in the terminal; its result is the job's last result |
+
+- **Changes apply without a restart**: the scheduler reads the configuration every 15
+  seconds. A job whose schedule changed counts from the change. A broken configuration
+  is logged once, and the jobs wait until it is fixed.
+- **One run at a time**, for the scheduler, `job run` and the web interface: a job that
+  is due while another backup or restore runs waits for it to end, in a queue, and
+  starts right after. A job is never queued twice: due again while it still waits, it
+  is not added again. A cron job still running at its next time runs once more right
+  after it.
+- **Missed times** (the scheduler was stopped at 2:00) are not caught up for cron and
+  `at`. An `every` job counts from its last start, so it runs as soon as the scheduler
+  is back if its time has passed.
+- **Followed on the web page**: the running job shows on the Backup page like a
+  backup started there (progress, results, log), and **Cancel** stops it within a
+  second. A job whose process disappears (killed, machine stopped) shows as failed
+  after a minute without news.
+- **Stopping** (Ctrl+C, SIGTERM): the running job is cancelled, its snapshots deleted,
+  like a cancelled backup.
+- **Results**: the report of each job goes to the log file (see [Log file](#log-file));
+  the last result (state, guests OK and failed, error) is shown by `job list` and the
+  web page.
+
+The scheduler and the web interface share a directory, set by `[scheduler] data_dir`
+(`/var/lib/antigrafa/scheduler` on Linux, `%PROGRAMDATA%\antigrafa\scheduler` on
+Windows), which both service accounts must be able to write:
+
+- `run.lock`: the lock held by whoever runs a backup or a restore. It is a lock of the
+  system, freed even if the process is killed. `run.json` says who holds it.
+- `jobs/<name>.json`: the start and result of each job's last run.
+- `scheduler.json`: the scheduler's heartbeat (every 15 seconds), its queue and the job
+  it runs. The web page says the scheduler is not running when the heartbeat is more
+  than 90 seconds old.
+- `runs/`: the running job and the last 20, for the web page (`<start>-<pid>-<job>.json`,
+  written every second while it runs); `<...>.cancel`, written by the web page, asks the
+  scheduler to cancel the job.
+
+The `backup` and `restore-guest` commands do not take this lock: a backup started by
+hand can run at the same time as a job.
+
+Running as a service on Linux (systemd), `/etc/systemd/system/antigrafa-scheduler.service`:
+
+```ini
+[Unit]
+Description=Antigrafa scheduler
+After=network-online.target
+
+[Service]
+ExecStart=/opt/antigrafa/bin/antigrafa scheduler
+Restart=on-failure
+# The running job is cancelled and its snapshots deleted: give it time
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
+```
+
+On Windows, through the Task Scheduler: at startup, run whether the user is logged on
+or not, with the account that has the SSH key, and without the "stop the task if it
+runs longer than" limit.
 
 ## Repository format
 

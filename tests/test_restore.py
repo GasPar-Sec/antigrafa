@@ -5,6 +5,7 @@ through the real write script into a local file, compared with the original imag
 """
 
 import io
+import logging
 import os
 import re
 import subprocess
@@ -25,6 +26,7 @@ from antigrafa.platforms.proxmox.restore import (
     restored_config,
     size_option,
 )
+from antigrafa.progress import Progress
 from antigrafa.restore import backup_disks, restore_guest
 from antigrafa.targets import Repository, TargetConfig
 
@@ -62,6 +64,26 @@ def test_write_script_puts_each_chunk_at_its_offset(tmp_path, zeroed):
     # A zeroed volume already reads as zeros: they are not written
     middle = b"\xff" * 1000 if zeroed else bytes(1000)
     assert target.read_bytes() == b"a" * 1000 + middle + b"b" * 1000
+
+
+def test_write_script_flushes_to_the_disk_as_it_goes(tmp_path):
+    # Otherwise the node's memory runs GiBs ahead of a slow disk: 100 % long before the end
+    target = tmp_path / "disk"
+    target.write_bytes(bytes(4000))
+    script = _script()
+    synced = []
+    script["sync"] = synced.append
+    fd = os.open(target, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+    try:
+        records = _records((b"W", 0, b"a" * 1000), (b"Z", 1000, 1000), (b"W", 2000, b"b" * 1000),
+                           (b"W", 3000, b"c" * 1000))
+        assert script["receive"](fd, io.BytesIO(records), False, sync_every=1500) == 4000
+        assert len(synced) == 2  # after 2000 and 4000 bytes written
+        synced.clear()
+        script["receive"](fd, io.BytesIO(records), True, sync_every=1500)  # zeros not written: not counted
+        assert len(synced) == 1 and script["SYNC_EVERY"] == 256 << 20
+    finally:
+        os.close(fd)
 
 
 def test_write_script_rejects_a_damaged_input(tmp_path):
@@ -299,6 +321,19 @@ def test_vm_restored_as_a_new_guest(tmp_path):
     config = node.commands[-1]
     assert "scsi0: ZFS:vm-901-disk-0,iothread=1,size=4K" in config and "lock" not in config
     assert config.endswith("901.conf.tmp.antigrafa /etc/pve/nodes/pve1/qemu-server/901.conf")
+
+
+def test_the_last_write_to_the_disk_is_shown(tmp_path, caplog):
+    # Everything sent is not everything on the disk yet: the page and the log say so
+    caplog.set_level(logging.INFO)
+    progress = Progress(label="restore", enabled=False)
+    node = Node(tmp_path)
+    seen = []
+    received = node.received
+    node.received = lambda sink: seen.append(progress.snapshot()["status"]) or received(sink)
+    _platform(node, API()).restore_guest(MANIFEST, [MemoryDisk("scsi0", IMAGE)], RestoreRequest("901"), progress, None)
+    assert seen == ["scsi0: writing to the disk"] and progress.snapshot()["status"] == ""
+    assert "VM 901: scsi0 sent, the node writes its last data to the disk" in caplog.text
 
 
 class ClusterAPI:

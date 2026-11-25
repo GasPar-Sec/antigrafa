@@ -220,6 +220,96 @@ def cmd_web_deluser(cfg: Config, args) -> int:
     return 0
 
 
+def cmd_scheduler(cfg: Config, args) -> int:
+    import signal
+    import threading
+
+    from .scheduler import Scheduler
+
+    scheduler = Scheduler(args.config)
+    previous = None
+    if threading.current_thread() is threading.main_thread() and hasattr(signal, "SIGTERM"):
+        # systemd stops services with SIGTERM: stop like Ctrl+C, the running backup cleaned up
+        previous = signal.signal(signal.SIGTERM, _interrupt)
+    try:
+        return scheduler.serve()
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+
+
+def _interrupt(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
+def _when(text: str | None) -> str:
+    if not text:
+        return "-"
+    return datetime.fromisoformat(text).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def cmd_job_list(cfg: Config, args) -> int:
+    if cfg.jobs:
+        _print_jobs(cfg)
+    else:
+        print("no job configured ([job.<name>] sections)")
+    return 0
+
+
+def _print_jobs(cfg: Config) -> None:
+    from .scheduler import job_summaries, scheduler_status
+
+    status = scheduler_status(cfg.scheduler.directory)
+    if status["alive"]:
+        print(f"scheduler: running since {_when(status['started'])} (pid {status['pid']})"
+              + (f", running {status['running']}" if status["running"] else "")
+              + (f", queue: {', '.join(status['queue'])}" if status["queue"] else ""))
+    else:
+        print("scheduler: not running (antigrafa scheduler): jobs only run with it")
+    for job in job_summaries(cfg):
+        last = job["last"]
+        if last:
+            outcome = f"{last['state']} {_when(last['started'])}, {last['guests_ok']}/{last['guests_total']} OK"
+            if last.get("error"):
+                outcome += f": {last['error']}"
+        else:
+            outcome = "never ran"
+        print()
+        print(f"{job['name']}{'' if job['enabled'] else ' (disabled)'}")
+        print(f"  what:  {job['what']}")
+        print(f"  when:  {job['schedule']}")
+        print(f"  next:  {_when(job['next']) if job['enabled'] else '-'}")
+        print(f"  last:  {outcome}")
+
+
+def cmd_job_run(cfg: Config, args) -> int:
+    import threading
+
+    from .liverun import LiveRun
+    from .runlock import RunLock, describe
+    from .scheduler import execute_job
+
+    job = cfg.jobs.get(args.name)
+    if job is None:
+        raise ConfigError(f"unknown job {args.name} ({', '.join(sorted(cfg.jobs)) or 'none configured'})")
+    lock = RunLock(cfg.scheduler.directory)
+    stop = threading.Event()
+    try:
+        lock.acquire({"by": "cli", "job": job.name, "what": "backup"}, stop,
+                     on_wait=lambda holder: log.info("waiting for %s to end", describe(holder)))
+    except OSError as exc:
+        raise ConfigError(f"cannot take the run lock in {cfg.scheduler.directory}: {exc}") from None
+    progress = args.progress_bar
+    try:
+        # Followed on the web page too, which may cancel it
+        with LiveRun(cfg.scheduler.directory, job.name, by="cli", progress=progress) as live:
+            result, _ = execute_job(cfg, job, by="cli", progress=progress, cancel=live.cancel, live=live)
+    finally:
+        progress.finish()
+        lock.release()
+    return 0 if result["state"] == "ok" else 1
+
+
 def _open_log_file(cfg: Config) -> logging.Handler | None:
     """The [log] file on the root logger; None when disabled or not writable."""
     from .logfile import ArchivingFileHandler
@@ -311,6 +401,16 @@ def build_parser() -> argparse.ArgumentParser:
                            "if it is still running after 5 minutes (fails after 2 more)")
     rg.add_argument("--jobs", type=int, default=4, help=jobs_help)
     rg.set_defaults(func=cmd_restore_guest)
+
+    sc = sub.add_parser("scheduler", help="run the jobs ([job.<name>] sections) at their times, until stopped")
+    sc.set_defaults(func=cmd_scheduler)
+    j = sub.add_parser("job", help="recurring backups: list the jobs, or run one now")
+    jsub = j.add_subparsers(dest="job_cmd", required=True)
+    jl = jsub.add_parser("list", help="the jobs, their next run and their last result")
+    jl.set_defaults(func=cmd_job_list)
+    jr = jsub.add_parser("run", help="run a job now (waits for a backup or restore in progress)")
+    jr.add_argument("name")
+    jr.set_defaults(func=cmd_job_run)
 
     w = sub.add_parser("web", help="web interface (HTTPS): start and follow backups")
     wsub = w.add_subparsers(dest="web_cmd", required=True)

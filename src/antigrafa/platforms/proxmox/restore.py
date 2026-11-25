@@ -43,8 +43,14 @@ log = logging.getLogger(__name__)
 
 # argv: path, "1" when the volume reads as zeros already. Standard input: records
 # b"W" + offset (8) + length (4) + data, b"Z" + offset (8) + length (4) (zeros), b"E".
+# Flushed to the disk every SYNC_EVERY bytes: otherwise the node's memory takes GiBs
+# ahead of a slow disk, the progress reaches 100 % long before the disk has them, and
+# the end (or a cancel) waits for all of it to be written.
 WRITE_SCRIPT = r'''
 import os, struct, sys
+
+SYNC_EVERY = 256 << 20
+sync = getattr(os, "fdatasync", os.fsync)
 
 
 def read_full(stream, size):
@@ -65,8 +71,9 @@ def write_at(fd, data, offset):
         view = view[os.write(fd, view):]
 
 
-def receive(fd, inp, zeroed):
+def receive(fd, inp, zeroed, sync_every=SYNC_EVERY):
     written = 0
+    unsynced = 0
     while True:
         kind = read_full(inp, 1)
         if kind == b"E":
@@ -80,9 +87,14 @@ def receive(fd, inp, zeroed):
             if len(data) != length:
                 raise IOError("input ended inside a chunk at %d" % offset)
             write_at(fd, data, offset)
+            unsynced += length
         elif not zeroed:
             write_at(fd, bytes(length), offset)
+            unsynced += length
         written += length
+        if unsynced >= sync_every:  # the sender waits for the disk, not for the memory
+            sync(fd)
+            unsynced = 0
 
 
 if __name__ == "__main__":
@@ -90,7 +102,7 @@ if __name__ == "__main__":
     fd = os.open(path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
     try:
         total = receive(fd, sys.stdin.buffer, zeroed)
-        os.fsync(fd)
+        sync(fd)
     finally:
         os.close(fd)
     sys.stdout.write("%d\n" % total)
@@ -585,7 +597,12 @@ class ProxmoxRestore:
                 offset += length
                 task.advance(length)
             sink.write(b"E")
-            written = int(sink.close().strip() or 0)
+            log.info("%s: %s sent, the node writes its last data to the disk", self.label, disk.key)
+            self.progress.set_status(f"{disk.key}: writing to the disk")
+            try:
+                written = int(sink.close().strip() or 0)
+            finally:
+                self.progress.set_status("")
         if offset != disk.size or written != disk.size:
             raise RestoreError(f"{disk.key}: {written} bytes written instead of {disk.size}")
 

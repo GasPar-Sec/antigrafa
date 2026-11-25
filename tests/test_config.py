@@ -328,3 +328,87 @@ def test_log_7z_default_level(tmp_path):
     assert (seven.compression, seven.compression_level) == ("7z", 5)  # 7z -mx5, its own default
     best = load_config(_write(tmp_path, MINIMAL + '[log]\ncompression = "7z"\ncompression_level = 9\n')).log
     assert best.compression_level == 9
+
+
+JOB = MINIMAL + """
+[job.nightly]
+all = true
+exclude = [9000, "105"]
+schedule = "0 2 * * *"
+"""
+
+
+def test_jobs_and_scheduler_sections(tmp_path):
+    from antigrafa.config import default_scheduler_dir
+
+    cfg = load_config(_write(tmp_path, JOB + PROXMOX + '\n[scheduler]\ndata_dir = "/srv/sched"\n'))
+    job = cfg.jobs["nightly"]
+    assert job.all and job.exclude == ["9000", "105"] and job.enabled  # ids as text
+    assert job.timing.describe() == "cron 0 2 * * *" and job.source == "" and job.target == ""
+    assert cfg.scheduler.directory == Path("/srv/sched")
+    assert load_config(_write(tmp_path, MINIMAL)).jobs == {}
+    assert str(load_config(_write(tmp_path, MINIMAL)).scheduler.directory) == default_scheduler_dir()
+
+
+def test_scheduler_default_directory():
+    from antigrafa.config import default_scheduler_dir
+
+    assert default_scheduler_dir(platform="linux") == "/var/lib/antigrafa/scheduler"
+    assert default_scheduler_dir(platform="win32", environ={"PROGRAMDATA": r"D:\Data"}) == \
+        r"D:\Data\antigrafa\scheduler"
+
+
+def test_job_forms(tmp_path):
+    text = MINIMAL + PROXMOX + """
+[job.a]
+guests = [100, "101"]
+every = "6h"
+target = "local"
+source = "pve"
+
+[job.b]
+all = true
+at = ["02:00", "14:00"]
+days = ["mon", "fri"]
+enabled = false
+"""
+    cfg = load_config(_write(tmp_path, text))
+    assert cfg.jobs["a"].guests == ["100", "101"] and cfg.jobs["a"].timing.describe() == "every 6h"
+    assert cfg.jobs["b"].timing.describe() == "at 02:00, 14:00 on mon, fri" and not cfg.jobs["b"].enabled
+
+
+@pytest.mark.parametrize(
+    ("job", "message"),
+    [
+        ("all = true", r"\[job.j\]: set one of schedule"),
+        ('schedule = "@daily"', "set all = true, or the guests"),
+        ('all = true\nguests = ["1"]\nschedule = "@daily"', "set all = true, or the guests"),
+        ('all = "yes"\nschedule = "@daily"', "all must be true or false"),
+        ('all = true\nschedule = "@daily"\nenabled = 1', "enabled must be true or false"),
+        ('guests = "100"\nschedule = "@daily"', "guests must be a list of guest ids"),
+        ('all = true\nexclude = [true]\nschedule = "@daily"', "exclude must be a list"),
+        ('all = true\nschedule = "0 2 * *"', "needs 5 fields"),
+        ('all = true\nevery = "1x"', "m, h or d"),
+        ('all = true\nschedule = "@daily"\nsource = "other"', "unknown source 'other' \(pve\)"),
+        ('all = true\nschedule = "@daily"\ntarget = "nas"', "unknown target 'nas' \(local\)"),
+        ('all = true\nschedule = "@daily"\nsource = 3', "source must be a string"),
+        ('all = true\nschedule = "@daily"\nwhen = "now"', "unknown keys when"),
+    ],
+)
+def test_invalid_job(tmp_path, job, message):
+    with pytest.raises(ConfigError, match=message):
+        load_config(_write(tmp_path, MINIMAL + PROXMOX + "\n[job.j]\n" + job + "\n"))
+
+
+def test_job_needs_a_source_and_picks_the_only_one(tmp_path):
+    with pytest.raises(ConfigError, match=r"\[job.j\]: a \[source.<name>\] section is required"):
+        load_config(_write(tmp_path, MINIMAL + '[job.j]\nall = true\nevery = "1d"\n'))
+    two = MINIMAL + PROXMOX + PROXMOX.replace("source.pve", "source.pve2")
+    with pytest.raises(ConfigError, match="several sources configured, set source \(pve, pve2\)"):
+        load_config(_write(tmp_path, two + '[job.j]\nall = true\nevery = "1d"\n'))
+    with pytest.raises(ConfigError, match="invalid job name"):
+        load_config(_write(tmp_path, MINIMAL + PROXMOX + '[job."a b"]\nall = true\nevery = "1d"\n'))
+    with pytest.raises(ConfigError, match=r"\[scheduler\]: unknown keys x"):
+        load_config(_write(tmp_path, MINIMAL + "[scheduler]\nx = 1\n"))
+    with pytest.raises(ConfigError, match="data_dir must be a string"):
+        load_config(_write(tmp_path, MINIMAL + "[scheduler]\ndata_dir = 1\n"))

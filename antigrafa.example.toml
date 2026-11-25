@@ -86,6 +86,43 @@ port = 8443
 # addresses. Add the DNS name when the page is reached through it.
 # allowed_hosts = ["backup.example.lan"]
 
+# --------------------------------------------------------------------------- recurring jobs
+
+# Backups at fixed times, run by the scheduler service: antigrafa scheduler.
+# antigrafa job list: the jobs, their next run and last result; antigrafa job run <name>:
+# one now. One run at a time: a job due while another backup or restore runs waits for
+# it to end (in the queue, never twice).
+#
+# Guests: all = true (every guest of the source, new ones included, minus exclude), or
+# guests = [...]. source and target may be left out when only one is configured.
+# When: one of
+#   schedule = "0 2 * * *"       cron: minute hour day month weekday (*/6, 1-5, mon-fri,
+#                                @daily, @hourly...); times missed while the scheduler
+#                                was not running are not caught up
+#   every = "6h"                 from the start of the previous run (m, h, d); a job
+#                                that never ran is due as soon as the scheduler starts
+#   at = "02:00"                 or ["02:00", "14:00"], with days = ["mon", "fri"]
+#                                (every day without it)
+[job.nightly]
+source = "cluster1"
+target = "nas"
+all = true
+exclude = [9000]
+schedule = "0 2 * * *"
+
+[job.databases]
+source = "cluster1"
+target = "local"
+guests = [101, 102]
+every = "6h"
+# enabled = false             # kept, but not run by the scheduler
+
+# Where the scheduler and the web interface keep the run lock (one run at a time, for
+# both) and each job's last result. Writable by the accounts of both services.
+# Default: /var/lib/antigrafa/scheduler (Linux), %PROGRAMDATA%\antigrafa\scheduler (Windows).
+# [scheduler]
+# data_dir = "/var/lib/antigrafa/scheduler"
+
 # --------------------------------------------------------------------------- log file
 
 # Every command also writes its log to a file: INFO, DEBUG with -v (-q only quiets the

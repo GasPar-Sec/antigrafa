@@ -391,6 +391,72 @@ def test_manager_guests_checks_rights_when_nothing_is_visible(lab):
         lab.manager.guests("lab")
 
 
+def test_manager_refuses_to_start_while_the_scheduler_runs(lab, monkeypatch):
+    from antigrafa.runlock import RunLock
+
+    m = lab.manager
+    scheduler = RunLock(lab.cfg.scheduler.directory)
+    assert scheduler.try_acquire({"by": "scheduler", "job": "nightly", "what": "backup"})
+    try:
+        status = m.status()
+        assert status["busy"] and status["external"]["label"] == "job nightly (started by the scheduler)"
+        with pytest.raises(Busy, match="job nightly \\(started by the scheduler\\) is running: wait for it to end"):
+            m.start(source="lab", target=None, every=True, user="alice")
+        with pytest.raises(Busy, match="job nightly"):
+            m.start_restore(target=None, backup="x", user="alice")
+        assert not m._busy  # refused: nothing claimed here
+    finally:
+        scheduler.release()
+    assert m.status() == {"busy": False, "runs": [], "external": None}
+
+
+def test_manager_holds_the_run_lock_while_it_runs(lab):
+    from antigrafa.runlock import RunLock
+
+    m = lab.manager
+    run = m.start(source="lab", target=None, guests=["1"], user="alice")
+    lab.gate.reading.wait(10)
+    holder = RunLock(lab.cfg.scheduler.directory).holder()
+    assert holder["by"] == "web" and holder["what"] == "backup" and holder["user"] == "alice"
+    assert m.status()["external"] is None  # its own run: not "external"
+    lab.gate.go.set()
+    _wait(lambda: not run.active)
+    assert RunLock(lab.cfg.scheduler.directory).holder() is None
+    with pytest.raises(ConfigError, match="no guest to back up"):
+        m.start(source="lab", target=None, every=True, exclude=["1", "2"])
+    assert RunLock(lab.cfg.scheduler.directory).holder() is None  # refused: released
+
+
+def test_manager_unwritable_lock_directory(lab, tmp_path):
+    from antigrafa.config import SchedulerConfig
+
+    (tmp_path / "file").write_text("x")
+    lab.cfg.scheduler = SchedulerConfig(data_dir=str(tmp_path / "file" / "s"))
+    with pytest.raises(ConfigError, match="cannot take the run lock in .*\\[scheduler\\] data_dir"):
+        lab.manager.start(source="lab", target=None, every=True)
+    assert not lab.manager.status()["busy"]
+
+
+def test_manager_runs_a_job_now_and_records_it(lab):
+    from antigrafa import scheduler as sched
+    from antigrafa.config import JobConfig
+
+    lab.cfg.jobs["nightly"] = JobConfig(name="nightly", all=True, exclude=["1"], schedule="0 2 * * *")
+    data = lab.manager.jobs()
+    assert data["scheduler"]["alive"] is False
+    [job] = data["jobs"]
+    assert job["name"] == "nightly" and job["schedule"] == "cron 0 2 * * *" and job["last"] is None
+    run = lab.manager.start_job("nightly", user="alice")
+    assert run.job == "nightly" and run.summary()["job"] == "nightly" and [g.id for g in run.guests] == ["2"]
+    _wait(lambda: not run.active)
+    state = sched.read_job_state(lab.cfg.scheduler.directory, "nightly")
+    assert state["last_start"] == run.started.isoformat()
+    assert state["last"]["state"] == "ok" and state["last"]["by"] == "web" and state["last"]["user"] == "alice"
+    assert lab.manager.jobs()["jobs"][0]["last"]["guests_ok"] == 1
+    with pytest.raises(ConfigError, match="unknown job nope"):
+        lab.manager.start_job("nope")
+
+
 def _backed_up(lab):
     """A backup of the container in the lab repository; its listing entry."""
     run = lab.manager.start(source="lab", target=None, guests=["2"], user="alice")
@@ -588,6 +654,18 @@ class FakeManager:
         if self.error:
             raise self.error
         self.restores = getattr(self, "restores", []) + [kwargs]
+        return self.run_obj
+
+    def jobs(self):
+        if self.error:
+            raise self.error
+        return {"scheduler": {"alive": False, "queue": [], "running": None},
+                "jobs": [{"name": "nightly", "what": "every guest of lab -> local", "schedule": "cron 0 2 * * *"}]}
+
+    def start_job(self, name, user=""):
+        if self.error:
+            raise self.error
+        self.jobs_run = getattr(self, "jobs_run", []) + [(name, user)]
         return self.run_obj
 
 
@@ -790,6 +868,40 @@ def test_restore_errors_become_json(client, error, status):
     client.fake.error = error
     response = client.post("/api/restores", json.dumps({"backup": "x"}), content_type="application/json")
     assert response.status_code == status and response.json() == {"error": str(error)}
+
+
+def test_jobs_listed_and_run_now(client):
+    assert client.get("/api/jobs").status_code == 401
+    assert client.post("/api/jobs/nightly/run").status_code == 401
+    _login(client)
+    data = client.get("/api/jobs").json()
+    assert data["jobs"][0]["name"] == "nightly" and data["scheduler"]["alive"] is False
+    response = client.post("/api/jobs/nightly/run")
+    assert response.status_code == 202 and response.json() == {"run": 7}
+    assert client.fake.jobs_run == [("nightly", "alice")]
+    assert client.get("/api/jobs/nightly/run").status_code == 405  # never by a simple link
+    assert client.post("/api/jobs").status_code == 405
+    client.fake.error = Busy("job nightly (started by the scheduler) is running")
+    response = client.post("/api/jobs/nightly/run")
+    assert response.status_code == 409 and "started by the scheduler" in response.json()["error"]
+    client.fake.error = ConfigError("unknown job x")
+    assert client.post("/api/jobs/x/run").status_code == 400
+    assert client.get("/api/jobs").status_code == 400
+
+
+def test_backup_page_has_the_jobs(client):
+    _login(client)
+    page = client.get("/").content.decode()
+    assert "Scheduled jobs" in page and "/api/jobs" in page and 'id="jobs"' in page
+    assert "Scheduled jobs" not in client.get("/restore/").content.decode()
+
+
+def test_status_says_what_runs_in_the_scheduler(client):
+    _login(client)
+    external = {"by": "scheduler", "job": "nightly", "label": "job nightly (started by the scheduler)"}
+    client.fake.status = lambda: {"busy": True, "runs": [], "external": external}
+    data = client.get("/api/status?kind=restore").json()
+    assert data["external"] == external and data["busy"] and data["run"] is None and data["active"] is None
 
 
 def test_posts_need_the_csrf_token(client):
