@@ -34,10 +34,16 @@ jobs:
         run: sudo podman build -t antigrafa-machine -f tools/ci/Containerfile tools/ci
 
       - name: Boot it
-        # --systemd=always: podman mounts the cgroups and tmpfs systemd needs, without
-        # --privileged (the host's devices stay out of reach)
+        # --systemd=always: podman mounts the cgroups and tmpfs systemd needs.
+        # SYS_ADMIN, apparmor=unconfined: the hardening of the units (PrivateTmp,
+        # ProtectSystem...) makes systemd build a mount namespace for each service, which
+        # needs CAP_SYS_ADMIN and mount (denied by the default AppArmor profile).
+        # Without them: "Failed to keep CAP_SYS_ADMIN", status 217/USER.
+        # Still not --privileged: the host's devices stay out of reach.
         run: |
-          sudo podman run -d --name machine --systemd=always -v "$PWD:/src:ro" antigrafa-machine
+          sudo podman run -d --name machine --systemd=always \
+            --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            -v "$PWD:/src:ro" antigrafa-machine
           tools/ci/wait-systemd.sh sudo podman exec machine
 
       - name: Install, first start

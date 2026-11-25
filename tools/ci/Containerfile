@@ -1,6 +1,6 @@
 # CI: a Debian machine with systemd as PID 1, to test deploy/install.sh and the services
 # (.github/workflows/deploy.yml). Run by podman, which prepares it for systemd itself:
-# no --privileged needed.
+# no --privileged needed (only CAP_SYS_ADMIN, for the hardening of the units).
 FROM debian:trixie
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
