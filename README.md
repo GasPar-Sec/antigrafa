@@ -258,13 +258,49 @@ the guests a token cannot see.
 
 ## Installation
 
+On a Linux machine with systemd (a VM is fine), from a copy of the repository:
+
+```sh
+sudo deploy/install.sh            # scheduler + web interface
+sudo deploy/install.sh --no-web   # the scheduler only (no Django)
+```
+
+The script installs Antigrafa as two services **started at boot**,
+`antigrafa-scheduler` ([recurring backups](#recurring-backups)) and `antigrafa-web`
+([web interface](#web-interface)), both run by a system account `antigrafa`:
+
+| Path | Content | Owner, mode |
+|---|---|---|
+| `/opt/antigrafa` | the program, in a virtual environment | root |
+| `/etc/antigrafa/antigrafa.toml` | the configuration (copied from `antigrafa.example.toml` the first time) | `root:antigrafa`, 0640 |
+| `/etc/antigrafa/id_ed25519` | the SSH key for the nodes (created the first time) | `antigrafa`, 0600 |
+| `/var/lib/antigrafa` | the account's home (`.ssh/known_hosts`), `web/` and `scheduler/` | `antigrafa`, 0750 |
+| `/var/log/antigrafa` | the [log file](#log-file) | `antigrafa`, 0750 |
+| `/etc/systemd/system/antigrafa-*.service` | the services ([deploy/systemd/](deploy/systemd/)) | root |
+| `/usr/local/bin/antigrafa` | the command: run as root, it runs as `antigrafa` | root |
+
+The first time, the services are enabled but not started: the script prints what is
+left to do (the token, the key to add on the nodes, their host keys, a web user), then
+`systemctl start antigrafa-scheduler antigrafa-web`. The targets, local directories
+and NFS shares, must be writable by `antigrafa`.
+
+Run the script again to **upgrade** from a newer copy: the configuration, the keys and
+the data are kept, and the running services are restarted (a running backup is then
+cancelled and cleaned up). `PYTHON=python3.12` picks another Python, `PREFIX` another
+directory than `/opt/antigrafa`.
+
+Run the commands through `/usr/local/bin/antigrafa` (or as `antigrafa`), not as root
+with `/opt/antigrafa/bin/antigrafa`: files created by root (web users, log archives,
+job results) could not be read by the services.
+
+Requires Python 3.11 or later (Debian 12, Ubuntu 24.04, RHEL 9 with `python3.11`) and
+its `venv` module (`apt install python3-venv`). On Python 3.14+, zstd comes from the
+standard library and the project has no dependencies. By hand, without the services:
+
 ```sh
 python3 -m venv /opt/antigrafa && /opt/antigrafa/bin/pip install .
 cp antigrafa.example.toml /etc/antigrafa/antigrafa.toml
 ```
-
-Requires Python 3.11 or later. On Python 3.14+, zstd comes from the standard library
-and the project has no dependencies.
 
 On Windows, the configuration goes to `%PROGRAMDATA%\antigrafa\antigrafa.toml`
 (`C:\ProgramData\antigrafa\antigrafa.toml`) instead of `/etc/antigrafa/antigrafa.toml`;
@@ -485,20 +521,8 @@ what it created removed (restore).
 | `antigrafa web adduser <name>` | create a user, or change its password (`--password-stdin` for scripts) |
 | `antigrafa web deluser <name>` | remove a user |
 
-Running as a service on Linux (systemd), `/etc/systemd/system/antigrafa-web.service`:
-
-```ini
-[Unit]
-Description=Antigrafa web interface
-After=network-online.target
-
-[Service]
-ExecStart=/opt/antigrafa/bin/antigrafa web serve
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
+On Linux, `deploy/install.sh` runs it as the `antigrafa-web` service, started at boot
+(see [Installation](#installation)).
 
 On Windows, `antigrafa web serve` runs in a console, or at startup through the Task
 Scheduler (run whether the user is logged on or not, with the account that has the SSH
@@ -577,22 +601,9 @@ Windows), which both service accounts must be able to write:
 The `backup` and `restore-guest` commands do not take this lock: a backup started by
 hand can run at the same time as a job.
 
-Running as a service on Linux (systemd), `/etc/systemd/system/antigrafa-scheduler.service`:
-
-```ini
-[Unit]
-Description=Antigrafa scheduler
-After=network-online.target
-
-[Service]
-ExecStart=/opt/antigrafa/bin/antigrafa scheduler
-Restart=on-failure
-# The running job is cancelled and its snapshots deleted: give it time
-TimeoutStopSec=300
-
-[Install]
-WantedBy=multi-user.target
-```
+On Linux, `deploy/install.sh` runs it as the `antigrafa-scheduler` service, started at
+boot (see [Installation](#installation)). Stopping it (`systemctl stop`) cancels the
+running job and deletes its snapshots: systemd waits up to 5 minutes.
 
 On Windows, through the Task Scheduler: at startup, run whether the user is logged on
 or not, with the account that has the SSH key, and without the "stop the task if it
@@ -633,6 +644,11 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest                        # tests + coverage (coverage.xml)
 .venv/bin/bandit -c pyproject.toml -r src   # security analysis
 ```
+
+The *Deployment* workflow ([.github/workflows/deploy.yml](.github/workflows/deploy.yml))
+runs `deploy/install.sh` on Debian, starts the services, reboots the machine and checks
+that they are back on their own: once in a systemd container (podman, restarted), once
+in a QEMU/KVM virtual machine (really rebooted). The checks are in [tools/ci/](tools/ci/).
 
 A full SonarQube analysis (tests, bandit, quality and security) runs in a throwaway
 Docker instance: see [tools/sonarqube/README.md](tools/sonarqube/README.md).

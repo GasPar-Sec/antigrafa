@@ -1,0 +1,37 @@
+[Unit]
+Description=Antigrafa web interface (HTTPS)
+Documentation=https://github.com/GasPar-Sec/antigrafa#web-interface
+# NFS targets: wait for the network and the remote mounts of /etc/fstab
+Wants=network-online.target
+After=network-online.target remote-fs.target
+
+[Service]
+Type=exec
+User=antigrafa
+Group=antigrafa
+ExecStart=/opt/antigrafa/bin/antigrafa web serve
+Restart=on-failure
+RestartSec=10
+# SIGTERM cancels the running backup or restore and cleans it up: give it time
+TimeoutStopSec=300
+UMask=0027
+
+# Hardening. Not ProtectSystem=strict nor ProtectHome: the targets are paths of the
+# configuration, anywhere on the machine, and the service must write to them.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
