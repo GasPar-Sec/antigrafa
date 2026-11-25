@@ -1,108 +1,108 @@
-# Antigrafa configuration: copy to /etc/antigrafa/antigrafa.toml
+# Antigrafa configuration. Copy it to /etc/antigrafa/antigrafa.toml, then edit it.
+# Windows: %PROGRAMDATA%\antigrafa\antigrafa.toml. Another file: antigrafa -c <file>.
 
-# --------------------------------------------------------------------------- sources
-# One [source.<name>] section per cluster or host to back up. "type" picks the
-# platform; the other keys belong to that platform. The name is used on the command
-# line (--source) and as the top directory of its backups in each target.
+# =========================================================================== sources
+# What to back up: one [source.<name>] per cluster. The name appears on the command
+# line (--source cluster1) and as a folder in each target.
 
 [source.cluster1]
-type = "proxmox"
-url = "https://pve1.example.lan:8006"
-token_id = "antigrafa@pve!backup"
-token_secret_file = "/etc/antigrafa/token"   # or token_secret = "..."
-# The certificate is verified. Proxmox uses its own CA: copy
-# /etc/pve/pve-root-ca.pem from a node and point ca_file at it.
+type = "proxmox"                               # the platform
+url = "https://pve1.example.lan:8006"          # address of the Proxmox API (any node)
+token_id = "antigrafa@pve!backup"              # API token: user@realm!name
+token_secret_file = "/etc/antigrafa/token"     # file holding the token secret (or token_secret = "...")
+
+# Proxmox certificate. Copy /etc/pve/pve-root-ca.pem from a node.
 ca_file = "/etc/antigrafa/pve-root-ca.pem"
-# Labs only: skip certificate verification (remove ca_file). Anyone on the network
-# path can then intercept the API token.
+# Test labs only: do not check the certificate (remove ca_file). Unsafe: the token can be stolen.
 # verify_tls = false
-# Chunks are hashed on the node (python3, present on Proxmox VE): only those that
-# changed since the previous backup cross the network. Costs CPU on the node, at low
-# priority. false: every chunk is sent, hashed here.
+
+# true: the node compares each piece of disk with the last backup and sends only what
+# changed. Uses a bit of CPU on the node. false: send everything.
 # remote_hash = true
-# How the disks are captured (no mode stops a guest). "proxmox": snapshot through the
-# API; Proxmox snapshots every disk of the guest and refuses if one is on a storage
-# without snapshots (LVM thick, iSCSI, raw file), even flagged backup=0. "storage":
-# Antigrafa freezes the guest (agent) and snapshots only the disks it backs up,
-# directly on their storage. "qemu": running VMs are backed up by QEMU itself, as PBS
-# does, on any storage; containers as "storage". "auto": for each guest, the first of
-# these that works: "proxmox" (if Proxmox can snapshot every disk and the token has
-# VM.Snapshot), else "storage", else "qemu". The choice is logged.
+
+# How the disks are frozen for the copy. No mode stops a guest.
+#   "proxmox": Proxmox takes a snapshot of the whole guest. Fails if a disk cannot have
+#              snapshots (LVM, iSCSI, raw file), even one excluded with backup=0.
+#   "storage": Antigrafa takes a snapshot of each backed-up disk, on its storage.
+#   "qemu":    QEMU keeps a frozen view of each disk while it is read. Works on every
+#              storage, for VMs. Containers are handled as "storage".
+#   "auto":    picks the best mode for each guest and writes its choice in the log.
 snapshot_mode = "auto"           # default: "proxmox"
-# VM disks on ZFS (zvols): the snapshot of a backup stays on the node as the base of
-# the next one, which then reads only what ZFS says changed. "auto" takes storage
-# snapshots for those guests. While a base exists, Proxmox refuses to roll the disk
-# back to an older snapshot: delete the base first (the next backup reads it in full).
+
+# ZFS disks of VMs: keep the last snapshot on the node, so the next backup reads only
+# the changed parts. While it exists, Proxmox refuses to roll back to an older snapshot:
+# delete the @antigrafa_... snapshot first (the next backup then reads the whole disk).
 # incremental = true
-# "qemu" mode: temporary images on the nodes, growing with what a VM writes during
-# its backup. If this filesystem fills up, the VM's writes fail: leave room. Created
-# 0700 if missing; refused if anyone but root can write to it.
+
+# "qemu" mode: folder on each node for temporary copies of what a VM writes during its
+# backup. If this disk fills up, the VM can no longer write: leave free space.
 # fleecing_dir = "/var/lib/antigrafa/fleecing"
 
-# One guest with its own snapshot_mode (by id), the source's for the others.
+# Give one guest (by id) its own mode; the others use the source's mode.
 # [source.cluster1.guests.650]
 # snapshot_mode = "qemu"
 
-# How Antigrafa reaches the nodes to read the snapshots.
+# How Antigrafa connects to the nodes with SSH to read the disks.
 [source.cluster1.ssh]
-user = "root"
-identity_file = "/etc/antigrafa/id_ed25519"
-# Fast cipher, useful above ~500 MiB/s:
+user = "root"                                  # SSH user on the nodes
+identity_file = "/etc/antigrafa/id_ed25519"    # private key; its public key goes in the nodes' authorized_keys
+# Faster encryption, useful above ~500 MiB/s:
 # options = ["Ciphers=aes128-gcm@openssh.com"]
 
-# SSH address of each node (otherwise the node name is used as-is).
+# SSH address of each node. Without it, the node name is used.
 [source.cluster1.nodes.pve1]
 host = "10.0.0.11"
 
 [source.cluster1.nodes.pve2]
 host = "10.0.0.12"
 
-# --------------------------------------------------------------------------- targets
+# =========================================================================== targets
+# Where backups go: one [target.<name>] per destination (--target local).
 
 [target.local]
-kind = "local"
+kind = "local"            # a folder on this machine
 path = "/srv/antigrafa"
 
 [target.nas]
-kind = "nfs"              # refuses to write if the share is not mounted
+kind = "nfs"              # an NFS share; nothing is written if it is not mounted
 path = "/mnt/nas/antigrafa"
-sync = "filesystem"       # "file" (fsync per chunk) | "filesystem" | "none"
+# When data is forced onto the disk:
+#   "file": after each piece (safest, slowest); "filesystem": once at the end (default);
+#   "none": let the system decide.
+sync = "filesystem"
 
-# --------------------------------------------------------------------------- web
-
-# Web interface: antigrafa web serve (needs pip install 'antigrafa[web]'). HTTPS only,
-# with a login: create users with antigrafa web adduser <name>.
+# =========================================================================== web
+# Web page: antigrafa web serve (needs pip install 'antigrafa[web]').
+# HTTPS only, with a login. Create a user: antigrafa web adduser <name>.
 [web]
-listen = "0.0.0.0"            # every interface; "127.0.0.1": this machine only
+listen = "0.0.0.0"            # every network card; "127.0.0.1": this machine only
 port = 8443
-# Users, sessions, secret key, generated certificate.
+# Users, sessions and the generated certificate.
 # Default: /var/lib/antigrafa/web (Linux), %PROGRAMDATA%\antigrafa\web (Windows).
 # data_dir = "/var/lib/antigrafa/web"
-# Your own certificate (both or neither). Without them, a self-signed certificate is
-# created in <data_dir>/tls/ on the first start.
+# Your own certificate (both or none). Without them, one is created on the first start:
+# check its fingerprint, printed at startup, against the browser's.
 # cert_file = "/etc/antigrafa/web.pem"
 # key_file = "/etc/antigrafa/web.key"
-# Names the browser may use to reach the page. Default: this machine's names and
-# addresses. Add the DNS name when the page is reached through it.
+# Names used in the browser to reach the page. Default: this machine's names and addresses.
 # allowed_hosts = ["backup.example.lan"]
 
-# --------------------------------------------------------------------------- recurring jobs
-
-# Backups at fixed times, run by the scheduler service: antigrafa scheduler.
-# antigrafa job list: the jobs, their next run and last result; antigrafa job run <name>:
-# one now. One run at a time: a job due while another backup or restore runs waits for
-# it to end (in the queue, never twice).
+# =========================================================================== scheduled backups
+# Backups that run by themselves, started by: antigrafa scheduler.
+# antigrafa job list: the jobs and their last result. antigrafa job run <name>: run one now.
+# Only one backup or restore runs at a time: the others wait their turn.
 #
-# Guests: all = true (every guest of the source, new ones included, minus exclude), or
-# guests = [...]. source and target may be left out when only one is configured.
-# When: one of
-#   schedule = "0 2 * * *"       cron: minute hour day month weekday (*/6, 1-5, mon-fri,
-#                                @daily, @hourly...); times missed while the scheduler
-#                                was not running are not caught up
-#   every = "6h"                 from the start of the previous run (m, h, d); a job
-#                                that never ran is due as soon as the scheduler starts
-#   at = "02:00"                 or ["02:00", "14:00"], with days = ["mon", "fri"]
-#                                (every day without it)
+# Which guests:
+#   all = true        every guest, new ones included (exclude = [...] to skip some)
+#   guests = [...]    only these
+# source and target can be left out when only one of each exists.
+#
+# When (pick one):
+#   schedule = "0 2 * * *"   cron format: minute hour day month weekday (@daily works).
+#                            A time missed while the scheduler was stopped is skipped.
+#   every = "6h"             every 30m, 6h, 1d... counted from the last start.
+#   at = "02:00"             or ["02:00", "14:00"]; add days = ["mon", "fri"] to limit the days.
+# Changes are picked up within 15 seconds, no restart needed.
 [job.nightly]
 source = "cluster1"
 target = "nas"
@@ -115,51 +115,50 @@ source = "cluster1"
 target = "local"
 guests = [101, 102]
 every = "6h"
-# enabled = false             # kept, but not run by the scheduler
+# enabled = false             # keep the job but do not run it
 
-# Where the scheduler and the web interface keep the run lock (one run at a time, for
-# both) and each job's last result. Writable by the accounts of both services.
+# Folder shared by the scheduler and the web page (lock, job results). Both services
+# must be able to write in it.
 # Default: /var/lib/antigrafa/scheduler (Linux), %PROGRAMDATA%\antigrafa\scheduler (Windows).
 # [scheduler]
 # data_dir = "/var/lib/antigrafa/scheduler"
 
-# --------------------------------------------------------------------------- log file
-
-# Every command also writes its log to a file: INFO, DEBUG with -v (-q only quiets the
-# terminal). Past max_size_mib, the file is compressed next to it
-# (antigrafa-2026-11-20T10-15-00.log.zip) and a new one starts.
+# =========================================================================== log file
+# Every command writes its log to a file (more details with -v; -q only quiets the screen).
 [log]
 # Default: /var/log/antigrafa/antigrafa.log (Linux),
 # %PROGRAMDATA%\antigrafa\antigrafa.log (Windows). "none": no log file.
 # file = "/var/log/antigrafa/antigrafa.log"
-max_size_mib = 1024           # size of the .log file before it is archived
-max_archives = 5              # archives kept, the oldest removed first
-# "zip", "tar.gz", "rar" or "7z". rar and 7z need their program: rar (WinRAR on
-# Windows), 7z / 7zz / 7za (7-Zip on Windows); without it, the archives are zip.
+max_size_mib = 1024           # when the file reaches this size, it is archived and a new one starts
+max_archives = 5              # number of archives kept; the oldest are deleted
+# Archive format: "zip", "tar.gz", "rar" or "7z". rar and 7z need their program
+# installed (WinRAR, 7-Zip on Windows); without it, zip is used.
 compression = "zip"
 # 0 (no compression) to 9 (smallest, slowest); rar: 0 to 5.
 # Default: 6 (zip, tar.gz), 3 (rar), 5 (7z).
 # compression_level = 6
 
-# --------------------------------------------------------------------------- tuning
-
+# =========================================================================== speed
+# The defaults suit most cases.
 [tuning]
-chunk_size_mib = 4
-max_parallel_guests = 4       # guests backed up at the same time (all hosts)
-max_parallel_per_host = 1     # on a single host
+chunk_size_mib = 4            # disks are cut in pieces of this size
+max_parallel_guests = 4       # guests backed up at the same time
+max_parallel_per_host = 1     # guests backed up at the same time on one node
 
-# Destination: target write latency per chunk; above it, concurrency goes down.
+# Destination: Antigrafa writes more pieces at once while the destination keeps up,
+# fewer when a write takes longer than writer_target_latency_ms.
 writer_min_concurrency = 1
 writer_max_concurrency = 8
 writer_start_concurrency = 2
 writer_target_latency_ms = 250
-compression_level = 3
+# Compression (zstd, 1 = fast to 9 = small). It goes up when the destination is slow.
+compression_level = 3         # starting level
 compression_min_level = 1
 compression_max_level = 9
 
-# Source: snapshot reads slow down when the host's iowait rises.
-source_max_mib_s = 0          # 0 = no fixed cap
-source_min_mib_s = 10
-host_iowait_high = 0.10
-host_iowait_low = 0.03
-low_priority = true           # read at low I/O and CPU priority on the host
+# Source: reading slows down when the node's disks are busy (iowait), so guests keep their speed.
+source_max_mib_s = 0          # maximum read speed in MiB/s; 0 = no limit
+source_min_mib_s = 10         # never read slower than this
+host_iowait_high = 0.10       # above 10% iowait, read slower
+host_iowait_low = 0.03        # below 3% iowait, read faster
+low_priority = true           # read with low priority on the node, behind the guests
