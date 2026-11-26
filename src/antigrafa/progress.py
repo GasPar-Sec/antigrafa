@@ -221,14 +221,13 @@ class Progress:
                 "percent": _fraction(self.done_known, total, approximate) * 100 if known else None,
                 "approximate": approximate,
                 "rate": rate,
-                "eta": left / rate if known and rate and left > 0 else None,
+                "eta": self._overall_eta(left, rate) if known else None,
                 "elapsed": elapsed,
                 "tasks": [self._task_snapshot(t) for t in self._running],
             }
 
     def _task_snapshot(self, task: Task) -> dict:
         elapsed = max(self._clock() - task.start, 1e-6)
-        rate = task.done / elapsed
         total = task.total or None
         return {
             "name": task.name,
@@ -236,9 +235,25 @@ class Progress:
             "total": total,
             "percent": _fraction(task.done, total, task.approximate) * 100 if total else None,
             "approximate": task.approximate,
-            "rate": rate,
-            "eta": (total - task.done) / rate if total and rate and total > task.done else None,
+            "rate": task.done / elapsed,
+            "eta": self._task_eta(task),
         }
+
+    def _task_eta(self, task: Task) -> float | None:
+        """Time ``task`` still needs at its own rate; None when unknown or done."""
+        rate = task.done / max(self._clock() - task.start, 1e-6)
+        if task.total and rate and task.total > task.done:
+            return (task.total - task.done) / rate
+        return None
+
+    def _overall_eta(self, left: float, rate: float) -> float | None:
+        """Time left for the whole run: ``left`` at the average ``rate``, but never less
+        than the slowest running task needs. The average counts what went by fast (chunks
+        unchanged since the last backup): one slow disk at the end would show "ETA 1s"."""
+        if not (rate and left > 0):
+            return None
+        tasks = [eta for eta in (self._task_eta(t) for t in self._running) if eta is not None]
+        return max([left / rate, *tasks])
 
     # ----------------------------------------------------------------- text
 
@@ -284,9 +299,9 @@ class Progress:
             fields.append((5, self._amount(self.done)))
         if self.done:
             fields.append((4, f"{self._amount(rate)}/s"))
-            left = total - self.done_known
-            if total and not self.unknown_open and left > 0:  # never when past the estimate
-                fields.append((2, f"ETA {human_duration(left / rate)}"))
+            eta = self._overall_eta(total - self.done_known, rate) if total and not self.unknown_open else None
+            if eta is not None:  # never when past the estimate
+                fields.append((2, f"ETA {human_duration(eta)}"))
         fields.append((6, human_duration(elapsed)))
         if self.status:
             fields.append((2, self.status))
@@ -308,8 +323,9 @@ class Progress:
             fields.append((0, self._amount(task.done)))
         if task.done:
             fields.append((4, f"{self._amount(rate)}/s"))
-            if task.total and task.total > task.done:
-                fields.append((2, f"ETA {human_duration((task.total - task.done) / rate)}"))
+            eta = self._task_eta(task)
+            if eta is not None:
+                fields.append((2, f"ETA {human_duration(eta)}"))
         return fields
 
     def _bar(self, done: int, total: int, approximate: bool) -> str:
