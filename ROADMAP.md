@@ -98,6 +98,25 @@ Replace or complement the iowait with:
 - [ ] Report which signal triggered each slowdown in the log and the web page
 - [ ] Check the I/O scheduler of the disks read; warn when `ionice` has no effect
 
+## Diagnostics: show where a slow backup waits
+
+A backup can be slow while the node, the Antigrafa machine and the destination are all
+idle. Seen on 2026-11-26: a VM read at ~430 KiB/s because ~18% of the packets from its
+node arrived out of order (`rcv_ooopack` in `ss -ti`), so TCP kept slowing down. Finding
+it took `ps`, `zpool iostat`, `iostat` and `ss` on three machines.
+
+- [ ] Per disk, time spent in each stage: waiting for data from the node, checking the
+      destination (`store.has`), waiting for a write slot, writing; in the report and
+      on the web page, with the stage that limits the rate
+- [ ] Network rate and health of each SSH stream (from `ss -ti` on the Antigrafa
+      machine): received rate, RTT compared to its minimum, out-of-order and duplicate
+      packets
+- [ ] Warning when the network looks like the cause: low rate while the node and the
+      destination are idle, high out-of-order or retransmission rate (e.g. a bond in
+      `balance-rr`, a LACP mismatch, a faulty port)
+- [ ] `antigrafa diagnose <node>`: measure the raw rates (disk read on the node, network
+      to the Antigrafa machine, write to the target) to compare with a backup
+
 ## Features
 
 - [x] Chunks hashed on the source host (`remote_hash`): only changed chunks cross the network
