@@ -622,6 +622,17 @@ class ProxmoxPlatform(Platform):
 
         return ProxmoxRestore(self, manifest, disks, request, progress, cancel).run()
 
+    def hosts(self) -> list[dict]:
+        nodes = sorted(self.api.nodes(), key=lambda n: str(n.get("node", "")))
+        return [
+            {
+                "name": str(n.get("node", "")),
+                "status": str(n.get("status") or "unknown"),
+                "address": self.settings.node_host(str(n.get("node", ""))),
+            }
+            for n in nodes
+        ]
+
     def restore_locations(self, kind: str) -> list[dict]:
         from .restore import restore_locations
 

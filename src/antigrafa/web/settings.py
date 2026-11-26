@@ -86,7 +86,7 @@ def build(web: WebConfig, config_path: str) -> dict:
             {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
         ],
         "LOGIN_URL": "login",
-        "LOGIN_REDIRECT_URL": "index",
+        "LOGIN_REDIRECT_URL": "home",
         "LOGOUT_REDIRECT_URL": "login",
         # HTTPS only: cookies never sent in clear, not readable by scripts
         "SESSION_COOKIE_SECURE": True,

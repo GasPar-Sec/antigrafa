@@ -73,8 +73,14 @@ def _page(request: HttpRequest, page: str):
 
 @login_required
 @require_GET
-def index(request: HttpRequest):
-    """The backup page."""
+def home(request: HttpRequest):
+    """The home page: the backups running, this machine, its hosts and disks."""
+    return render(request, "antigrafa/home.html", {"page": "home"})
+
+
+@login_required
+@require_GET
+def backup_page(request: HttpRequest):
     return _page(request, "backup")
 
 
@@ -106,6 +112,20 @@ def status(request: HttpRequest):
         run = manager.run(data["runs"][0]["id"])
     data["run"] = run.details(_int(request.GET.get("logs_after")) or 0) if run else None
     return JsonResponse(data)
+
+
+@require_GET
+@api
+def running(request: HttpRequest):
+    """The backups running now, each with its overall progress (the home page)."""
+    return JsonResponse({"running": get_manager().running()})
+
+
+@require_GET
+@api
+def overview(request: HttpRequest):
+    """This machine, the recent backups, the hosts of each source and the disks."""
+    return JsonResponse(get_manager().overview())
 
 
 @require_GET

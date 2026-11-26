@@ -1,0 +1,61 @@
+{% comment %}
+Functions shared by every page: building elements, formatting, calling the API, a progress line.
+{% endcomment %}
+<script>
+"use strict";
+const CSRF = document.querySelector('meta[name="csrf-token"]').content;
+const $ = (id) => document.getElementById(id);
+
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = text;  // never innerHTML: names come from the hypervisor
+  if (cls) node.className = cls;
+  return node;
+}
+
+function bytes(n) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (Math.abs(n) >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return i === 0 ? `${Math.round(n)} B` : `${n.toFixed(1)} ${units[i]}`;
+}
+
+function duration(s) {
+  s = Math.floor(s);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+function time(iso) {
+  return iso ? new Date(iso).toLocaleString() : "";
+}
+
+async function call(url, options = {}) {
+  options.headers = Object.assign({"X-CSRFToken": CSRF, "Content-Type": "application/json"}, options.headers || {});
+  options.credentials = "same-origin";
+  const response = await fetch(url, options);
+  if (response.status === 401) { window.location = "{% url 'login' %}"; throw new Error("not logged in"); }
+  let data = {};
+  try { data = await response.json(); } catch (e) { /* empty body */ }
+  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  return data;
+}
+
+function progressLine(name, p, cls) {
+  const line = el("div", null, "progress-line" + (cls ? " " + cls : ""));
+  const bar = el("div", null, "bar" + (p.percent === null ? " unknown" : ""));
+  const fill = el("span");
+  fill.style.width = `${p.percent === null ? 0 : p.percent}%`;
+  bar.append(fill);
+  const parts = [];
+  if (p.percent !== null) parts.push(`${p.approximate ? "~" : ""}${Math.floor(p.percent)}%`);
+  parts.push(p.total ? `${bytes(p.done)} / ${p.approximate ? "~" : ""}${bytes(p.total)}` : bytes(p.done));
+  if (p.done) parts.push(`${bytes(p.rate)}/s`);
+  if (p.eta !== null && p.eta !== undefined) parts.push(`ETA ${duration(p.eta)}`);
+  line.append(el("div", name), bar, el("div", parts.join("  ·  "), "numbers"));
+  return line;
+}
+
+</script>

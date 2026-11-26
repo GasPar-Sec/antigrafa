@@ -227,6 +227,12 @@ class Platform(ABC):
         """
         raise PlatformError(f"restoring guests is not supported on {self.type}")
 
+    def hosts(self) -> list[dict]:
+        """The hosts of this source, for the overview of the web page: ``name``,
+        ``status`` ("online", "offline"...) and ``address`` (how Antigrafa reaches it).
+        [] when the platform cannot list them."""
+        return []
+
     def restore_locations(self, kind: str) -> list[dict]:
         """Where a guest of ``kind`` can be restored: each host, and its storages that can
         hold its disks.

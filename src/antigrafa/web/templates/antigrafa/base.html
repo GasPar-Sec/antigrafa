@@ -9,13 +9,13 @@
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --text: #1d232b; --muted: #5f6b7a; --line: #dde2e8;
   --accent: #2c6bed; --accent-text: #ffffff; --ok: #1f8a4c; --bad: #c4352b; --warn: #b26a00;
-  --bar: #e6eaf0; --code: #f0f2f5;
+  --bar: #e6eaf0; --code: #f0f2f5; --other: #8a94a3;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #14181d; --panel: #1c2128; --text: #e6e9ed; --muted: #9aa5b1; --line: #2e353e;
     --accent: #5b8cff; --accent-text: #0d1117; --ok: #4cc27f; --bad: #f0675d; --warn: #e3a33b;
-    --bar: #2a313a; --code: #161a20;
+    --bar: #2a313a; --code: #161a20; --other: #6b7684;
   }
 }
 * { box-sizing: border-box; }
@@ -76,8 +76,43 @@ pre { background: var(--code); border: 1px solid var(--line); border-radius: 6px
 .choices { margin-top: 8px; }
 .choices label { display: block; color: inherit; font-size: 14.5px; margin: 5px 0; }
 .choices label:has(input:disabled) { opacity: .45; }
+/* Home page: backups running (each leads to the Backup page), stat tiles, hosts, disks */
+.running-run { display: block; color: inherit; text-decoration: none; padding: 8px 10px; margin: 0 -10px;
+  border-radius: 6px; }
+.running-run:hover, .running-run:focus-visible { background: var(--bg); }
+.running-what { font-size: 13.5px; color: var(--muted); }
+.machine { margin: -6px 0 12px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.tile { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.tile .label { color: var(--muted); font-size: 13px; }
+.tile .value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .sub { color: var(--muted); font-size: 12.5px; }
+h3 { font-size: 14px; margin: 14px 0 6px; }
+.hosts { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 4px 0; font-size: 13.5px; }
+.host { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border: 1px solid var(--line);
+  border-radius: 999px; }
+.host .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
+.host.online .dot { background: var(--ok); }
+.host.offline .dot { background: var(--bad); }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 12.5px; margin-bottom: 4px; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px;
+  vertical-align: -1px; }
+/* Fixed columns: the bars of every disk line up */
+.disk-line { display: grid; grid-template-columns: minmax(150px, 240px) minmax(120px, 1fr) minmax(0, 430px); gap: 4px 12px;
+  align-items: center; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+.disk-line:last-child { border-bottom: 0; }
+.disk-line .numbers { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.disk-line .where { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+/* Thin segmented bar: Antigrafa, other data, then the free space (the track) */
+.space { display: flex; height: 8px; background: var(--bar); border-radius: 999px; overflow: hidden; }
+.space > span { height: 100%; }
+.space > span + span { border-left: 2px solid var(--panel); }  /* 2px gap between the parts */
+.antigrafa-fill { background: var(--accent); }
+.other-fill { background: var(--other); }
+.free-fill { background: var(--bar); border: 1px solid var(--line); }
 @media (max-width: 640px) {
-  .progress-line { grid-template-columns: 1fr; gap: 3px; }
+  .progress-line, .disk-line { grid-template-columns: 1fr; gap: 3px; }
+  .disk-line .numbers { text-align: left; }
 }
 </style>
 </head>
