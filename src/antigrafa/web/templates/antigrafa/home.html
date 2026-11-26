@@ -1,0 +1,217 @@
+{% extends "antigrafa/base.html" %}
+{% comment %}
+The home page: the backups running now (each line leads to the Backup page), this machine,
+the recent results, the hosts of each source, and the disks with the space Antigrafa takes.
+{% endcomment %}
+{% block title %}Antigrafa{% endblock %}
+{% block body %}
+{% include "antigrafa/header.html" %}
+<main>
+  <section id="running">
+    <h2>Backups running</h2>
+    <p class="muted" id="running-empty">No backup running.</p>
+    <div id="running-list"></div>
+    <p class="error" id="running-error"></p>
+  </section>
+
+  <section id="overview">
+    <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 8px;">
+      <h2 style="margin: 0;">This machine <span id="machine-name" class="muted"></span></h2>
+      <button id="load-overview" type="button">Reload</button>
+    </div>
+    <p class="muted machine" id="machine"></p>
+    <p class="error" id="overview-error"></p>
+    <div class="kpis" id="kpis"></div>
+    <div id="sources"></div>
+    <h3>Disks</h3>
+    <div class="legend" aria-hidden="true">
+      <span><span class="swatch antigrafa-fill"></span>Antigrafa</span>
+      <span><span class="swatch other-fill"></span>Other data</span>
+      <span><span class="swatch free-fill"></span>Free</span>
+    </div>
+    <div id="disks"><p class="muted">Loading…</p></div>
+  </section>
+
+</main>
+
+{% include "antigrafa/helpers.html" %}
+<script>
+"use strict";
+
+// ------------------------------------------------------------------ backups running
+
+let runningTimer = null;
+let runningCount = null;  // backups running at the last look: the overview is reloaded when it changes
+
+function runningLine(r) {
+  // The whole backup, not each guest: x/y guests, %, done / total, rate, ETA
+  const link = el("a", null, "running-run");
+  link.href = `{% url 'backup_page' %}?run=${encodeURIComponent(r.id)}`;
+  link.title = "Follow this backup on the Backup page";
+  const what = `#${r.id} ${r.job ? "job " + r.job + " · " : ""}${r.source} → ${r.target}`
+    + `${r.state === "cancelling" ? " · cancelling" : ""}`;
+  link.append(el("div", what, "running-what"));
+  const guests = `${r.guests_done}/${r.guests_total} guests`;
+  if (r.progress) {
+    const line = progressLine(guests, r.progress, "overall");
+    line.querySelector(".numbers").textContent += `  ·  ${duration(r.progress.elapsed)}`;
+    link.append(line);
+  } else {
+    link.append(el("div", `${guests} · starting…`, "muted"));
+  }
+  return link;
+}
+
+async function loadRunning() {
+  clearTimeout(runningTimer);
+  let again = 15000;
+  try {
+    const data = await call("{% url 'running' %}");
+    $("running-list").replaceChildren(...data.running.map(runningLine));
+    $("running-empty").classList.toggle("hidden", data.running.length > 0);
+    $("running-error").textContent = "";
+    if (data.running.length) again = 3000;
+    if (runningCount !== null && runningCount !== data.running.length) loadOverview();  // a backup ended
+    runningCount = data.running.length;
+  } catch (e) {
+    $("running-error").textContent = e.message;
+  }
+  runningTimer = setTimeout(loadRunning, again);
+}
+
+// ------------------------------------------------------------------ overview
+
+let overviewTimer = null;
+
+function uptime(s) {
+  const d = Math.floor(s / 86400);
+  return d ? `${d}d ${Math.floor((s % 86400) / 3600)}h` : duration(s);
+}
+
+function percent(part, total) {
+  return total ? `${Math.round((part / total) * 100)}%` : "0%";
+}
+
+function tile(label, value, sub, cls) {
+  const box = el("div", null, "tile");
+  box.append(el("div", label, "label"), el("div", value, "value" + (cls ? " " + cls : "")));
+  if (sub) box.append(el("div", sub, "sub"));
+  return box;
+}
+
+function showMachine(m) {
+  $("machine-name").textContent = `· ${m.hostname}`;
+  const parts = [m.os, `Antigrafa ${m.version}`];
+  if (m.uptime !== null) parts.push(`up ${uptime(m.uptime)}`);
+  if (m.cpus) parts.push(`${m.cpus} CPUs`);
+  if (m.load !== null) parts.push(`load ${m.load.toFixed(2)}`);
+  if (m.memory) parts.push(`memory ${bytes(m.memory.total - m.memory.available)} / ${bytes(m.memory.total)} used`);
+  $("machine").textContent = parts.join("  ·  ");
+}
+
+function showKpis(data) {
+  const b = data.backups;
+  const hosts = data.sources.flatMap((s) => s.hosts);
+  const online = hosts.filter((h) => h.status === "online").length;
+  const targets = data.disks.flatMap((d) => d.targets).length;
+  const unreachable = data.disks.filter((d) => d.error).length;
+  const since = b.runs ? `over the last ${b.runs} run${b.runs > 1 ? "s" : ""}` : "no backup listed yet";
+  $("kpis").replaceChildren(
+    tile("Guests backed up", `✓ ${b.guests_ok}`, b.last_ok ? `last ${time(b.last_ok)}` : since, "state-ok"),
+    tile("Guests failed", `${b.guests_failed ? "✕" : "✓"} ${b.guests_failed}`,
+      b.last_failed ? `last ${time(b.last_failed)}` : since, b.guests_failed ? "state-failed" : ""),
+    tile("Nodes online", `${online} / ${hosts.length}`,
+      `${data.sources.length} source${data.sources.length > 1 ? "s" : ""}`, online < hosts.length ? "state-failed" : ""),
+    tile("Destinations", `${targets}`, unreachable ? `${unreachable} unreachable` : "all reachable",
+      unreachable ? "state-failed" : ""),
+  );
+}
+
+function showSources(sources) {
+  const box = $("sources");
+  box.replaceChildren();
+  for (const s of sources) {
+    const line = el("div", null, "hosts");
+    line.append(el("strong", s.name), el("span", s.type ? `(${s.type})` : "", "muted"));
+    if (s.error) line.append(el("span", s.error, "error"));
+    for (const h of s.hosts) {
+      const chip = el("span", null, `host ${h.status}`);
+      chip.title = `${h.name}: ${h.status}, reached at ${h.address}`;
+      chip.append(el("span", null, "dot"), el("span", h.name), el("span", h.status, "muted"));
+      line.append(chip);
+    }
+    if (!s.error && !s.hosts.length) line.append(el("span", "no host listed", "muted"));
+    box.append(line);
+  }
+}
+
+function spaceBar(d) {
+  const bar = el("div", null, "space");
+  const antigrafa = d.antigrafa === null ? 0 : d.antigrafa;
+  const other = Math.max(0, d.used - antigrafa);
+  const parts = [["antigrafa-fill", "Antigrafa", antigrafa], ["other-fill", "Other data", other]];
+  for (const [cls, name, value] of parts) {
+    if (!value) continue;  // a part at zero draws nothing
+    const seg = el("span", null, cls);
+    seg.style.width = `${(value / d.total) * 100}%`;
+    seg.title = `${name}: ${bytes(value)} (${percent(value, d.total)})`;
+    bar.append(seg);
+  }
+  bar.setAttribute("role", "img");
+  bar.setAttribute("aria-label", `Antigrafa ${d.antigrafa === null ? "being measured" : bytes(antigrafa)}, `
+    + `other data ${bytes(other)}, free ${bytes(d.free)}, of ${bytes(d.total)}`);
+  bar.title = `Free: ${bytes(d.free)} (${percent(d.free, d.total)})`;
+  return bar;
+}
+
+function showDisks(disks) {
+  const box = $("disks");
+  box.replaceChildren();
+  for (const d of disks) {
+    const line = el("div", null, "disk-line");
+    const name = el("div");
+    name.append(el("div", d.system ? `${d.name} (${d.path})` : d.targets.map((t) => t.name).join(", ")));
+    const where = d.targets.map((t) => {
+      const count = t.backups === null || t.backups === undefined ? "" : ` · ${t.backups} backup${t.backups === 1 ? "" : "s"}`;
+      return `${d.system || d.targets.length > 1 ? t.name + ": " : ""}${t.path}${count}`;
+    });
+    if (where.length) name.append(el("div", (d.system ? "destination " : "") + where.join(" · "), "where"));
+    line.append(name);
+    if (d.error) {
+      line.append(el("div", d.error, "error"), el("div", "unreachable", "numbers"));
+    } else {
+      // No destination on this disk (the system disk alone): no share of Antigrafa to give
+      const share = !d.targets.length ? null
+        : d.antigrafa === null ? "Antigrafa: measuring…"
+        : `Antigrafa ${bytes(d.antigrafa)} (${percent(d.antigrafa, d.total)})`;
+      const other = Math.max(0, d.used - (d.antigrafa || 0));
+      const numbers = [share, `other ${bytes(other)}`, `free ${bytes(d.free)} / ${bytes(d.total)}`].filter(Boolean);
+      line.append(spaceBar(d), el("div", numbers.join("  ·  "), "numbers"));
+    }
+    box.append(line);
+  }
+  if (!disks.length) box.append(el("p", "No disk to show.", "muted"));
+}
+
+async function loadOverview() {
+  clearTimeout(overviewTimer);
+  let again = 60000;
+  try {
+    const data = await call("{% url 'overview' %}");
+    showMachine(data.machine);
+    showKpis(data);
+    showSources(data.sources);
+    showDisks(data.disks);
+    $("overview-error").textContent = "";
+    if (data.disks.some((d) => d.measuring && d.antigrafa === null)) again = 5000;  // until measured
+  } catch (e) {
+    $("overview-error").textContent = e.message;
+  }
+  overviewTimer = setTimeout(loadOverview, again);
+}
+
+$("load-overview").addEventListener("click", loadOverview);
+loadRunning();
+loadOverview();
+</script>
+{% endblock %}

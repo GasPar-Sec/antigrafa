@@ -531,7 +531,8 @@ def test_snapshot_gives_plain_values():
     assert (s["done"], s["total"]) == (600, 1400)
     assert s["percent"] == pytest.approx(600 / 1400 * 100)
     assert s["approximate"] and s["rate"] == pytest.approx(60.0) and s["elapsed"] == pytest.approx(10.0)
-    assert s["eta"] == pytest.approx(800 / 60)
+    # 800 left at 60/s would be 13 s, but 150/rootfs alone needs 300 more at 10/s: 30 s
+    assert s["eta"] == pytest.approx(30.0)
     first, second = s["tasks"]
     assert first == {
         "name": "100/scsi0", "done": 500, "total": 1000, "percent": 50.0, "approximate": False,
@@ -584,3 +585,22 @@ def test_announced_size_is_never_negative():
     p = _progress(enabled=False)
     p.expect("1/scsi0", -5)
     assert p.snapshot()["total"] is None  # nothing to measure against yet
+
+
+def test_overall_eta_waits_for_the_slowest_disk():
+    # An incremental backup: one disk went by fast (unchanged chunks), one is slow
+    clock = Clock()
+    p = _progress(clock, label="backup")
+    fast = p.task(1000 * 1024**2, name="1/scsi0")
+    slow = p.task(100 * 1024**2, name="2/rootfs")
+    clock.now += 10
+    fast.advance(990 * 1024**2)
+    slow.advance(1 * 1024**2)  # 0.1 MiB/s: 99 MiB left take 990 s
+    snap = p.snapshot()
+    assert snap["rate"] == pytest.approx(99.1 * 1024**2)  # 109 MiB left at that rate: 1 s
+    assert snap["eta"] == pytest.approx(990)  # but the slow disk needs 990 s
+    assert {t["name"]: round(t["eta"]) for t in snap["tasks"]} == {"1/scsi0": 0, "2/rootfs": 990}
+    assert "ETA 16m 30s" in p.line()
+    fast.close()
+    slow.close()
+    assert p.snapshot()["eta"] is None  # nothing left

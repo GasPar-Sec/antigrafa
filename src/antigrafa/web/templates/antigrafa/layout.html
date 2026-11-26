@@ -5,19 +5,7 @@ run panel and the list of the page's runs. One run at a time for the whole serve
 running run is pointed to, not shown.
 {% endcomment %}
 {% block body %}
-<header>
-  <div class="brand">
-    <h1>Antigrafa</h1>
-    <nav>
-      <a href="{% url 'index' %}"{% if page == "backup" %} aria-current="page"{% endif %}>Backup</a>
-      <a href="{% url 'restore_page' %}"{% if page == "restore" %} aria-current="page"{% endif %}>Restore</a>
-    </nav>
-  </div>
-  <div class="who">
-    <span>{{ user.get_username }}</span>
-    <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button type="submit">Sign out</button></form>
-  </div>
-</header>
+{% include "antigrafa/header.html" %}
 <main>
   {% if config_error %}<section><p class="error">Configuration: {{ config_error }}</p></section>{% endif %}
   <section id="other-run" class="hidden"><p id="other-run-text" style="margin: 0;"></p></section>
@@ -57,12 +45,11 @@ running run is pointed to, not shown.
   </section>
 </main>
 
+{% include "antigrafa/helpers.html" %}
 <script>
 "use strict";
 const PAGE = "{{ page }}";  // the kind of runs this page shows: backup or restore
-const PAGES = {backup: "{% url 'index' %}", restore: "{% url 'restore_page' %}"};
-const CSRF = document.querySelector('meta[name="csrf-token"]').content;
-const $ = (id) => document.getElementById(id);
+const PAGES = {backup: "{% url 'backup_page' %}", restore: "{% url 'restore_page' %}"};
 let selectedRun = null;   // run shown; null: the most recent one of this page
 let shownRun = null;      // run whose log is on screen
 let logTotal = 0;         // log lines of that run already shown
@@ -75,59 +62,7 @@ let onStatus = () => {};  // the page's own reaction to busy changing
   if (Number.isInteger(asked) && asked > 0) selectedRun = asked;  // a link from the other page
 }
 
-function el(tag, text, cls) {
-  const node = document.createElement(tag);
-  if (text !== undefined && text !== null) node.textContent = text;  // never innerHTML: names come from the hypervisor
-  if (cls) node.className = cls;
-  return node;
-}
-
-function bytes(n) {
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let i = 0;
-  while (Math.abs(n) >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-  return i === 0 ? `${Math.round(n)} B` : `${n.toFixed(1)} ${units[i]}`;
-}
-
-function duration(s) {
-  s = Math.floor(s);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
-  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
-}
-
-function time(iso) {
-  return iso ? new Date(iso).toLocaleString() : "";
-}
-
-async function call(url, options = {}) {
-  options.headers = Object.assign({"X-CSRFToken": CSRF, "Content-Type": "application/json"}, options.headers || {});
-  options.credentials = "same-origin";
-  const response = await fetch(url, options);
-  if (response.status === 401) { window.location = "{% url 'login' %}"; throw new Error("not logged in"); }
-  let data = {};
-  try { data = await response.json(); } catch (e) { /* empty body */ }
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-  return data;
-}
-
 // ------------------------------------------------------------------ runs
-
-function progressLine(name, p, cls) {
-  const line = el("div", null, "progress-line" + (cls ? " " + cls : ""));
-  const bar = el("div", null, "bar" + (p.percent === null ? " unknown" : ""));
-  const fill = el("span");
-  fill.style.width = `${p.percent === null ? 0 : p.percent}%`;
-  bar.append(fill);
-  const parts = [];
-  if (p.percent !== null) parts.push(`${p.approximate ? "~" : ""}${Math.floor(p.percent)}%`);
-  parts.push(p.total ? `${bytes(p.done)} / ${p.approximate ? "~" : ""}${bytes(p.total)}` : bytes(p.done));
-  if (p.done) parts.push(`${bytes(p.rate)}/s`);
-  if (p.eta !== null && p.eta !== undefined) parts.push(`ETA ${duration(p.eta)}`);
-  line.append(el("div", name), bar, el("div", parts.join("  ·  "), "numbers"));
-  return line;
-}
 
 function showProgress(run) {
   const box = $("progress");

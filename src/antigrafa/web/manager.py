@@ -38,10 +38,12 @@ from .. import liverun
 from .. import scheduler as jobs_state
 from ..liverun import guest_dict, result_dict
 from ..operations import backup_state, new_data_line, open_platform, open_repository, report_lines, select_guests
-from ..platforms.base import Guest, RestoreRequest
+from ..overview import SizeCache, disk_usage, machine_info, root_path
+from ..platforms.base import Guest, PlatformError, RestoreRequest
 from ..progress import Progress
 from ..restore import restore_guest
 from ..runlock import RunLock, describe, write_json
+from ..targets import mount_fstype
 
 log = logging.getLogger(__name__)
 
@@ -237,6 +239,7 @@ class BackupManager:
         self._external_cache: dict = {}  # the files already read (see liverun.read_runs)
         self._log = _RunLog(self)
         logging.getLogger("antigrafa").addHandler(self._log)
+        self._sizes = SizeCache()  # space taken by each destination, measured in the background
 
     def close(self) -> None:
         logging.getLogger("antigrafa").removeHandler(self._log)
@@ -321,6 +324,99 @@ class BackupManager:
                 if running is not None:
                     external["run"] = running.id
         return {"busy": busy or external is not None, "runs": [r.summary() for r in runs], "external": external}
+
+    # ----------------------------------------------------------------- overview
+
+    def running(self) -> list[dict]:
+        """The backups running now (here or by the scheduler), newest first, each with the
+        progress of the whole backup."""
+        found = []
+        for summary in self.status()["runs"]:
+            if summary["kind"] != "backup" or summary["state"] not in ("running", "cancelling"):
+                continue
+            run = self.run(summary["id"])
+            progress = run.details().get("progress") if run is not None else None
+            found.append({**summary, "progress": progress})
+        return found
+
+    def overview(self) -> dict:
+        """This machine, the backups of the runs listed, the hosts of each source, and the
+        disks: the system disk and those of the destinations, with the space Antigrafa takes."""
+        cfg = self.config()
+        return {
+            "machine": machine_info(),
+            "backups": self._backup_counts(),
+            "sources": [self._source_hosts(cfg, name) for name in sorted(cfg.sources)],
+            "disks": self._disks(cfg),
+        }
+
+    def _backup_counts(self) -> dict:
+        """Over the backups listed on the page (the last runs, kept across restarts)."""
+        runs = [r for r in self.status()["runs"] if r["kind"] == "backup" and r["state"] not in ("running", "cancelling")]
+
+        def last(state: str) -> str | None:
+            return max((r["finished"] or r["started"] for r in runs if r["state"] == state), default=None)
+
+        return {
+            "runs": len(runs),
+            "runs_ok": sum(1 for r in runs if r["state"] == "ok"),
+            "runs_failed": sum(1 for r in runs if r["state"] == "failed"),
+            "guests_ok": sum(r["guests_ok"] for r in runs),
+            "guests_failed": sum(r["guests_failed"] for r in runs),
+            "last_ok": last("ok"),
+            "last_failed": last("failed"),
+        }
+
+    def _source_hosts(self, cfg: Config, name: str) -> dict:
+        try:
+            hosts, error = open_platform(cfg, name).hosts(), ""
+        except (ConfigError, PlatformError, OSError) as exc:
+            hosts, error = [], str(exc)
+        return {"name": name, "type": getattr(cfg.sources[name], "type", ""), "hosts": hosts, "error": error}
+
+    def _disks(self, cfg: Config) -> list[dict]:
+        """One entry per filesystem: the system disk first, then those of the destinations.
+        Destinations on one filesystem share its entry; one that cannot be reached has
+        its own, with the error."""
+        root = root_path()
+        system = {"name": "System disk", "path": root, "system": True, "targets": [], **disk_usage(root)}
+        disks = {system["device"]: system}
+        unreachable = []
+        for name in sorted(cfg.targets):
+            target = cfg.targets[name]
+            entry = {"name": name, "path": target.path, "kind": target.kind}
+            try:
+                usage = self._target_usage(target)
+            except OSError as exc:
+                unreachable.append({"name": name, "path": target.path, "system": False, "targets": [entry],
+                                    "error": str(exc)})
+                continue
+            entry.update(self._sizes.get(target.path))
+            disk = disks.setdefault(usage["device"], {"name": name, "path": target.path, "system": False,
+                                                      "targets": [], **usage})
+            disk["targets"].append(entry)
+        for disk in disks.values():
+            sizes = [t["bytes"] for t in disk["targets"]]
+            measured = all(b is not None for b in sizes)
+            disk["antigrafa"] = sum(sizes) if measured else None
+            disk["measuring"] = any(t["measuring"] for t in disk["targets"])
+            disk["error"] = ""
+            del disk["device"]
+        return list(disks.values()) + unreachable
+
+    @staticmethod
+    def _target_usage(target) -> dict:
+        """Space of the filesystem of a destination; OSError when it cannot be reached."""
+        if not os.path.isdir(target.path):
+            raise OSError(f"{target.path} does not exist")
+        if target.kind == "nfs":
+            try:
+                fstype = mount_fstype(target.path)
+            except OSError:
+                fstype = None
+            if not fstype or not fstype.startswith("nfs"):
+                raise OSError(f"{target.path} is not on an NFS mount")
+        return disk_usage(target.path)
 
     def jobs(self) -> dict:
         """The [job.<name>] sections: what, when, next and last run; and the scheduler's state."""

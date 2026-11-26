@@ -1,0 +1,14 @@
+<header>
+  <div class="brand">
+    <h1>Antigrafa</h1>
+    <nav>
+      <a href="{% url 'home' %}"{% if page == "home" %} aria-current="page"{% endif %}>Home</a>
+      <a href="{% url 'backup_page' %}"{% if page == "backup" %} aria-current="page"{% endif %}>Backup</a>
+      <a href="{% url 'restore_page' %}"{% if page == "restore" %} aria-current="page"{% endif %}>Restore</a>
+    </nav>
+  </div>
+  <div class="who">
+    <span>{{ user.get_username }}</span>
+    <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button type="submit">Sign out</button></form>
+  </div>
+</header>
