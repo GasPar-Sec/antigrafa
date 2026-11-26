@@ -1,8 +1,5 @@
 # Antigrafa
 
-> [!WARNING]
-> Work in progress: not tested on a real cluster yet. Do not use it as your only backup.
-
 Antigrafa backs up virtual machines and containers from a separate machine. It takes a
 snapshot, then copies it slowly enough that **the guests never slow down**.
 
