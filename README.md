@@ -1,5 +1,8 @@
 # Antigrafa
 
+[![Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGasPar-Sec%2Fantigrafa%2Frelease%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v)](pyproject.toml)
+[![License](https://img.shields.io/github/license/GasPar-Sec/antigrafa)](LICENSE)
+
 Antigrafa backs up virtual machines and containers from a separate machine. It takes a
 snapshot, then copies it slowly enough that **the guests never slow down**.
 
