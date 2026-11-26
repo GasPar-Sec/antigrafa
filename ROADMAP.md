@@ -71,6 +71,33 @@ the bottleneck can be the read on the node, the network or the destination.
 - [ ] A command to remove the bases of a guest, before a Proxmox rollback to an older
       snapshot (refused while a base exists)
 
+## Source load: measure what the guests feel
+
+Today the read throttle (`SourceThrottle`) follows one number: the node's iowait (`wait`
+from `/nodes/<node>/status`, the "IO delay" graph in Proxmox). It has blind spots:
+
+- Diluted on large nodes: on 64 cores, a VM fully stalled on its disk adds about 1.5%
+  iowait, far below `host_iowait_high` (10%), so the reads never slow down
+- One number for every disk: reading a quiet pool is slowed down when another pool is
+  busy, and the other way around
+- Ceph RBD and network storage: the load is on the storage servers, the node's iowait
+  sees only part of it
+- `ionice -c 2 -n 7` only works with the BFQ scheduler; with `none` or `mq-deadline`
+  (default for NVMe and SSD) the low priority has no effect
+
+Replace or complement the iowait with:
+
+- [ ] **I/O pressure (PSI)** of the node (`/proc/pressure/io`, read over SSH): the share
+      of time tasks are stalled on I/O, not diluted by the number of cores. First step:
+      small change, available on every recent Proxmox kernel
+- [ ] **Latency of the disk being read** (`await` from `/proc/diskstats`, for the
+      device or pool behind the snapshot): slow down only when the disks shared with the
+      guests suffer
+- [ ] **Wait of the guests' `kvm` processes** (delay accounting, `delayacct_blkio_ticks`):
+      measures directly whether the VMs wait on their disks, the real "zero impact" test
+- [ ] Report which signal triggered each slowdown in the log and the web page
+- [ ] Check the I/O scheduler of the disks read; warn when `ionice` has no effect
+
 ## Features
 
 - [x] Chunks hashed on the source host (`remote_hash`): only changed chunks cross the network
