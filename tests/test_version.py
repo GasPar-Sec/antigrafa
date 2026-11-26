@@ -44,7 +44,7 @@ def test_readme_badge_reads_the_pyproject_version():
     badge = re.search(r"\[!\[Version\]\((?P<image>[^)]+)\)\]\((?P<link>[^)]+)\)", readme)
     assert badge, "README.md: the Version badge is missing"
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(badge["image"]).query)
-    assert query["url"][0].endswith("/pyproject.toml") and query["query"] == ["$.project.version"]
+    assert query["url"][0].endswith("/main/pyproject.toml") and query["query"] == ["$.project.version"]
     assert badge["link"] == "pyproject.toml"
 
 
