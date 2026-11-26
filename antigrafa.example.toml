@@ -46,8 +46,10 @@ snapshot_mode = "auto"           # default: "proxmox"
 [source.cluster1.ssh]
 user = "root"                                  # SSH user on the nodes
 identity_file = "/etc/antigrafa/id_ed25519"    # private key; its public key goes in the nodes' authorized_keys
-# Faster encryption, useful above ~500 MiB/s:
-# options = ["Ciphers=aes128-gcm@openssh.com"]
+# ssh -o options. accept-new: a node's host key is recorded on the first connection,
+# and a key that changes afterwards is still refused.
+# Add "Ciphers=aes128-gcm@openssh.com" for faster encryption, useful above ~500 MiB/s.
+options = ["StrictHostKeyChecking=accept-new"]
 
 # SSH address of each node. Without it, the node name is used.
 [source.cluster1.nodes.pve1]

@@ -35,6 +35,7 @@ def test_example_configuration_is_valid():
     assert pve.url == "https://pve1.example.lan:8006"
     assert pve.ca_file == "/etc/antigrafa/pve-root-ca.pem"
     assert pve.ssh.identity_file == "/etc/antigrafa/id_ed25519"
+    assert pve.ssh.options == ["StrictHostKeyChecking=accept-new"]  # first connection without a prompt
     assert set(cfg.targets) == {"local", "nas"}
     assert cfg.targets["nas"].kind == "nfs"
     assert cfg.targets["nas"].name == "nas"
