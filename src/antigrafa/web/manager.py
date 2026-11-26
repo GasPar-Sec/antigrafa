@@ -5,8 +5,10 @@ Nothing here depends on Django: the views only call ``BackupManager``.
 Everything that can be checked quickly is checked before ``start`` (or
 ``start_restore``) returns (the configuration, the destination, the guests, the
 token's rights, the backup to restore), so that the page shows the error at once.
-The run then goes on in its own thread; the page follows it through ``status``. The
-last runs (state, results, log, report) stay in memory until the server stops.
+The run then goes on in its own thread; the page follows it through ``status``. Each
+run is also written to the scheduler's ``runs/`` directory when it starts and when it
+ends, as the scheduler's jobs are (see ``antigrafa.liverun``): the last runs (state,
+results, log, report) stay listed after the server or the machine restarts.
 
 One run at a time, with the scheduler too: a run holds the run lock of the scheduler's
 directory (see ``antigrafa.runlock``); while a scheduled job runs, nothing starts here.
@@ -21,6 +23,7 @@ process writes them to the scheduler's directory (see ``antigrafa.liverun``).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -38,11 +41,11 @@ from ..operations import backup_state, new_data_line, open_platform, open_reposi
 from ..platforms.base import Guest, RestoreRequest
 from ..progress import Progress
 from ..restore import restore_guest
-from ..runlock import RunLock, describe
+from ..runlock import RunLock, describe, write_json
 
 log = logging.getLogger(__name__)
 
-HISTORY = 20  # runs kept in memory
+HISTORY = 20  # runs kept in memory and in runs/
 LOG_LINES = 2000  # log lines kept per run
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(message)s"
 
@@ -85,6 +88,11 @@ class Run:
     message: str = ""
     job: str = ""  # a [job.<name>] started from the page
     lock: RunLock | None = field(default=None, repr=False)
+    uid: str = ""  # its file in runs/ (see liverun)
+
+    def __post_init__(self) -> None:
+        if not self.uid:  # starts with the start time, as the scheduler's: pruned in order
+            self.uid = f"{self.started:%Y%m%dT%H%M%S%f}-{os.getpid()}-web{self.id}"
 
     def add_log(self, line: str) -> None:
         self.logs.append(line)
@@ -94,10 +102,12 @@ class Run:
     def active(self) -> bool:
         return self.state in ("running", "cancelling")
 
-    def summary(self) -> dict:
+    def summary(self, state: str = "") -> dict:
+        """``state``: the final state, before ``self.state`` says it (written to runs/)."""
+        state = state or self.state
         if self.kind == "restore":
-            done = 0 if self.active else 1
-            ok = 1 if self.state == "ok" else 0
+            done = 0 if state in ("running", "cancelling") else 1
+            ok = 1 if state == "ok" else 0
         else:
             done = len(self.results)
             ok = sum(1 for r in self.results if r.ok)
@@ -107,7 +117,7 @@ class Run:
             "user": self.user,
             "source": self.source,
             "target": self.target,
-            "state": self.state,
+            "state": state,
             "started": self.started.isoformat(),
             "finished": self.finished.isoformat() if self.finished else None,
             "guests_total": len(self.guests),
@@ -118,16 +128,17 @@ class Run:
             "job": self.job,
         }
 
-    def details(self, logs_after: int = 0) -> dict:
-        """Everything about the run; ``logs_after``: only the log lines after that many."""
+    def details(self, logs_after: int = 0, state: str = "") -> dict:
+        """Everything about the run; ``logs_after``: only the log lines after that many;
+        ``state``: as for ``summary``."""
         lines, total = list(self.logs), self.log_total
         first = total - len(lines)  # number of the oldest line kept
         return {
-            **self.summary(),
+            **self.summary(state),
             "cancelled_by": self.cancelled_by,
             "error": self.error,
             "guests": [guest_dict(g) for g in self.guests],
-            "progress": self.progress.snapshot() if self.active else None,
+            "progress": self.progress.snapshot() if self.active and not state else None,
             "results": [result_dict(r) for r in self.results],
             "report": self.report,
             "backup": self.backup,
@@ -295,7 +306,8 @@ class BackupManager:
             own = list(self._runs)
             busy = self._busy
         directory = self._directory()
-        others = self._external_runs(directory) if directory is not None else []
+        mine = {r.uid for r in own}  # their file: this server shows them from memory
+        others = [r for r in self._external_runs(directory) if r.uid not in mine] if directory is not None else []
         runs = sorted(own + others, key=_started, reverse=True)[:HISTORY]
         external = None
         if not busy and directory is not None:
@@ -359,7 +371,9 @@ class BackupManager:
             with self._lock:
                 self._runs.appendleft(run)
                 self._threads[run.id] = thread
+                self._external_ids[run.uid] = run.id
                 self.current = run
+            self._save(run, new=True)
             if job:
                 jobs_state.record_start(cfg.scheduler.directory, job, run.started)
             thread.start()
@@ -391,6 +405,24 @@ class BackupManager:
                 self._busy = False
             raise
         return lock
+
+    def _save(self, run: Run, *, new: bool = False, state: str = "") -> None:
+        """Write the run to runs/, so that it stays listed after a restart. ``state``: its
+        final state, before ``run.state`` says it. Never stops the run."""
+        directory = self._directory()
+        if directory is None:
+            return
+        data = run.details(state=state)
+        now = _now().isoformat()
+        try:
+            folder = directory / liverun.RUNS_DIR
+            if new:
+                folder.mkdir(parents=True, exist_ok=True)
+                liverun.prune(directory, keep=HISTORY - 1)
+            write_json(folder / f"{run.uid}.json", {**data, "pid": os.getpid(), "heartbeat": now})
+        except OSError as exc:
+            log.warning("%s %d: cannot write it to %s (not listed after a restart): %s", run.kind, run.id,
+                        directory / liverun.RUNS_DIR, exc)
 
     def _unclaim(self, lock: RunLock | None) -> None:
         if lock is not None:
@@ -455,7 +487,9 @@ class BackupManager:
             with self._lock:
                 self._runs.appendleft(run)
                 self._threads[run.id] = thread
+                self._external_ids[run.uid] = run.id
                 self.current = run
+            self._save(run, new=True)
             thread.start()
         except BaseException:
             self._unclaim(lock)
@@ -510,6 +544,7 @@ class BackupManager:
             else:
                 jobs_state.record_end(directory, run.job, jobs_state.job_result(
                     run.started, state, len(run.guests), run.results, by="web", user=run.user, error=run.error))
+        self._save(run, state=state)  # before the next run may start
         with self._lock:
             self.current = None
             self._threads.pop(run.id, None)
