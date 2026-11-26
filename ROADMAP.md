@@ -112,5 +112,6 @@ the bottleneck can be the read on the node, the network or the destination.
 
 ## Validation
 
-- [ ] Test against a real Proxmox cluster (ZFS, Ceph RBD, LVM-thin)
+- [x] Test against a real Proxmox cluster (ZFS)
+- [ ] Test against a real Proxmox cluster (Ceph RBD, LVM-thin)
 - [ ] Confirm the minimum API token permissions
