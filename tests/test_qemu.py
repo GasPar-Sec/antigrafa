@@ -383,3 +383,26 @@ def test_fleecing_image_without_direct_io_when_the_filesystem_refuses_it(tmp_pat
     add = [a for n, a in fake.calls if n == "blockdev-add"]
     assert [a.get("cache") for a in add] == [{"direct": True}, None]
     assert "antigrafa-scsi0" in fake.nodes
+
+
+def test_only_a_disk_read_from_its_volume_restarts_mid_way():
+    class Volume(Direct):
+        def stream_command_from(self, offset):
+            return f"dd if=/dev/x skip={offset}"
+
+    class Streams(SSH):
+        def stream(self, cmd, input=None):
+            self.commands.append(cmd)
+            return "stream"
+
+    ssh = Streams()
+    disk = Disk("scsi0", "san:0.0.8.scsi-36e8")
+    through_qemu = qemu.QemuDiskSource(ssh, disk, "snap", Volume(), low_priority=False)
+    through_qemu.use_qemu("/run/antigrafa-650.nbd", 1024)
+    through_qemu.open_stream()
+    assert through_qemu.reopener(4096) is None  # the NBD reader always starts at 0
+
+    stopped = qemu.QemuDiskSource(ssh, disk, "snap", Volume(), low_priority=False)
+    stopped.open_stream()
+    stopped.reopener(4096)(2)
+    assert ssh.commands[-1] == "dd if=/dev/x skip=8192"

@@ -1,6 +1,9 @@
+import shlex
+
 import pytest
 
 from antigrafa.platforms.proxmox.capture import (
+    LOW_PRIORITY,
     Disk,
     LvmThinSource,
     RbdSource,
@@ -448,10 +451,16 @@ def test_live_raw_file_on_a_directory_storage():
         src.take_snapshot()
     # O_DIRECT (no page cache) when the filesystem accepts it, tested on one block first
     image = "/mnt/pve/nas/images/100/vm-100-disk-0.raw"
-    assert src.stream_command() == (
+    assert shlex.split(src.stream_command()) == ["sh", "-c", (
         f"if dd if={image} bs=4096 count=1 iflag=direct of=/dev/null status=none 2>/dev/null; "
         f"then dd if={image} bs=4M iflag=direct status=none; else dd if={image} bs=4M status=none; fi"
-    )
+    )]
+    # One command: the low-priority prefix applies to all of it ("nice if ..." is a syntax error)
+    assert shlex.split(LOW_PRIORITY + src.stream_command())[-3:-1] == ["sh", "-c"]
+    # From an offset, either way
+    script = shlex.split(src.stream_command_from(8192))[-1]
+    assert f"then dd if={image} bs=4M iflag=direct,skip_bytes skip=8192 status=none;" in script
+    assert f"else dd if={image} bs=4M iflag=skip_bytes skip=8192 status=none; fi" in script
 
 
 @pytest.mark.parametrize(
@@ -468,3 +477,47 @@ def test_storages_without_snapshots_need_the_qemu_mode(cfg, volid):
 def test_qcow2_stays_unsupported_even_stopped():
     with pytest.raises(UnsupportedStorage, match="qcow2"):
         make_source(FakeSSH(), {"type": "dir", "path": "/x"}, Disk("scsi0", "local:1/vm-1-disk-0.qcow2"), "s", live=True)
+
+
+# --------------------------------------------------------------------------- reading again from a chunk
+
+MiB = 1024 * 1024
+ZFS = {"type": "zfspool", "pool": "rpool/data"}
+
+
+def test_plain_read_reopens_from_a_chunk():
+    ssh = StreamingSSH()
+    src = make_source(ssh, ZFS, Disk("scsi0", "local-zfs:vm-100-disk-0"), "snap1", low_priority=False)
+    assert src.reopener(4 * MiB) is None  # nothing opened yet
+    src.open_stream()
+    src.reopener(4 * MiB)(3)
+    cmd, sent = ssh.streamed
+    assert cmd == "dd if=/dev/zvol/rpool/data/vm-100-disk-0@snap1 bs=4M iflag=direct,skip_bytes skip=12582912 status=none"
+    assert sent is None
+
+
+def test_hashed_read_reopens_with_the_rest_of_the_reference():
+    from antigrafa import delta
+
+    ssh = StreamingSSH()
+    src = make_source(ssh, ZFS, Disk("scsi0", "local-zfs:vm-100-disk-0"), "snap1", remote_hash=True)
+    reference = [b"a" * 32, b"b" * 32, b"c" * 32]
+    src.open_hashed_stream(reference, MiB)
+    src.reopener(MiB)(2)
+    cmd, sent = ssh.streamed
+    assert sent == delta.encode_reference(reference[2:])  # the script counts from its first chunk
+    argv = shlex.split(cmd)
+    assert argv[:2] == ["ionice", "-c"] and argv[-2] == str(MiB)  # same priority, same chunks
+    assert argv[-1] == "dd if=/dev/zvol/rpool/data/vm-100-disk-0@snap1 bs=4M iflag=direct,skip_bytes skip=2097152 status=none"
+
+
+def test_reads_that_cannot_start_mid_way_are_not_reopened(monkeypatch):
+    ssh = StreamingSSH({"zfs get -Hp -o value volsize": f"{4 * MiB}\n"})
+    zvol = make_source(ssh, ZFS, Disk("scsi0", "local-zfs:vm-100-disk-0"), "snap1", remote_hash=True)
+    monkeypatch.setattr(zvol, "_changes", lambda reference, chunk_size: [(1, 2)])
+    zvol.open_hashed_stream([b"a" * 32] * 4, MiB)  # incremental: only the changed chunks
+    assert zvol.reopener(MiB) is None
+
+    rbd = make_source(ssh, {"type": "rbd", "pool": "vms"}, Disk("scsi0", "ceph:vm-1-disk-0"), "s")
+    rbd.open_stream()  # rbd export: no offset
+    assert rbd.reopener(MiB) is None

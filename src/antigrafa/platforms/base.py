@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import BinaryIO, Protocol
 
 KINDS = ("vm", "ct")  # virtual machine, container
@@ -108,6 +108,16 @@ class DiskSource(ABC):
     @abstractmethod
     def open_stream(self) -> Stream:
         """Start reading the snapshot of this disk."""
+
+    def reopener(self, chunk_size: int) -> Callable[[int], Stream] | None:
+        """After ``open_stream`` or ``open_hashed_stream``: opens that same read again on a
+        new connection, from a given chunk on, when the first connection became too slow
+        (see ``antigrafa.reconnect``). Its streams, and the first one, then also have
+        ``kill()`` and ``close(abort)``.
+
+        None: this read cannot start mid-way.
+        """
+        return None
 
     def cleanup(self) -> None:
         """Undo what ``prepare`` did. Must be safe even if ``prepare`` failed."""

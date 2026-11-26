@@ -328,7 +328,16 @@ def test_backup_report_details(capsys):
     assert "Total: 2 guest(s), 1 OK, 1 failed, in 2m 05s" in out
     assert "Sum of guest times" not in out  # 130 s over 125 s: not really parallel
     assert "Read: 20.0 GiB, 163.8 MiB/s on average" in out
+    assert "new connection" not in out  # only when there was one
     assert "Longest: VM 100 (web) (2m 05s)" in out
+
+
+def test_backup_report_shows_new_connections(capsys):
+    disk = _disk("scsi0", 1024**3, 60.0)
+    disk.stats.reconnects = 2
+    vm = jobs.GuestResult(guest=Guest("100", "vm", "web", "pve1"), ok=True, snapshot="x", disks=[disk], duration=61.0)
+    cli._backup_report([vm], datetime(2026, 11, 26, 10, 0, 0), 61.0)
+    assert "3 new chunks, 1 reused, 1.0 GiB sent, 2 new connections" in capsys.readouterr().out
 
 
 def test_backup_report_same_day_and_single_guest(capsys):

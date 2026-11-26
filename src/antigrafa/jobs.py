@@ -25,9 +25,11 @@ from . import __version__
 from .adaptive import MiB, SourceThrottle, WriteController, WriteTuning
 from .config import Tuning
 from .index import IndexCorrupted, read_index, read_manifest, write_index, write_manifest
-from .pipeline import StreamStats, backup_delta, backup_stream
+from .delta import read_records
+from .pipeline import StreamStats, backup_records, raw_records
 from .platforms.base import DiskSource, Guest, Platform
 from .progress import Progress
+from .reconnect import ReconnectingReader, StreamWatch
 from .targets import Repository
 
 log = logging.getLogger(__name__)
@@ -121,6 +123,11 @@ class BackupRunner:
         # One controller and one writer pool for the destination,
         # shared by every concurrent backup.
         self.controller = WriteController(write_tuning(tuning))
+        self.watch = StreamWatch(
+            min_rate=tuning.stream_min_mib_s * MiB,
+            window=tuning.stream_window_s,
+            max_reconnects=tuning.stream_max_reconnects,
+        )
         self._writers = ThreadPoolExecutor(max_workers=tuning.writer_max_concurrency, thread_name_prefix="writer")
         self._lock = threading.Lock()
         self._throttles: dict[str, SourceThrottle] = {}
@@ -292,17 +299,23 @@ class BackupRunner:
                     log.debug("%s: %s: hashed on the source, %d chunks of reference", g.label, src.key, len(reference))
                 else:
                     log.debug("%s: %s: every chunk sent", g.label, src.key)
-                with hashed or src.open_stream() as stream:
+                stream = hashed or src.open_stream()
+                chunk_size = self.chunk_size
+
+                def parse(stdout, start: int):
+                    if hashed is not None:  # numbered from chunk ``start``: the reference too
+                        return read_records(stdout, reference[start:])
+                    return raw_records(stdout, chunk_size)
+
+                reader = ReconnectingReader(
+                    stream, parse, src.reopener(chunk_size), self.watch, f"{g.label}: {src.key}", chunk_size
+                )
+                with reader:
                     store, throttle = self.repo.store, self._throttle(g.host)
-                    if hashed is not None:
-                        digests, stats = backup_delta(
-                            stream.stdout, reference, store, self.controller, self._writers, throttle, advance
-                        )
-                    else:
-                        digests, stats = backup_stream(
-                            stream.stdout, store, self.controller, self._writers, throttle, self.chunk_size,
-                            on_read=advance,
-                        )
+                    digests, stats = backup_records(
+                        reader.records(), store, self.controller, self._writers, throttle, advance
+                    )
+                stats.reconnects = reader.reconnects
         finally:
             try:
                 src.cleanup()
@@ -316,6 +329,8 @@ class BackupRunner:
         write_index(dest / f"{src.key}.{ext}.fidx", size, self.chunk_size, digests)
         rate = stats.bytes_read / MiB / stats.elapsed if stats.elapsed else 0.0
         skipped = f", {stats.skipped_chunks} unchanged chunks not read" if stats.skipped_chunks else ""
+        if stats.reconnects:
+            skipped += f", {stats.reconnects} new connection{'s' if stats.reconnects > 1 else ''}"
         log.info(
             "%s: %s: %.0f MiB in %.0f s (%.0f MiB/s), %d new chunks, %d reused, %.0f MiB sent%s",
             g.label, src.key, size / MiB, stats.elapsed, rate, stats.new_chunks, stats.reused_chunks,

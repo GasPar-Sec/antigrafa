@@ -75,6 +75,11 @@ class Tuning:
     host_iowait_high: float = 0.10
     host_iowait_low: float = 0.03
     low_priority: bool = True  # read at low I/O and CPU priority on the host
+    # A read slower than this for stream_window_s, while Antigrafa waits for it, is
+    # opened again on a new connection (see ``reconnect``)
+    stream_min_mib_s: float = 1  # 0 = never
+    stream_window_s: float = 60
+    stream_max_reconnects: int = 5  # per disk
 
 
 @dataclass

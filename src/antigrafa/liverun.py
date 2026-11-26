@@ -68,6 +68,7 @@ def result_dict(r: GuestResult) -> dict:
                 "new_chunks": d.stats.new_chunks,
                 "reused_chunks": d.stats.reused_chunks,
                 "sent_bytes": d.stats.sent_bytes,
+                "reconnects": d.stats.reconnects,
             }
             for d in r.disks
         ],

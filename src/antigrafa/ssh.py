@@ -36,8 +36,16 @@ class RemoteStream:
     def stdout(self) -> BinaryIO:
         return self.proc.stdout
 
+    def kill(self) -> None:
+        """Stop the local ssh at once, from any thread: a read in progress ends."""
+        self.aborted = True
+        if self.proc.poll() is None:
+            self.proc.kill()
+
     def close(self, abort: bool = False) -> None:
         self.aborted = self.aborted or abort
+        if self._stderr.closed:  # already closed (a stream replaced by a new connection)
+            return
         if abort and self.proc.poll() is None:
             self.proc.kill()
         if self.proc.stdout:
