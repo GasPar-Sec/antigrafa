@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "antigrafa"
-version = "1.2.0"
+version = "1.2.1"
 description = "VM and container backups with zero guest impact, adapting to destination performance"
 readme = "README.md"
 license = "GPL-2.0-only"
