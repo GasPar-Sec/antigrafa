@@ -552,6 +552,66 @@ def test_manager_restore_cancel_and_failure(lab, monkeypatch):
     assert any("restore %d failed: id 2 is taken" % run.id in line for line in run.logs)
 
 
+def test_manager_runs_stay_listed_after_a_restart(lab, monkeypatch):
+    backup = _backed_up(lab)  # a backup by alice
+    fake = FakeRestore(PlatformError("id 2 is taken"))
+    fake.go.set()
+    monkeypatch.setattr(manager_module, "restore_guest", fake)
+    run = lab.manager.start_restore(target=None, backup=backup["path"], user="bob")
+    _wait(lambda: not run.active)
+    before = lab.manager.status()["runs"]
+    assert [(r["kind"], r["state"]) for r in before] == [("restore", "failed"), ("backup", "ok")]
+
+    restarted = BackupManager("antigrafa.toml", load=lambda path: lab.cfg)  # the server started again
+    try:
+        after = restarted.status()["runs"]
+        keys = ("kind", "user", "source", "target", "state", "started", "finished", "guests_ok", "guests_failed")
+        assert [{k: r[k] for k in keys} for r in after] == [{k: r[k] for k in keys} for r in before]
+        details = restarted.run(after[1]["id"]).details()
+        assert details["results"][0]["guest"]["id"] == "2" and details["progress"] is None
+        assert any(line.startswith("Total: 1 guest(s), 1 OK") for line in details["report"])
+        assert details["logs"]  # the log of the run, too
+        details = restarted.run(after[0]["id"]).details()
+        assert details["error"] == "id 2 is taken" and details["backup"] == backup["path"]
+        assert details["restore"]["guest_id"] == "2"
+    finally:
+        restarted.close()
+
+
+def test_manager_run_cut_by_a_crash_shows_as_failed_after_a_restart(lab):
+    run = lab.manager.start(source="lab", target=None, every=True, user="alice")
+    lab.gate.reading.wait(10)
+    [own] = lab.manager.status()["runs"]  # its file is there, but this server shows its own run
+    assert own["state"] == "running" and own["id"] == run.id and "external" not in own
+
+    # The machine stops: the file still says "running", and nothing writes it any more
+    path = lab.cfg.scheduler.directory / "runs" / f"{run.uid}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["heartbeat"] = (datetime.now().astimezone() - timedelta(minutes=5)).isoformat()
+    restarted = BackupManager("antigrafa.toml", load=lambda p: lab.cfg)
+    try:
+        path.write_text(json.dumps(data), encoding="utf-8")
+        [shown] = restarted.status()["runs"]
+        assert shown["state"] == "failed" and shown["user"] == "alice"
+        assert "stopped before the end" in restarted.run(shown["id"]).details()["error"]
+    finally:
+        restarted.close()
+
+
+def test_manager_cannot_write_its_runs_but_still_runs(lab, tmp_path, caplog):
+    from antigrafa.config import SchedulerConfig
+
+    blocker = tmp_path / "s"
+    blocker.mkdir()
+    (blocker / "runs").write_text("not a directory")
+    lab.cfg.scheduler = SchedulerConfig(data_dir=str(blocker))
+    lab.gate.go.set()
+    run = lab.manager.start(source="lab", target=None, every=True, user="alice")
+    _wait(lambda: not run.active)
+    assert run.state == "ok"
+    assert "not listed after a restart" in caplog.text
+
+
 def test_manager_restore_locations(lab, monkeypatch):
     with pytest.raises(PlatformError, match="not supported on memory"):  # the base platform
         lab.manager.restore_locations("lab", "vm")

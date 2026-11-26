@@ -3,7 +3,8 @@
 While a job runs, ``runs/<id>.json`` in the scheduler's directory says where it stands,
 in the form of the web interface's own runs: progress, results, log, report. The
 process running it writes it every second, and once more at the end; the most recent
-``HISTORY`` stay, so the page also lists the jobs that ended.
+``HISTORY`` stay, so the page also lists the jobs that ended. The web interface writes
+its own runs there too, when they start and end, so they stay listed after a restart.
 
 To cancel it, the web interface writes ``runs/<id>.cancel``: the process running the
 job sees it within a second and cancels the backup (snapshots deleted, unfinished
