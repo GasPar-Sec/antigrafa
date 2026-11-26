@@ -49,8 +49,9 @@ running run is pointed to, not shown.
 <script>
 "use strict";
 const PAGE = "{{ page }}";  // the kind of runs this page shows: backup or restore
-const PAGES = {backup: "{% url 'backup_page' %}", restore: "{% url 'restore_page' %}"};
+const PAGES = RUN_PAGES;
 let selectedRun = null;   // run shown; null: the most recent one of this page
+let scrollToRun = false;  // opened from a link to one run: scroll to it once it is shown
 let shownRun = null;      // run whose log is on screen
 let logTotal = 0;         // log lines of that run already shown
 let timer = null;
@@ -59,7 +60,7 @@ let onStatus = () => {};  // the page's own reaction to busy changing
 
 {
   const asked = Number(new URLSearchParams(window.location.search).get("run"));
-  if (Number.isInteger(asked) && asked > 0) selectedRun = asked;  // a link from the other page
+  if (Number.isInteger(asked) && asked > 0) { selectedRun = asked; scrollToRun = true; }  // a link from another page
 }
 
 // ------------------------------------------------------------------ runs
@@ -194,6 +195,10 @@ async function refresh() {
     }
     showRuns(data.runs);
     showRun(data.run);
+    if (scrollToRun && data.run && data.run.id === selectedRun) {
+      scrollToRun = false;
+      $("run").scrollIntoView({block: "start"});
+    }
     showOtherRun(data.active, data.external);
     active = data.busy;
     busy = data.busy;

@@ -5,6 +5,8 @@ Functions shared by every page: building elements, formatting, calling the API, 
 "use strict";
 const CSRF = document.querySelector('meta[name="csrf-token"]').content;
 const $ = (id) => document.getElementById(id);
+// The page that shows the runs of each kind; ?run=<id> opens one there, scrolled to it
+const RUN_PAGES = {backup: "{% url 'backup_page' %}", restore: "{% url 'restore_page' %}"};
 
 function el(tag, text, cls) {
   const node = document.createElement(tag);

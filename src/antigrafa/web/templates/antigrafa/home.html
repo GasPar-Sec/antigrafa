@@ -8,8 +8,8 @@ the recent results, the hosts of each source, and the disks with the space Antig
 {% include "antigrafa/header.html" %}
 <main>
   <section id="running">
-    <h2>Backups running</h2>
-    <p class="muted" id="running-empty">No backup running.</p>
+    <h2>Running now</h2>
+    <p class="muted" id="running-empty">Nothing running.</p>
     <div id="running-list"></div>
     <p class="error" id="running-error"></p>
   </section>
@@ -38,20 +38,25 @@ the recent results, the hosts of each source, and the disks with the space Antig
 <script>
 "use strict";
 
-// ------------------------------------------------------------------ backups running
+// ------------------------------------------------------------------ running now
 
 let runningTimer = null;
-let runningCount = null;  // backups running at the last look: the overview is reloaded when it changes
+let runningCount = null;  // runs going on at the last look: the overview is reloaded when it changes
+
+const KIND_NAMES = {backup: "Backup", restore: "Restore"};
 
 function runningLine(r) {
-  // The whole backup, not each guest: x/y guests, %, done / total, rate, ETA
+  // The whole run, not each guest: x/y guests, %, done / total, rate, ETA. Any kind, several
+  // at once: each line leads to the page of its kind, scrolled to that run.
+  const kind = KIND_NAMES[r.kind] || r.kind;
   const link = el("a", null, "running-run");
-  link.href = `{% url 'backup_page' %}?run=${encodeURIComponent(r.id)}`;
-  link.title = "Follow this backup on the Backup page";
-  const what = `#${r.id} ${r.job ? "job " + r.job + " · " : ""}${r.source} → ${r.target}`
+  link.href = `${RUN_PAGES[r.kind] || RUN_PAGES.backup}?run=${encodeURIComponent(r.id)}`;
+  link.title = `Follow this ${kind.toLowerCase()} on its page`;
+  const where = r.kind === "restore" ? `${r.guest} from ${r.target}` : `${r.source} → ${r.target}`;
+  const what = `${kind} #${r.id} · ${r.job ? "job " + r.job + " · " : ""}${where}`
     + `${r.state === "cancelling" ? " · cancelling" : ""}`;
   link.append(el("div", what, "running-what"));
-  const guests = `${r.guests_done}/${r.guests_total} guests`;
+  const guests = r.kind === "restore" ? kind : `${r.guests_done}/${r.guests_total} guests`;
   if (r.progress) {
     const line = progressLine(guests, r.progress, "overall");
     line.querySelector(".numbers").textContent += `  ·  ${duration(r.progress.elapsed)}`;

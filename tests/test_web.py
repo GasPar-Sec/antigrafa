@@ -1191,9 +1191,10 @@ def test_home_page_shows_what_runs_and_the_machine(client):
     response = client.post("/login/", {"username": "alice", "password": PASSWORD})
     assert response.status_code == 302 and response["Location"] == "/"  # signed in: the home page
     page = client.get("/").content.decode()
-    assert "Backups running" in page and "/api/running" in page and "/api/overview" in page
+    assert "Running now" in page and "/api/running" in page and "/api/overview" in page
     assert '<a href="/" aria-current="page">Home</a>' in page and 'href="/backup/"' in page
-    assert "/backup/?run=" in page  # a running backup leads to the Backup page
+    # Each run leads to the page of its kind, opened on that run
+    assert 'const RUN_PAGES = {backup: "/backup/", restore: "/restore/"}' in page and "?run=" in page
     assert "Start a backup" not in page and 'id="run"' not in page
 
 
@@ -1249,3 +1250,23 @@ def test_manager_overview_reports_a_source_it_cannot_reach(lab, monkeypatch):
     monkeypatch.setattr(manager_module, "open_platform", unreachable)
     [source] = lab.manager.overview()["sources"]
     assert source["error"] == "pve1: connection refused" and source["hosts"] == []
+
+
+def test_run_pages_scroll_to_the_run_they_are_opened_on(client):
+    _login(client)
+    for url in ("/backup/", "/restore/"):
+        page = client.get(url).content.decode()
+        assert "scrollToRun = true" in page and '$("run").scrollIntoView' in page
+
+
+def test_manager_running_lists_every_kind(lab, monkeypatch):
+    backup = _backed_up(lab)
+    fake = FakeRestore()  # held until the test lets it go
+    monkeypatch.setattr(manager_module, "restore_guest", fake)
+    run = lab.manager.start_restore(target=None, backup=backup["path"], user="bob")
+    fake.started.wait(10)
+    [shown] = lab.manager.running()
+    assert shown["kind"] == "restore" and shown["id"] == run.id and shown["guest"]
+    fake.go.set()
+    _wait(lambda: not run.active)
+    assert lab.manager.running() == []
