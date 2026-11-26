@@ -328,11 +328,12 @@ class BackupManager:
     # ----------------------------------------------------------------- overview
 
     def running(self) -> list[dict]:
-        """The backups running now (here or by the scheduler), newest first, each with the
-        progress of the whole backup."""
+        """Every run going on now, whatever its kind (backup, restore...) and wherever it
+        runs (here or the scheduler), newest first, each with its overall progress. Made
+        for several at once, although one runs at a time today."""
         found = []
         for summary in self.status()["runs"]:
-            if summary["kind"] != "backup" or summary["state"] not in ("running", "cancelling"):
+            if summary["state"] not in ("running", "cancelling"):
                 continue
             run = self.run(summary["id"])
             progress = run.details().get("progress") if run is not None else None
