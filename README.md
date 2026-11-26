@@ -1,6 +1,6 @@
 # Antigrafa
 
-[![Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGasPar-Sec%2Fantigrafa%2Frelease%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v)](pyproject.toml)
+[![Version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FGasPar-Sec%2Fantigrafa%2Fmain%2Fpyproject.toml&query=%24.project.version&label=version&prefix=v)](pyproject.toml)
 [![License](https://img.shields.io/github/license/GasPar-Sec/antigrafa)](LICENSE)
 
 Antigrafa backs up virtual machines (VMs) and containers. It runs on its own machine,
@@ -21,7 +21,7 @@ sudo deploy/install.sh
 ```
 
 The script installs Antigrafa, creates an SSH key and a default configuration, then prints
-the next steps. Follow them, then start the services:
+the next steps. Follow~ them, then start the services:
 
 ```sh
 sudo systemctl start antigrafa-scheduler antigrafa-web
