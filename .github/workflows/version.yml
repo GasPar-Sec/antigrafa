@@ -1,0 +1,30 @@
+# The version is the same everywhere: pyproject.toml, src/antigrafa/__init__.py, and the
+# README badge (which reads pyproject.toml). Fast check on Linux only: see tests/test_version.py.
+name: Version
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Same version everywhere
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: pip install -e . pytest
+
+      # -o addopts="": no coverage for this one test
+      - name: Check the version
+        run: pytest -o addopts="" tests/test_version.py
