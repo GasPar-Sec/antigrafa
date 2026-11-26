@@ -71,6 +71,52 @@ the bottleneck can be the read on the node, the network or the destination.
 - [ ] A command to remove the bases of a guest, before a Proxmox rollback to an older
       snapshot (refused while a base exists)
 
+## Source load: measure what the guests feel
+
+Today the read throttle (`SourceThrottle`) follows one number: the node's iowait (`wait`
+from `/nodes/<node>/status`, the "IO delay" graph in Proxmox). It has blind spots:
+
+- Diluted on large nodes: on 64 cores, a VM fully stalled on its disk adds about 1.5%
+  iowait, far below `host_iowait_high` (10%), so the reads never slow down
+- One number for every disk: reading a quiet pool is slowed down when another pool is
+  busy, and the other way around
+- Ceph RBD and network storage: the load is on the storage servers, the node's iowait
+  sees only part of it
+- `ionice -c 2 -n 7` only works with the BFQ scheduler; with `none` or `mq-deadline`
+  (default for NVMe and SSD) the low priority has no effect
+
+Replace or complement the iowait with:
+
+- [ ] **I/O pressure (PSI)** of the node (`/proc/pressure/io`, read over SSH): the share
+      of time tasks are stalled on I/O, not diluted by the number of cores. First step:
+      small change, available on every recent Proxmox kernel
+- [ ] **Latency of the disk being read** (`await` from `/proc/diskstats`, for the
+      device or pool behind the snapshot): slow down only when the disks shared with the
+      guests suffer
+- [ ] **Wait of the guests' `kvm` processes** (delay accounting, `delayacct_blkio_ticks`):
+      measures directly whether the VMs wait on their disks, the real "zero impact" test
+- [ ] Report which signal triggered each slowdown in the log and the web page
+- [ ] Check the I/O scheduler of the disks read; warn when `ionice` has no effect
+
+## Diagnostics: show where a slow backup waits
+
+A backup can be slow while the node, the Antigrafa machine and the destination are all
+idle. Seen on 2026-11-26: a VM read at ~430 KiB/s because ~18% of the packets from its
+node arrived out of order (`rcv_ooopack` in `ss -ti`), so TCP kept slowing down. Finding
+it took `ps`, `zpool iostat`, `iostat` and `ss` on three machines.
+
+- [ ] Per disk, time spent in each stage: waiting for data from the node, checking the
+      destination (`store.has`), waiting for a write slot, writing; in the report and
+      on the web page, with the stage that limits the rate
+- [ ] Network rate and health of each SSH stream (from `ss -ti` on the Antigrafa
+      machine): received rate, RTT compared to its minimum, out-of-order and duplicate
+      packets
+- [ ] Warning when the network looks like the cause: low rate while the node and the
+      destination are idle, high out-of-order or retransmission rate (e.g. a bond in
+      `balance-rr`, a LACP mismatch, a faulty port)
+- [ ] `antigrafa diagnose <node>`: measure the raw rates (disk read on the node, network
+      to the Antigrafa machine, write to the target) to compare with a backup
+
 ## Features
 
 - [x] Chunks hashed on the source host (`remote_hash`): only changed chunks cross the network
