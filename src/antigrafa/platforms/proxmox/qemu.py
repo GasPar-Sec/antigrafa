@@ -394,6 +394,11 @@ class QemuDiskSource(VolumeSource):
             return self._direct().stream_command()
         return f"python3 -c {shlex.quote(NBD_SCRIPT)} {shlex.quote(self._socket)} {shlex.quote(self.key)}"
 
+    def stream_command_from(self, offset: int) -> str | None:
+        if self._socket is None:
+            return self._direct().stream_command_from(offset)
+        return None  # through QEMU: the NBD reader always starts at 0 (for now)
+
     def reader_marker(self) -> str:
         if self._socket is None:
             return self._direct().reader_marker()

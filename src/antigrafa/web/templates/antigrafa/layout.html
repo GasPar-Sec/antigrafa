@@ -147,7 +147,8 @@ function showResults(run) {
   tbody.replaceChildren();
   for (const r of run.results) {
     const tr = el("tr");
-    const disks = r.disks.map((d) => `${d.key} ${bytes(d.size)} (${bytes(d.sent_bytes)} sent)`).join(", ");
+    const reconnects = (d) => (d.reconnects ? `, ${d.reconnects} new connection${d.reconnects > 1 ? "s" : ""}` : "");
+    const disks = r.disks.map((d) => `${d.key} ${bytes(d.size)} (${bytes(d.sent_bytes)} sent${reconnects(d)})`).join(", ");
     tr.append(
       el("td", r.guest.label),
       el("td", r.ok ? "OK" : "FAILED", r.ok ? "state-ok" : "state-failed"),

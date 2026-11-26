@@ -220,3 +220,19 @@ def test_sink_runs_the_ssh_command(monkeypatch):
     assert seen["argv"][-2:] == ["root@pve1", "tar -xf -"] and "2222" in seen["argv"]
     assert seen["kwargs"]["stdin"] == subprocess.PIPE
     assert sink.command == "tar -xf -"
+
+
+def test_kill_from_another_thread_ends_a_blocked_read():
+    import threading
+
+    err = tempfile.TemporaryFile()
+    # The process killed is the one holding the pipe, as ssh is (a shell would leave its child)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                            stdout=subprocess.PIPE, stderr=err, bufsize=0)
+    s = RemoteStream("local", "sleep", proc, err)
+    threading.Timer(0.2, s.kill).start()
+    assert s.stdout.read(10) == b""  # the collapsed stream ends at once
+    assert s.aborted
+    s.close(abort=True)
+    s.close()  # replaced streams are closed again on exit: nothing happens, nothing raised
+    assert proc.returncode is not None

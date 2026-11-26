@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 
 import pytest
@@ -807,3 +808,80 @@ def test_read_mode_is_logged(repo, caplog):
     guest = Guest("1", "vm", "web", "h1")
     assert _backup_once(repo, guest, Told("disk0", b"x" * 100)).ok
     assert "VM 1 (web): disk0: incremental since antigrafa_A: 2 of 8 chunks changed" in caplog.text
+
+
+# --------------------------------------------------------------------------- collapsed stream
+
+
+class StallingStream:
+    """Delivers ``data``, then nothing until killed: a connection that collapsed."""
+
+    def __init__(self, data, stall=True):
+        import threading
+
+        self.stdout = self
+        self._data = io.BytesIO(data)
+        self.stall = stall
+        self.killed = threading.Event()
+
+    def read(self, n):
+        buf = self._data.read(n)
+        if not buf and self.stall:
+            self.killed.wait(10)  # never hangs the tests
+        return buf
+
+    def kill(self):
+        self.killed.set()
+
+    def close(self, abort=False):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+
+class CollapsingDisk(MemoryDisk):
+    """Its first connection stalls after ``cut`` bytes; opened again from a chunk, it is fine."""
+
+    def __init__(self, key, data, cut):
+        super().__init__(key, data)
+        self.cut = cut
+        self.reopened = []
+
+    def open_stream(self):
+        return StallingStream(self.data[: self.cut])
+
+    def reopener(self, chunk_size):
+        def reopen(start):
+            self.reopened.append(start)
+            return StallingStream(self.data[start * chunk_size :], stall=False)
+
+        return reopen
+
+
+def test_collapsed_stream_goes_on_over_a_new_connection(repo, tmp_path, caplog):
+    guest = Guest("1", "vm", "web", "h1")
+    disk = CollapsingDisk("disk0", os.urandom(DISK_SIZE), cut=2 * 1024 * 1024 + 1000)
+    platform = MemoryPlatform([guest], {"1": [disk]})
+
+    with caplog.at_level(logging.INFO):
+        [result] = _run(platform, repo, [guest], stream_window_s=0.2)
+
+    assert result.ok, result.error
+    assert disk.reopened == [2]  # from the chunk it was cut in (1 MiB chunks)
+    stats = result.disks[0].stats
+    assert stats.reconnects == 1 and stats.bytes_read == DISK_SIZE
+    assert "new connection from 2.0 MiB (1/5)" in caplog.text
+    assert "1 new connection" in caplog.text  # in the summary of the disk
+
+    path, manifest = repo.list_snapshots()[-1]
+    entry = manifest["disks"][0]
+    assert entry["stats"]["reconnects"] == 1
+    size, _, digests = read_index(repo.resolve(path) / entry["index"])
+    out = tmp_path / "restored.img"
+    with open(out, "wb") as f:
+        restore_stream(repo.store, digests, f, size)
+    assert out.read_bytes() == disk.data  # complete and in order
