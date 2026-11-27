@@ -34,16 +34,15 @@ from typing import Callable
 from ..config import Config, ConfigError, load_config
 from ..index import read_manifest
 from ..jobs import BackupRunner, GuestResult
-from .. import liverun
+from .. import liverun, notify
 from .. import scheduler as jobs_state
 from ..liverun import guest_dict, result_dict
 from ..operations import backup_state, new_data_line, open_platform, open_repository, report_lines, select_guests
-from ..overview import SizeCache, disk_usage, machine_info, root_path
+from ..overview import SizeCache, disk_usage, machine_info, root_path, target_usage
 from ..platforms.base import Guest, PlatformError, RestoreRequest
 from ..progress import Progress
 from ..restore import restore_guest
 from ..runlock import RunLock, describe, write_json
-from ..targets import mount_fstype
 
 log = logging.getLogger(__name__)
 
@@ -387,7 +386,7 @@ class BackupManager:
             target = cfg.targets[name]
             entry = {"name": name, "path": target.path, "kind": target.kind}
             try:
-                usage = self._target_usage(target)
+                usage = target_usage(target)
             except OSError as exc:
                 unreachable.append({"name": name, "path": target.path, "system": False, "targets": [entry],
                                     "error": str(exc)})
@@ -404,20 +403,6 @@ class BackupManager:
             disk["error"] = ""
             del disk["device"]
         return list(disks.values()) + unreachable
-
-    @staticmethod
-    def _target_usage(target) -> dict:
-        """Space of the filesystem of a destination; OSError when it cannot be reached."""
-        if not os.path.isdir(target.path):
-            raise OSError(f"{target.path} does not exist")
-        if target.kind == "nfs":
-            try:
-                fstype = mount_fstype(target.path)
-            except OSError:
-                fstype = None
-            if not fstype or not fstype.startswith("nfs"):
-                raise OSError(f"{target.path} is not on an NFS mount")
-        return disk_usage(target.path)
 
     def jobs(self) -> dict:
         """The [job.<name>] sections: what, when, next and last run; and the scheduler's state."""
@@ -649,6 +634,24 @@ class BackupManager:
         run.lock = None
         run.state = state  # last: a run seen ended never keeps the next one from starting
         log.info("%s %d ended: %s", run.kind, run.id, run.state)
+        self._notify(run, state)
+
+    def _notify(self, run: Run, state: str) -> None:
+        """Tell the [notify.<name>] channels how the run ended (after it shows as ended)."""
+        try:
+            channels = self.config().notify
+        except ConfigError as exc:
+            log.warning("%s %d: no notification: %s", run.kind, run.id, exc)
+            return
+        if run.kind == "restore":
+            guest = run.guests[0].label if run.guests else "?"
+            message = notify.restore_notification(state, backup=run.backup, target=run.target, guest=guest,
+                                                  error=run.error, message=run.message, user=run.user)
+        else:
+            message = notify.backup_notification(state, source=run.source, target=run.target, results=run.results,
+                                                 report=run.report, error=run.error, job=run.job, by="web",
+                                                 user=run.user)
+        notify.send(channels, message)
 
     def cancel(self, run_id: int, user: str = "") -> bool:
         """Ask the running backup to stop (snapshots deleted, partial backups removed), or the

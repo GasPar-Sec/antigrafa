@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from .notify import NotifyConfig
 from .platforms.base import check_name
 from .schedule import Schedule, parse_schedule
 from .targets import TargetConfig
@@ -173,10 +174,18 @@ class SchedulerConfig:
     web interface: the lock that keeps one run at a time, and the state of each job."""
 
     data_dir: str = ""  # "": default_scheduler_dir(); writable by the scheduler and the web interface
+    # The checks behind the "system" notifications (destinations, nodes): every so many
+    # minutes, 0 = never; a destination this full (percent) is a problem
+    check_minutes: int = 10
+    disk_alert_percent: int = 90
 
     def __post_init__(self) -> None:
         if not isinstance(self.data_dir, str):
             raise ValueError("data_dir must be a string")
+        for name, top in (("check_minutes", 7 * 24 * 60), ("disk_alert_percent", 100)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= top:
+                raise ValueError(f"{name} must be a whole number from 0 to {top}")
 
     @property
     def directory(self) -> Path:
@@ -229,6 +238,7 @@ class Config:
     log: LogConfig = field(default_factory=LogConfig)
     jobs: dict[str, JobConfig] = field(default_factory=dict)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    notify: dict[str, NotifyConfig] = field(default_factory=dict)
 
     def source(self, name: str | None) -> SourceConfig:
         return _pick(self.sources, name, "source")
@@ -307,7 +317,7 @@ def load_config(path: str | Path) -> Config:
             f"[{'], ['.join(sorted(old))}]: these sections moved into [source.<name>] "
             'with type = "proxmox" (see antigrafa.example.toml)'
         )
-    unknown = set(raw) - {"source", "target", "tuning", "web", "log", "job", "scheduler"}
+    unknown = set(raw) - {"source", "target", "tuning", "web", "log", "job", "scheduler", "notify"}
     if unknown:
         raise ConfigError(f"unknown sections: {', '.join(sorted(unknown))}")
 
@@ -327,7 +337,17 @@ def load_config(path: str | Path) -> Config:
         log=build_section(LogConfig, raw.get("log", {}), "log"),
         jobs={name: _job(name, data, sources, targets) for name, data in _tables(raw, "job").items()},
         scheduler=build_section(SchedulerConfig, raw.get("scheduler", {}), "scheduler"),
+        notify={name: _notify(name, data) for name, data in _tables(raw, "notify").items()},
     )
+
+
+def _notify(name: str, data: dict) -> NotifyConfig:
+    section = f"notify.{name}"
+    try:
+        check_name(name, "channel name")
+    except ValueError as exc:
+        raise ConfigError(f"[{section}]: {exc}") from None
+    return build_section(NotifyConfig, data, section, name=name)
 
 
 def _job(name: str, data: dict, sources: dict, targets: dict) -> JobConfig:

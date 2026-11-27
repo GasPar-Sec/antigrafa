@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from . import monitor, notify
 from .config import Config, ConfigError, JobConfig, load_config
 from .jobs import BackupRunner
 from .liverun import LiveRun
@@ -198,9 +199,11 @@ def execute_job(
     selected: list = []
     error = ""
     runner = None
+    source, target = job.source or "?", job.target or "?"  # the names, once known
     try:
         platform, repo, selected = prepare_backup(cfg, job.source or None, job.target or None,
                                                   job.guests, job.all, job.exclude)
+        source, target = platform.name, repo.cfg.name
         log.info("job %s: %d guest(s) of %s to %s", job.name, len(selected), platform.name, repo.cfg.name)
         if live is not None:
             live.begin(platform.name, repo.cfg.name, selected)
@@ -227,6 +230,9 @@ def execute_job(
     log.info("job %s ended: %s", job.name, state)
     if live is not None:
         live.finish(state, error, lines)
+    notify.send(cfg.notify, notify.backup_notification(
+        state, source=source, target=target, results=results, report=lines, error=error, job=job.name, by=by,
+        user=user))
     return result, lines
 
 
@@ -239,6 +245,7 @@ class Scheduler:
         now: Callable[[], datetime] = _now,
         tick: float = TICK,
         lock_poll: float = 5.0,
+        watch: monitor.SystemWatch | None = None,
     ) -> None:
         self.config_path = config_path
         self._load = load
@@ -255,6 +262,8 @@ class Scheduler:
         self._started_here: dict[str, datetime] = {}  # every: the last starts, if the state is not writable
         self._config_error = ""
         self._directory: Path | None = None
+        self._watch = watch or monitor.SystemWatch()
+        self._next_check = 0.0  # time.monotonic() of the next system check
 
     # ------------------------------------------------------------- checking
 
@@ -381,13 +390,41 @@ class Scheduler:
         finally:
             lock.release()
 
+    def system_check(self, force: bool = False) -> None:
+        """The checks behind the "system" notifications, every ``check_minutes`` (see ``monitor``)."""
+        if not force and time.monotonic() < self._next_check:
+            return
+        try:
+            cfg = self._load(self.config_path)
+        except ConfigError:
+            return  # check() already says it
+        minutes = cfg.scheduler.check_minutes
+        self._next_check = time.monotonic() + (minutes or 60) * 60
+        if not minutes:
+            return
+        try:
+            self._watch.check(cfg)
+        except Exception:  # pragma: no cover - never stops the scheduler
+            log.exception("system check")
+
+    def _previous_stop(self, cfg: Config) -> None:
+        """Started again: notify if the last run of the scheduler ended without stopping."""
+        previous = read_json(cfg.scheduler.directory / STATUS_FILE)
+        if previous and not previous.get("stopped") and previous.get("heartbeat"):
+            monitor.scheduler_event(cfg, "The scheduler started again after an unexpected stop", [
+                f"Its last sign of life: {previous['heartbeat'][:19].replace('T', ' ')} UTC.",
+                "Jobs due meanwhile did not run.",
+            ])
+
     def serve(self) -> int:
         """Run until ``stop`` (Ctrl+C, SIGTERM): the running backup is then cancelled and cleaned up."""
+        cfg = None
         try:
             cfg = self._load(self.config_path)
             jobs = [n for n, j in cfg.jobs.items() if j.enabled]
             log.info("scheduler started: %d job(s) enabled%s (state in %s)", len(jobs),
                      f" ({', '.join(sorted(jobs))})" if jobs else "", cfg.scheduler.directory)
+            self._previous_stop(cfg)
         except ConfigError as exc:
             log.error("configuration: %s", exc)
         worker = threading.Thread(target=self.work, name="scheduler-worker", daemon=True)
@@ -395,13 +432,19 @@ class Scheduler:
         try:
             while not self.stop.is_set():
                 self.check()
+                self.system_check()
                 self.stop.wait(self._tick)
         except KeyboardInterrupt:
             log.info("scheduler stopping%s", f": job {self._running} is cancelled" if self._running else "")
         finally:
+            running = self._running
             self.stop.set()
             with self._cond:
                 self._cond.notify_all()
             worker.join()
             self._write_status(stopped=True)
+            if cfg is not None:
+                monitor.scheduler_event(cfg, "The scheduler stopped", [
+                    "Jobs do not run until it starts again." + (f" Job {running} was cancelled." if running else ""),
+                ])
         return 0

@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/github/license/GasPar-Sec/antigrafa)](LICENSE)
 
 Antigrafa backs up virtual machines (VMs) and containers. It runs on its own machine,
-not on the servers it backs up. It first freezes the disks with a snapshot, then copies
+not on the servers. It first freezes the disks with a snapshot, then copies
 them slowly enough that **the VMs never slow down**.
 
 | Platform | Status |
@@ -20,8 +20,8 @@ On Linux, with Python 3.11 or newer:
 sudo deploy/install.sh
 ```
 
-The script installs Antigrafa, creates an SSH key and a default configuration, then prints
-the next steps. Follow~ them, then start the services:
+The script installs Antigrafa, an SSH key and a default configuration, and prints the
+next steps. Follow them, then start the services:
 
 ```sh
 sudo systemctl start antigrafa-scheduler antigrafa-web
@@ -37,6 +37,7 @@ Edit `/etc/antigrafa/antigrafa.toml`. Every option is explained in the file itse
 | `[source.<name>]` | what to back up (a cluster) |
 | `[target.<name>]` | where backups go (a folder, an NFS share) |
 | `[job.<name>]` | backups that run on a schedule |
+| `[notify.<name>]` | notifications: email, Discord, Teams |
 
 ## Usage
 
@@ -47,6 +48,7 @@ antigrafa list --target nas             # list the backups
 antigrafa verify --target nas           # check the backups can be read
 antigrafa restore-guest --target nas <backup>   # <backup>: a name shown by 'list'
 antigrafa job list                      # scheduled backups
+antigrafa notify test                   # test notifications
 ```
 
 - `-v`: more details, `-q`: errors only, `--help`: all the options of a command.

@@ -85,6 +85,23 @@ def disk_usage(path: str) -> dict:
     return {"total": usage.total, "used": usage.used, "free": usage.free, "device": os.stat(path).st_dev}
 
 
+def target_usage(target) -> dict:
+    """``disk_usage`` of a destination (a ``TargetConfig``); OSError when it cannot be
+    reached: missing, or an NFS one not mounted (never the local disk under it)."""
+    from .targets import mount_fstype
+
+    if not os.path.isdir(target.path):
+        raise OSError(f"{target.path} does not exist")
+    if target.kind == "nfs":
+        try:
+            fstype = mount_fstype(target.path)
+        except OSError:
+            fstype = None
+        if not fstype or not fstype.startswith("nfs"):
+            raise OSError(f"{target.path} is not on an NFS mount")
+    return disk_usage(target.path)
+
+
 def directory_size(path: str | os.PathLike) -> tuple[int, int]:
     """Bytes the files under ``path`` take on disk, and the number of complete backups
     (manifests) among them. Files that vanish meanwhile (a backup running) are skipped."""

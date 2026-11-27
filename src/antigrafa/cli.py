@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-from . import operations
+from . import notify, operations
 from .config import Config, ConfigError, default_config_path, load_config
 from .index import read_index, read_manifest
 from .pipeline import READ_AHEAD, in_order, restore_stream
@@ -59,15 +59,23 @@ def cmd_backup(cfg: Config, args) -> int:
     runner = BackupRunner(cfg.tuning, platform, repo, progress=progress)
     started = datetime.now().astimezone()
     start = time.monotonic()
+    results, error = [], ""
     try:
         results = runner.run(guests)
+    except Exception as exc:
+        error = str(exc) or type(exc).__name__
+        raise
     finally:
         runner.close()
         progress.finish()
-    elapsed = time.monotonic() - start
+        lines = report_lines(results, started, time.monotonic() - start)
+        new_data = new_data_line(runner.controller.stats())
+        state = operations.backup_state(len(guests), results, error)
+        notify.send(cfg.notify, notify.backup_notification(
+            state, source=platform.name, target=repo.cfg.name, results=results, report=lines[1:], error=error,
+            by="command line"))
 
-    _backup_report(results, started, elapsed)
-    new_data = new_data_line(runner.controller.stats())
+    print("\n".join(lines))
     if new_data:
         print(new_data)
     return 0 if all(r.ok for r in results) else 1
@@ -168,10 +176,18 @@ def cmd_restore_guest(cfg: Config, args) -> int:
                              overwrite=args.overwrite, disk_only=args.disk_only, stop=args.stop or "",
                              start=args.start)
     progress = args.progress_bar
+    guest = f"{str(manifest.get('guest', {}).get('kind', '')).upper()} {guest_id}".strip()
     try:
         done = restore_guest(platform, repo, args.backup, request, progress, jobs=args.jobs)
-    finally:
+    except BaseException as exc:
         progress.finish()
+        notify.send(cfg.notify, notify.restore_notification(
+            "cancelled" if isinstance(exc, KeyboardInterrupt) else "failed", backup=args.backup,
+            target=repo.cfg.name, guest=guest, error=str(exc) or type(exc).__name__))
+        raise
+    progress.finish()
+    notify.send(cfg.notify, notify.restore_notification("ok", backup=args.backup, target=repo.cfg.name,
+                                                        guest=guest, message=str(done)))
     print(done)
     return 0
 
@@ -246,6 +262,23 @@ def _when(text: str | None) -> str:
     if not text:
         return "-"
     return datetime.fromisoformat(text).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def cmd_notify_test(cfg: Config, args) -> int:
+    """Send a test message to every [notify.<name>] channel (or the one named), whatever its events."""
+    names = [args.name] if args.name else sorted(cfg.notify)
+    if not names:
+        print("no notification channel configured ([notify.<name>] sections)")
+        return 1
+    unknown = [n for n in names if n not in cfg.notify]
+    if unknown:
+        raise ConfigError(f"unknown channel {unknown[0]} ({', '.join(sorted(cfg.notify)) or 'none configured'})")
+    failed = 0
+    for name in names:
+        errors = notify.send(cfg.notify, notify.test_notification(name), only=name)
+        print(f"{name} ({cfg.notify[name].type}): {'not sent: ' + errors[name] if name in errors else 'sent'}")
+        failed += name in errors
+    return 1 if failed else 0
 
 
 def cmd_job_list(cfg: Config, args) -> int:
@@ -411,6 +444,12 @@ def build_parser() -> argparse.ArgumentParser:
     jr = jsub.add_parser("run", help="run a job now (waits for a backup or restore in progress)")
     jr.add_argument("name")
     jr.set_defaults(func=cmd_job_run)
+
+    n = sub.add_parser("notify", help="notifications by email, Discord or Teams ([notify.<name>] sections)")
+    nsub = n.add_subparsers(dest="notify_cmd", required=True)
+    nt = nsub.add_parser("test", help="send a test message to every channel, or to one")
+    nt.add_argument("name", nargs="?", help="one channel: the <name> of its [notify.<name>] section")
+    nt.set_defaults(func=cmd_notify_test)
 
     w = sub.add_parser("web", help="web interface (HTTPS): start and follow backups")
     wsub = w.add_subparsers(dest="web_cmd", required=True)

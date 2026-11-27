@@ -124,6 +124,45 @@ every = "6h"
 # Default: /var/lib/antigrafa/scheduler (Linux), %PROGRAMDATA%\antigrafa\scheduler (Windows).
 # [scheduler]
 # data_dir = "/var/lib/antigrafa/scheduler"
+# check_minutes = 10          # how often it checks destinations and nodes ("system" events); 0 = never
+# disk_alert_percent = 90     # a destination this full (%) is a problem
+
+# =========================================================================== notifications
+# One [notify.<name>] section per channel. Test them all: antigrafa notify test
+# A channel that fails is logged and never fails the backup it reports.
+#
+# events: what the channel receives (default: everything but "backup-ok"):
+#   "backup-failed"   a backup with a guest that failed, or the whole run, or cancelled
+#   "backup-ok"       a backup where every guest succeeded
+#   "restore"         the end of a restore, successful or not
+#   "system"          found by the scheduler: a destination unreachable or nearly full,
+#                     a node offline, the scheduler stopped; and when it is over
+
+# Email, through your mail server
+[notify.admins]
+type = "email"
+smtp_host = "smtp.example.lan"
+# smtp_port = 587             # default: 587 (starttls), 465 (ssl), 25 (none)
+security = "starttls"         # "starttls", "ssl" or "none"
+username = "antigrafa@example.lan"                 # leave out when the server needs no login
+password_file = "/etc/antigrafa/smtp-password"     # or password = "..."
+sender = "antigrafa@example.lan"
+to = ["admin@example.lan"]
+events = ["backup-failed", "restore", "system"]
+
+# Discord: Server settings > Integrations > Webhooks > New webhook > Copy webhook URL.
+# The address lets anyone post: keep it in a file readable by the services only.
+# [notify.discord]
+# type = "discord"
+# url_file = "/etc/antigrafa/discord-webhook"     # or url = "https://discord.com/api/webhooks/..."
+# events = ["backup-failed", "backup-ok", "restore", "system"]
+
+# Microsoft Teams: in the channel, ... > Workflows > "Send webhook alerts to a channel",
+# then copy the address it gives (the old "Incoming Webhook" connectors are retired).
+# [notify.teams]
+# type = "teams"
+# url_file = "/etc/antigrafa/teams-webhook"
+# events = ["backup-failed", "system"]
 
 # =========================================================================== log file
 # Every command writes its log to a file (more details with -v; -q only quiets the screen).

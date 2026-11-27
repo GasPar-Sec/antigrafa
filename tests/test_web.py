@@ -1344,3 +1344,24 @@ def test_account_ignores_an_unknown_form(client):
     assert client.post("/account/", {"form": "other"}).status_code == 200
     assert "is changed" not in client.get("/account/?saved=nonsense").content.decode()
     assert client.delete("/account/").status_code == 405
+
+
+def test_manager_notifies_the_end_of_a_run(lab, monkeypatch):
+    from antigrafa import notify
+
+    sent = []
+    monkeypatch.setattr(notify, "send", lambda channels, n: sent.append((channels, n)))
+    lab.cfg.notify = {"ops": notify.NotifyConfig(name="ops", type="discord", url="https://x/y")}
+    backup = _backed_up(lab)  # a backup by alice, from the page
+    _wait(lambda: sent)  # sent right after the run shows as ended
+    [(channels, n)] = sent
+    assert channels is lab.cfg.notify and n.event == "backup-ok" and n.title == "Backup succeeded: lab -> local"
+    assert "started from the web by alice" in n.lines[0]
+    fake = FakeRestore(PlatformError("id 2 is taken"))
+    fake.go.set()
+    monkeypatch.setattr(manager_module, "restore_guest", fake)
+    run = lab.manager.start_restore(target=None, backup=backup["path"], user="bob")
+    _wait(lambda: not run.active)
+    _wait(lambda: len(sent) == 2)
+    restore = sent[1][1]
+    assert restore.event == "restore" and restore.status == "failed" and "Error: id 2 is taken" in restore.lines

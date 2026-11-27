@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -788,7 +789,7 @@ def test_restore_guest_command(tmp_path, monkeypatch, capsys):
     args = cli.build_parser().parse_args(["restore-guest", "c1/vm/650/2026-11-21T10-00-00Z", "--host", "pve1",
                                           "--storage", "thick", "--jobs", "2"])
     args.progress_bar = Progress(enabled=False)
-    assert cli.cmd_restore_guest(None, args) == 0
+    assert cli.cmd_restore_guest(SimpleNamespace(notify={}), args) == 0  # no notification channel
     assert sources == ["c1"]  # the source the backup came from
     # No terminal, no --id: the original id; it is free on this simulated cluster
     assert "VM 650 restored on pve1" in capsys.readouterr().out
