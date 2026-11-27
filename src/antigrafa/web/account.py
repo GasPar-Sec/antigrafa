@@ -1,8 +1,10 @@
 """The page of the signed-in user (a click on their name): their name, email and password.
 
 Two forms on one page, told apart by the ``form`` field. After a change, the page is
-loaded again (``?saved=``) so that reloading it never sends the form twice. A new
-password signs out the user's other sessions, not this one.
+loaded again (``?saved=``) so that reloading it never sends the form twice, scrolled to
+the form just saved (``#details``, ``#password``), whose confirmation shows in it: the
+user clicked at the bottom of the page and sees it there. A new password signs out the
+user's other sessions, not this one.
 """
 
 from __future__ import annotations
@@ -40,13 +42,13 @@ def account(request: HttpRequest):
             profile = ProfileForm(request.POST, instance=user)
             if profile.is_valid():
                 profile.save()
-                return redirect(reverse("account") + "?saved=profile")
+                return redirect(reverse("account") + "?saved=profile#details")
         elif which == "password":
             password = PasswordChangeForm(user, request.POST)
             if password.is_valid():
                 password.save()
                 update_session_auth_hash(request, password.user)  # this session stays signed in
-                return redirect(reverse("account") + "?saved=password")
+                return redirect(reverse("account") + "?saved=password#password")
     return render(
         request,
         "antigrafa/account.html",
@@ -55,6 +57,7 @@ def account(request: HttpRequest):
             "profile": profile,
             "password": password,
             "password_rules": password_validators_help_texts(),
-            "saved": SAVED.get(request.GET.get("saved", "")),
+            "saved": request.GET.get("saved", "") if request.GET.get("saved", "") in SAVED else "",
+            "saved_message": SAVED.get(request.GET.get("saved", ""), ""),
         },
     )

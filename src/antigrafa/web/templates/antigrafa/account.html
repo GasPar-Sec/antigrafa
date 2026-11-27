@@ -6,12 +6,12 @@ The page of the signed-in user, reached by a click on their name: their details,
 {% block body %}
 {% include "antigrafa/header.html" %}
 <main style="max-width: 620px;">
-  {% if saved %}<section><p class="state-ok" style="margin: 0;">{{ saved }}</p></section>{% endif %}
-
-  <section>
+  <section id="details">
     <h2>Your details</h2>
+    {% if saved == "profile" %}<p class="saved" role="status">✓ {{ saved_message }}</p>{% endif %}
     <p class="muted" style="margin-top: -6px;">Signed in as <strong>{{ user.get_username }}</strong>.</p>
-    <form method="post" action="{% url 'account' %}">
+    {# The page comes back to this form: its errors, or its confirmation, are in view #}
+    <form method="post" action="{% url 'account' %}#details">
       {% csrf_token %}
       <input type="hidden" name="form" value="profile">
       {% if profile.non_field_errors %}<p class="error">{{ profile.non_field_errors|join:" " }}</p>{% endif %}
@@ -26,9 +26,10 @@ The page of the signed-in user, reached by a click on their name: their details,
     </form>
   </section>
 
-  <section>
+  <section id="password">
     <h2>Password</h2>
-    <form method="post" action="{% url 'account' %}">
+    {% if saved == "password" %}<p class="saved" role="status">✓ {{ saved_message }}</p>{% endif %}
+    <form method="post" action="{% url 'account' %}#password">
       {% csrf_token %}
       <input type="hidden" name="form" value="password">
       {% if password.non_field_errors %}<p class="error">{{ password.non_field_errors|join:" " }}</p>{% endif %}

@@ -1286,6 +1286,8 @@ def test_account_page_from_the_user_name(client):
     assert "Your details" in page and 'name="first_name"' in page and 'name="email"' in page
     assert 'name="old_password"' in page and 'name="new_password2"' in page
     assert "at least 12 characters" in page  # the password rules, shown before typing
+    # Each form brings the page back to itself, errors included
+    assert 'action="/account/#details"' in page and 'action="/account/#password"' in page
     assert 'href="/account/" class="account-link" title="Your details and password" aria-current="page"' in page
 
 
@@ -1295,10 +1297,13 @@ def test_account_details_are_saved(client):
     _login(client)
     response = client.post("/account/", {"form": "profile", "first_name": "Alice", "last_name": "Martin",
                                          "email": "alice@example.org"})
-    assert response.status_code == 302 and response["Location"] == "/account/?saved=profile"
+    assert response.status_code == 302 and response["Location"] == "/account/?saved=profile#details"
     user = get_user_model().objects.get(username="alice")
     assert (user.first_name, user.last_name, user.email) == ("Alice", "Martin", "alice@example.org")
-    assert "Your details are saved." in client.get(response["Location"]).content.decode()
+    page = client.get(response["Location"]).content.decode()
+    # The confirmation shows in the section the page scrolls to (#details), under its title
+    assert '<section id="details">' in page
+    assert page.index("Your details are saved.") < page.index('<section id="password">')
     assert ">Alice Martin</a>" in client.get("/").content.decode()  # the header shows the name
 
     page = client.post("/account/", {"form": "profile", "first_name": "A", "last_name": "", "email": "not-an-email"})
@@ -1323,7 +1328,9 @@ def test_password_change(client):
     assert "too short" in short.content.decode()
     response = client.post("/account/", {"form": "password", "old_password": PASSWORD,
                                          "new_password1": new, "new_password2": new})
-    assert response["Location"] == "/account/?saved=password"
+    assert response["Location"] == "/account/?saved=password#password"
+    page = client.get(response["Location"]).content.decode()
+    assert page.index('<section id="password">') < page.index("Your password is changed.")
     assert client.get("/").status_code == 200  # this session stays signed in
     assert other.get("/").status_code == 302  # the other one is signed out
     assert get_user_model().objects.get(username="alice").check_password(new)
@@ -1335,4 +1342,5 @@ def test_password_change(client):
 def test_account_ignores_an_unknown_form(client):
     _login(client)
     assert client.post("/account/", {"form": "other"}).status_code == 200
+    assert "is changed" not in client.get("/account/?saved=nonsense").content.decode()
     assert client.delete("/account/").status_code == 405
