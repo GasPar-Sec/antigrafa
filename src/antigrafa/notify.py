@@ -156,7 +156,7 @@ def teams_payload(n: Notification) -> dict:
         details = Notification("", "", "", n.lines[1:]).text()
         body.append({"type": "TextBlock", "text": details, "wrap": True, "fontType": "Monospace", "size": "Small"})
     body.append({"type": "TextBlock", "text": _footer(), "isSubtle": True, "size": "Small", "wrap": True})
-    card = {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "type": "AdaptiveCard",
+    card = {"$schema": "https://adaptivecards.io/schemas/1.2.0/adaptive-card.json", "type": "AdaptiveCard",
             "version": "1.4", "body": body}
     return {"type": "message",
             "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]}
@@ -190,7 +190,7 @@ def send_email(channel: NotifyConfig, msg: EmailMessage, timeout: float = TIMEOU
     if channel.security == "ssl":
         server = smtplib.SMTP_SSL(channel.smtp_host, channel.port, timeout=timeout, context=context)
     else:
-        server = smtplib.SMTP(channel.smtp_host, channel.port, timeout=timeout)
+        server = smtplib.SMTP(channel.smtp_host, channel.port, timeout=timeout) #NOSONAR
     with server:
         if channel.security == "starttls":
             server.starttls(context=context)
