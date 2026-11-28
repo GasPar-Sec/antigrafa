@@ -9,7 +9,7 @@ import pytest
 from antigrafa import delta
 from antigrafa.chunkstore import digest_of
 from antigrafa.pipeline import raw_records
-from antigrafa.reconnect import Meter, ReconnectingReader, SlowDetector, StreamWatch
+from antigrafa.reconnect import Meter, ReconnectingReader, ResumeMismatch, SlowDetector, StreamWatch
 
 MiB = 1024 * 1024
 CHUNK = 4096
@@ -264,3 +264,85 @@ def test_watchdog_stops_with_the_reader():
         records.close()  # the backup stopped early (error, cancel)
     time.sleep(0.05)
     assert not [t for t in threading.enumerate() if t.name == "stream-watch"]
+
+
+# --------------------------------------------------------------------------- stream made again (tar)
+
+
+def test_checked_stream_resumes_one_chunk_earlier(caplog):
+    data = os.urandom(5 * CHUNK + 100)
+    first = Stalling(data[: 2 * CHUNK + 1000])
+    opened = []
+
+    def reopen(start):
+        opened.append(start)
+        return Stalling(data[start * CHUNK :], stall=False)
+
+    reader = ReconnectingReader(first, _raw, reopen, FAST, "CT 7: rootfs", CHUNK, check=True)
+    with caplog.at_level(logging.WARNING), reader:
+        records = list(reader.records())
+
+    assert [r[1] for r in records] == _chunks(data)  # chunk 1, read again, is not given twice
+    assert opened == [1] and reader.reconnects == 1
+    assert "new connection from 8.0 KiB (1/5)" in caplog.text  # the next chunk not received
+
+
+def test_checked_stream_that_collapsed_at_once_starts_at_zero():
+    data = os.urandom(3 * CHUNK)
+    opened = []
+
+    def reopen(start):
+        opened.append(start)
+        return Stalling(data[start * CHUNK :], stall=False)
+
+    reader = ReconnectingReader(Stalling(data[:100]), _raw, reopen, FAST, "CT 7: rootfs", CHUNK, check=True)
+    with reader:
+        assert [r[1] for r in reader.records()] == _chunks(data)
+    assert opened == [0]
+
+
+def test_checked_stream_that_differs_stops_the_read():
+    data = os.urandom(4 * CHUNK)
+    other = bytearray(data)
+    other[CHUNK + 7] ^= 1  # the archive made again is not the same in chunk 1
+    other = bytes(other)
+    reopen = lambda start: Stalling(other[start * CHUNK :], stall=False)  # noqa: E731
+    reader = ReconnectingReader(Stalling(data[: 2 * CHUNK + 10]), _raw, reopen, FAST, "CT 7: rootfs", CHUNK, check=True)
+    received = []
+    with pytest.raises(ResumeMismatch, match="CT 7: rootfs: .*chunk 1 differs"), reader:
+        for record in reader.records():
+            received.append(record[1])
+    assert received == _chunks(data)[:2]  # nothing of the other archive was given
+
+
+def test_checked_stream_that_ends_too_early_stops_the_read():
+    data = os.urandom(3 * CHUNK)
+    reopen = lambda start: Stalling(b"", stall=False)  # noqa: E731
+    reader = ReconnectingReader(Stalling(data[: CHUNK + 10]), _raw, reopen, FAST, "CT 7: rootfs", CHUNK, check=True)
+    with pytest.raises(ResumeMismatch, match="ended before chunk 0"), reader:
+        list(reader.records())
+
+
+def test_checked_hashed_stream_resumes_one_chunk_earlier():
+    old = os.urandom(6 * CHUNK)
+    new = bytearray(old)
+    new[3 * CHUNK + 5] ^= 1  # chunk 3 changed: sent; the others only marked unchanged
+    new = bytes(new)
+    reference = [digest_of(c) for c in _chunks(old)]
+    wire = _relay(new, reference)
+    cut = len(delta.MAGIC) + 3 * 5 + 100  # three unchanged chunks, then in the middle of chunk 3
+    opened = []
+
+    def reopen(start):
+        opened.append(start)
+        return Stalling(_relay(new[start * CHUNK :], reference[start:]), stall=False)
+
+    def parse(stream, start):
+        return delta.read_records(stream, reference[start:])
+
+    reader = ReconnectingReader(Stalling(wire[:cut]), parse, reopen, FAST, "CT 7: rootfs", CHUNK, check=True)
+    with reader:
+        records = list(reader.records())
+
+    assert records == list(delta.read_records(io.BytesIO(wire), reference))  # as if never cut
+    assert opened == [2]  # unchanged chunk 2 checked by its digest

@@ -885,3 +885,40 @@ def test_collapsed_stream_goes_on_over_a_new_connection(repo, tmp_path, caplog):
     with open(out, "wb") as f:
         restore_stream(repo.store, digests, f, size)
     assert out.read_bytes() == disk.data  # complete and in order
+
+
+def test_collapsed_tar_stream_is_checked_on_the_new_connection(repo, tmp_path):
+    guest = Guest("7", "ct", "dns", "h1")
+    tree = CollapsingDisk("rootfs", os.urandom(DISK_SIZE), cut=2 * 1024 * 1024 + 1000)
+    tree.format, tree.size_known, tree.resume_check = "tar", False, True
+    platform = MemoryPlatform([guest], {"7": [tree]})
+
+    [result] = _run(platform, repo, [guest], stream_window_s=0.2)
+
+    assert result.ok, result.error
+    assert tree.reopened == [1]  # one chunk earlier: the archive made again is checked there
+    assert result.disks[0].stats.reconnects == 1
+    path, manifest = repo.list_snapshots()[-1]
+    entry = manifest["disks"][0]
+    size, _, digests = read_index(repo.resolve(path) / entry["index"])
+    out = tmp_path / "restored.tar"
+    with open(out, "wb") as f:
+        restore_stream(repo.store, digests, f, size)
+    assert out.read_bytes() == tree.data
+
+
+def test_tar_stream_made_again_differently_fails_the_disk(repo):
+    guest = Guest("7", "ct", "dns", "h1")
+    tree = CollapsingDisk("rootfs", os.urandom(DISK_SIZE), cut=2 * 1024 * 1024 + 1000)
+    tree.format, tree.size_known, tree.resume_check = "tar", False, True
+    first = tree.data[: tree.cut]  # what the first connection gave
+    other = bytearray(tree.data)
+    other[1024 * 1024 + 3] ^= 1  # chunk 1 of the archive made again is not the one received
+    tree.data = bytes(other)  # what the new connection reads
+    tree.open_stream = lambda: StallingStream(first)
+    platform = MemoryPlatform([guest], {"7": [tree]})
+
+    [result] = _run(platform, repo, [guest], stream_window_s=0.2)
+
+    assert not result.ok
+    assert "chunk 1 differs" in result.error

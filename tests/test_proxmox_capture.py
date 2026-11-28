@@ -521,3 +521,60 @@ def test_reads_that_cannot_start_mid_way_are_not_reopened(monkeypatch):
     rbd = make_source(ssh, {"type": "rbd", "pool": "vms"}, Disk("scsi0", "ceph:vm-1-disk-0"), "s")
     rbd.open_stream()  # rbd export: no offset
     assert rbd.reopener(MiB) is None
+
+
+def test_tar_archive_is_the_same_on_every_run():
+    ssh = FakeSSH({"zfs get -H -o value mountpoint": "/rpool/data/subvol-101-disk-0\n"})
+    src = ZfsDatasetSource(ssh, ZFS, Disk("rootfs", "z:subvol-101-disk-0"), "snap1")
+    src.prepare()
+    argv = shlex.split(src.stream_command())
+    # Neither atime, nor ctime, nor the PID in a header: so that a read can start again
+    assert "--pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime" in argv
+    assert "--sparse-version=0.0" in argv
+    assert src.resume_check is True
+    assert ZfsZvolSource.resume_check is False  # a fixed image needs no check
+
+
+def test_tar_read_reopens_from_a_chunk():
+    ssh = StreamingSSH({"zfs get -H -o value mountpoint": "/rpool/data/subvol-101-disk-0\n"})
+    src = make_source(ssh, ZFS, Disk("rootfs", "local-zfs:subvol-101-disk-0"), "snap1", low_priority=False)
+    src.prepare()
+    assert src.stream_command_from(0) == src.stream_command()
+    src.open_stream()
+    src.reopener(4 * MiB)(3)
+    cmd, sent = ssh.streamed
+    assert sent is None
+    argv = shlex.split(cmd)
+    assert argv[:2] == ["bash", "-c"] and len(argv) == 3
+    # The same tar, its first three chunks dropped on the node; a tar error is not lost
+    assert argv[2] == f"set -o pipefail; {src.stream_command()} | tail -c +{3 * 4 * MiB + 1}"
+    # Still found by the command that stops the readers of the snapshot
+    assert ".zfs/snapshot/snap1" in cmd
+
+
+def test_hashed_tar_read_reopens_with_the_rest_of_the_reference():
+    from antigrafa import delta
+
+    ssh = StreamingSSH({"zfs get -H -o value mountpoint": "/rpool/data/subvol-101-disk-0\n"})
+    src = make_source(ssh, ZFS, Disk("rootfs", "local-zfs:subvol-101-disk-0"), "snap1", remote_hash=True)
+    src.prepare()
+    reference = [b"a" * 32, b"b" * 32, b"c" * 32]
+    src.open_hashed_stream(reference, MiB)
+    src.reopener(MiB)(1)
+    cmd, sent = ssh.streamed
+    assert sent == delta.encode_reference(reference[1:])
+    argv = shlex.split(cmd)
+    assert argv[:2] == ["ionice", "-c"] and argv[-2] == str(MiB)  # same priority, same chunks
+    assert shlex.split(argv[-1])[:2] == ["bash", "-c"]
+    assert f"| tail -c +{MiB + 1}" in argv[-1]
+
+
+def test_live_tar_read_reopens_too():
+    ssh = StreamingSSH({"zfs get -H -o value mountpoint": "/rpool/data/subvol-101-disk-0\n"})
+    _, src = _live(ZFS, "local-zfs:subvol-101-disk-0", "rootfs", ssh=ssh)
+    src.prepare()
+    src.open_stream()
+    src.reopener(MiB)(2)
+    cmd, _ = ssh.streamed
+    assert f"-C /rpool/data/subvol-101-disk-0 . | tail -c +{2 * MiB + 1}" in cmd
+    assert src.reader_marker() in cmd  # the stop command finds it

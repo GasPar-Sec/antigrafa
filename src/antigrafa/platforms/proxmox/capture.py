@@ -504,10 +504,22 @@ class ZfsZvolSource(_ZfsSnapshots, VolumeSource):
             self._restore_snapdev = None
 
 
+# tar of a container's files. Two runs on the same files give the same archive, byte
+# for byte, so that a read can start again in the middle (``stream_command_from``):
+# - no atime nor ctime in the pax headers (reading a live tree changes atime);
+# - the pax header names without the PID (older tar versions put it in by default);
+# - sparse files in format 0.0: 0.1 and 1.0 put the PID in a header name.
+TAR_CREATE = (
+    "tar --numeric-owner --xattrs --acls --one-file-system --sparse --sparse-version=0.0 "
+    "--pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime"
+)
+
+
 class ZfsDatasetSource(_ZfsSnapshots, VolumeSource):
     """Container on a ZFS dataset: no block device, so we archive the snapshot's files."""
 
     format = "tar"
+    resume_check = True  # a new connection makes the archive again: checked
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -536,10 +548,16 @@ class ZfsDatasetSource(_ZfsSnapshots, VolumeSource):
     def stream_command(self) -> str:
         if not self.snapdir:
             raise RuntimeError("prepare() must be called first")
-        return (
-            "tar --numeric-owner --xattrs --acls --one-file-system --sparse "
-            f"-cf - -C {shlex.quote(self.snapdir)} ."
-        )
+        return f"{TAR_CREATE} -cf - -C {shlex.quote(self.snapdir)} ."
+
+    def stream_command_from(self, offset: int) -> str | None:
+        # The same tar again, its first ``offset`` bytes dropped on the node: they are
+        # read from the disk again, but not sent. The archive is the same byte for byte
+        # (see TAR_CREATE), and the reader checks it on the chunk before (resume_check).
+        if not offset:
+            return self.stream_command()
+        script = f"set -o pipefail; {self.stream_command()} | tail -c +{int(offset) + 1}"
+        return f"bash -c {shlex.quote(script)}"
 
     def reader_marker(self) -> str:
         if self.live:

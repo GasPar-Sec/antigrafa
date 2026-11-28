@@ -167,7 +167,9 @@ low_priority = true           # read with low priority on the node, behind the g
 
 # A read that stays very slow while Antigrafa waits for it is usually a network fault on
 # its connection only (a bad link in a bond or LACP group). It restarts where it stopped,
-# on a new connection. Not for containers, Ceph RBD, VMs read through QEMU, incrementals.
+# on a new connection. Containers (ZFS): their archive is made again on the node, only the
+# rest is sent, and the chunk before is checked. Not for Ceph RBD, VMs read through QEMU,
+# incrementals.
 stream_min_mib_s = 1          # slower than this (MiB/s) for stream_window_s: new connection; 0 = never
 stream_window_s = 60          # seconds
 stream_max_reconnects = 5     # new connections per disk at most
