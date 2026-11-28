@@ -36,6 +36,7 @@ class StreamStats:
     sent_bytes: int = 0  # chunk data that crossed the network
     stored_bytes: int = 0
     elapsed: float = 0.0
+    reconnects: int = 0  # new connections, the stream having become too slow (``reconnect``)
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -75,7 +76,8 @@ def read_full(stream: BinaryIO, size: int) -> bytes:
     return b"".join(parts)
 
 
-def _chunks(stream: BinaryIO, chunk_size: int) -> Iterator[tuple[bytes, bytes, int]]:
+def raw_records(stream: BinaryIO, chunk_size: int) -> Iterator[tuple[bytes, bytes, int]]:
+    """(digest, data, length) of each chunk of a raw stream (disk image or tar archive)."""
     while True:
         data = read_full(stream, chunk_size)
         if not data:
@@ -93,7 +95,7 @@ def backup_stream(
     on_read: Callable[[int], None] | None = None,
 ) -> tuple[list[bytes], StreamStats]:
     """Back up a raw stream. ``on_read(n)`` is called after each chunk read (progress)."""
-    return backup_records(_chunks(stream, chunk_size), store, controller, executor, throttle, on_read)
+    return backup_records(raw_records(stream, chunk_size), store, controller, executor, throttle, on_read)
 
 
 def backup_delta(

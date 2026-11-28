@@ -46,8 +46,10 @@ snapshot_mode = "auto"           # default: "proxmox"
 [source.cluster1.ssh]
 user = "root"                                  # SSH user on the nodes
 identity_file = "/etc/antigrafa/id_ed25519"    # private key; its public key goes in the nodes' authorized_keys
-# Faster encryption, useful above ~500 MiB/s:
-# options = ["Ciphers=aes128-gcm@openssh.com"]
+# ssh -o options. accept-new: a node's host key is recorded on the first connection,
+# and a key that changes afterwards is still refused.
+# Add "Ciphers=aes128-gcm@openssh.com" for faster encryption, useful above ~500 MiB/s.
+options = ["StrictHostKeyChecking=accept-new"]
 
 # SSH address of each node. Without it, the node name is used.
 [source.cluster1.nodes.pve1]
@@ -162,3 +164,10 @@ source_min_mib_s = 10         # never read slower than this
 host_iowait_high = 0.10       # above 10% iowait, read slower
 host_iowait_low = 0.03        # below 3% iowait, read faster
 low_priority = true           # read with low priority on the node, behind the guests
+
+# A read that stays very slow while Antigrafa waits for it is usually a network fault on
+# its connection only (a bad link in a bond or LACP group). It restarts where it stopped,
+# on a new connection. Not for containers, Ceph RBD, VMs read through QEMU, incrementals.
+stream_min_mib_s = 1          # slower than this (MiB/s) for stream_window_s: new connection; 0 = never
+stream_window_s = 60          # seconds
+stream_max_reconnects = 5     # new connections per disk at most

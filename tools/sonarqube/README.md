@@ -1,42 +1,50 @@
 # SonarQube (local, throwaway)
 
-[SonarQube Community Build](https://www.sonarsource.com/products/sonarqube/) checks code quality: bugs, security flaws, duplicated code, test coverage.
+[SonarQube](https://www.sonarsource.com/products/sonarqube/) checks code quality: bugs,
+security flaws, duplicated code, test coverage. Back to the [main README](../../README.md).
 
-`scan.py` creates a **fresh** SonarQube instance in Docker for each analysis, then **removes it entirely**. Nothing to install or configure, no password to remember. It works the same way on Windows (Docker Desktop + WSL2) and on Linux.
+`scan.py` starts a **new** SonarQube in Docker for each analysis, then **deletes it**.
+Nothing to install or configure, no password to remember. Works on Linux and on Windows
+(Docker Desktop + WSL2).
+
+## Contents
+
+- [Running an analysis](#running-an-analysis)
+- [What the script does](#what-the-script-does)
+- [The Quality Gate](#the-quality-gate)
+- [Good to know](#good-to-know)
 
 ## Running an analysis
 
-Requirements: Docker running, and the project venv activated with the dev tools installed (`pip install -e '.[dev]'`).
+You need Docker running and the project venv with the dev tools (`pip install -e '.[dev]'`).
 
 ```sh
-python tools/sonarqube/scan.py          # analyze, print a summary, then remove everything
-python tools/sonarqube/scan.py --keep   # same, but keep the web UI open until Enter
+python tools/sonarqube/scan.py          # analyze, print a summary, delete everything
+python tools/sonarqube/scan.py --keep   # same, but keep the web page open until Enter
 ```
 
-It can be run from any directory. It exits with code **0** if the Quality Gate passes, **1** otherwise.
+| Exit code | Meaning |
+|---|---|
+| 0 | the Quality Gate passes |
+| 1 | it fails |
 
 ## What the script does
 
-1. **Tests**: runs `pytest`, which writes `coverage.xml`. If a test fails, the script stops there.
-2. **Security**: runs `bandit` on `src/`, which writes `bandit-report.json`.
-3. **Update**: pulls the latest `sonarqube:community` and `sonar-scanner-cli:latest` images and prints "up to date" or "NEW VERSION".
-4. **Starts** a fresh SonarQube:
-   - on `127.0.0.1` only, on a random port (no conflict possible);
-   - with a random admin password and an analysis token created for the occasion;
-   - with the project Quality Gate (see below).
-5. **Analyzes** the code with the `scanner` container (the repository is mounted read-only).
-6. **Summary** in the terminal: Quality Gate verdict, metrics, list of issues with file and line, Security Hotspots to review.
-7. **Removes** the containers, network and volumes. If an image was updated, the old version is removed too.
-
-Removal happens **in every case**: success, failure, error or Ctrl+C. If an analysis was killed abruptly, the leftover instance is removed on the next run.
+1. Runs the tests (`pytest`, coverage) and the security check (`bandit`). Stops if a test fails.
+2. Downloads the latest SonarQube images, if any.
+3. Starts SonarQube on `127.0.0.1`, on a random port, with a random password.
+4. Analyzes the code (read-only) and prints the result: verdict, issues with file and line.
+5. Deletes the containers, network and volumes, **even on an error or Ctrl+C**.
 
 ## The Quality Gate
 
-SonarQube's default Quality Gate ("Sonar way") only judges **new code**. A fresh instance always runs its first analysis, so no code is "new" and the gate would always pass, even with a flaw. The script therefore creates its own gate, `antigrafa`, which applies the same thresholds to **all the code**:
+The Quality Gate is the pass/fail rule. SonarQube's default one only checks **new** code,
+and on a fresh instance no code is new, so it would always pass. The script uses its own
+gate, which checks **all** the code:
 
 | Condition | Threshold |
 |---|---|
-| Open issues (bugs, vulnerabilities, code smells, including bandit's) | 0 |
+| Open issues | 0 |
 | Security Hotspots reviewed | 100 % |
 | Test coverage | ≥ 80 % |
 | Duplicated lines | ≤ 3 % |
@@ -45,9 +53,10 @@ The thresholds are in `QUALITY_GATE_CONDITIONS`, at the top of `scan.py`.
 
 ## Good to know
 
-- **Coverage depends on the Python version**: `compress.py` uses the standard library's zstd on Python 3.14+ and the `zstandard` package before, so only one of the two branches is covered by a given interpreter.
-- **No history**: each analysis starts from scratch. The terminal summary is the result. To explore in detail in the web UI, use `--keep`.
-- **Duration**: about 3 to 4 minutes, 1 to 2 of which to start SonarQube.
-- **Embedded database**: SonarQube uses its embedded H2 database instead of PostgreSQL. It is not recommended for a permanent instance, but fine for a throwaway one.
-- **Offline**: if pulling the images fails, the script carries on with the images already present.
-- **`SONAR_ES_BOOTSTRAP_CHECKS_DISABLE`**: lets SonarQube start without tuning the system (`vm.max_map_count`). Acceptable for a local throwaway instance, not for a real server.
+| Topic | Detail |
+|---|---|
+| Duration | 3 to 4 minutes, 1 to 2 of them to start SonarQube |
+| History | none: each analysis starts from zero. Use `--keep` to browse the results |
+| Offline | the script uses the images already downloaded |
+| Coverage | `compress.py` has one branch for Python 3.14+ and one for older versions: one interpreter covers only one |
+| Not for a server | embedded H2 database and `SONAR_ES_BOOTSTRAP_CHECKS_DISABLE`: fine for a throwaway instance only |

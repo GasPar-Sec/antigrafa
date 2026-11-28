@@ -552,7 +552,8 @@ def test_manager_restore_cancel_and_failure(lab, monkeypatch):
     assert any("restore %d failed: id 2 is taken" % run.id in line for line in run.logs)
 
 
-def test_manager_runs_stay_listed_after_a_restart(lab, monkeypatch):
+def test_manager_runs_stay_listed_after_a_restart(lab, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="antigrafa")  # as the server does: the run's log is kept
     backup = _backed_up(lab)  # a backup by alice
     fake = FakeRestore(PlatformError("id 2 is taken"))
     fake.go.set()
@@ -686,6 +687,14 @@ class FakeManager:
     def status(self):
         return {"busy": True, "runs": [self.run_obj.summary()]}
 
+    def running(self):
+        return [{**self.run_obj.summary(), "progress": None}]
+
+    def overview(self):
+        if self.error:
+            raise self.error
+        return {"machine": {"hostname": "pbs"}, "backups": {"runs": 0}, "sources": [], "disks": []}
+
     def run(self, run_id):
         return self.run_obj if run_id == 7 else None
 
@@ -761,11 +770,11 @@ def test_pages_require_a_login(client):
 
 def test_index_page_lists_sources_and_targets(client):
     _login(client)
-    page = client.get("/").content.decode()
+    page = client.get("/backup/").content.decode()
     assert "<option>lab</option>" in page and "<option>nas</option>" in page
     assert 'name="csrf-token"' in page
     client.fake.error = ConfigError("bad config")
-    assert "Configuration: bad config" in client.get("/").content.decode()
+    assert "Configuration: bad config" in client.get("/backup/").content.decode()
 
 
 def test_status_and_guests(client):
@@ -852,10 +861,10 @@ def test_restore_has_its_own_page(client):
     assert "<option>nas</option>" in page and 'const PAGE = "restore"' in page
     assert "Start a backup" not in page and "Recent restores" in page
     assert '<a href="/restore/" aria-current="page">Restore</a>' in page
-    backup = client.get("/").content.decode()
+    backup = client.get("/backup/").content.decode()
     assert "Start a backup" in backup and 'const PAGE = "backup"' in backup and "Recent backups" in backup
     assert "Restore a guest" not in backup and 'id="restore-target"' not in backup
-    assert '<a href="/" aria-current="page">Backup</a>' in backup and 'href="/restore/"' in backup
+    assert '<a href="/backup/" aria-current="page">Backup</a>' in backup and 'href="/restore/"' in backup
     client.fake.error = ConfigError("bad config")
     assert "Configuration: bad config" in client.get("/restore/").content.decode()
     assert client.post("/restore/").status_code == 405
@@ -951,7 +960,7 @@ def test_jobs_listed_and_run_now(client):
 
 def test_backup_page_has_the_jobs(client):
     _login(client)
-    page = client.get("/").content.decode()
+    page = client.get("/backup/").content.decode()
     assert "Scheduled jobs" in page and "/api/jobs" in page and 'id="jobs"' in page
     assert "Scheduled jobs" not in client.get("/restore/").content.decode()
 
@@ -1171,3 +1180,167 @@ def test_foreign_certificate_is_used_as_is(web_config, tmp_path, caplog):
     caplog.set_level(logging.INFO)
     server.certificate(dataclasses.replace(web_config, web=web))
     assert "self-signed" not in caplog.text and "valid until" in caplog.text
+
+
+# --------------------------------------------------------------------------- home page
+
+
+def test_home_page_shows_what_runs_and_the_machine(client):
+    response = client.get("/")
+    assert response.status_code == 302 and response["Location"].startswith("/login/")
+    response = client.post("/login/", {"username": "alice", "password": PASSWORD})
+    assert response.status_code == 302 and response["Location"] == "/"  # signed in: the home page
+    page = client.get("/").content.decode()
+    assert "Running now" in page and "/api/running" in page and "/api/overview" in page
+    # The Home tab is a house icon, named for screen readers
+    assert 'href="/" class="home-tab" aria-label="Home" title="Home" aria-current="page"' in page
+    assert "<svg" in page and 'href="/backup/"' in page
+    # Each run leads to the page of its kind, opened on that run
+    assert 'const RUN_PAGES = {backup: "/backup/", restore: "/restore/"}' in page and "?run=" in page
+    assert "Start a backup" not in page and 'id="run"' not in page
+
+
+def test_running_and_overview_api(client):
+    for url in ("/api/running", "/api/overview"):
+        assert client.get(url).status_code == 401
+    _login(client)
+    [run] = client.get("/api/running").json()["running"]
+    assert run["id"] == 7 and run["progress"] is None
+    assert client.get("/api/overview").json()["machine"] == {"hostname": "pbs"}
+    client.fake.error = ConfigError("bad config")
+    assert client.get("/api/overview").status_code == 400
+
+
+def test_manager_running_backup_and_overview(lab):
+    m = lab.manager
+    assert m.running() == []
+    run = m.start(source="lab", target=None, guests=["1"], user="alice")
+    lab.gate.reading.wait(10)
+    [shown] = m.running()
+    assert shown["id"] == run.id and shown["guests_total"] == 1 and shown["progress"]["total"] == 300_000
+    lab.gate.go.set()
+    _wait(lambda: not run.active)
+    assert m.running() == []
+
+    data = m.overview()
+    assert data["machine"]["hostname"] and data["machine"]["version"]
+    assert data["backups"]["guests_ok"] == 1 and data["backups"]["guests_failed"] == 0
+    assert data["backups"]["runs_ok"] == 1 and data["backups"]["last_ok"]
+    assert data["sources"] == [{"name": "lab", "type": "", "hosts": [], "error": ""}]
+    system = data["disks"][0]
+    assert system["system"] and system["total"] >= system["used"] > 0
+    m._sizes.wait(10)  # the space of the destination, measured in the background
+    disk = next(d for d in m.overview()["disks"] if any(t["name"] == "local" for t in d["targets"]))
+    [target] = [t for t in disk["targets"] if t["name"] == "local"]
+    assert target["bytes"] > 0 and target["backups"] == 1 and disk["antigrafa"] >= target["bytes"]
+    assert disk["error"] == "" and disk["free"] > 0
+
+
+def test_manager_overview_unreachable_destinations(lab, tmp_path):
+    (tmp_path / "plain").mkdir()
+    lab.cfg.targets["gone"] = TargetConfig(name="gone", path=str(tmp_path / "missing"))
+    lab.cfg.targets["share"] = TargetConfig(name="share", path=str(tmp_path / "plain"), kind="nfs")
+    disks = {d["targets"][0]["name"]: d for d in lab.manager.overview()["disks"] if d["error"]}
+    assert disks["gone"]["error"].endswith("missing does not exist")
+    assert "not on an NFS mount" in disks["share"]["error"]  # never the local disk under it
+
+
+def test_manager_overview_reports_a_source_it_cannot_reach(lab, monkeypatch):
+    def unreachable(cfg, name):
+        raise PlatformError("pve1: connection refused")
+
+    monkeypatch.setattr(manager_module, "open_platform", unreachable)
+    [source] = lab.manager.overview()["sources"]
+    assert source["error"] == "pve1: connection refused" and source["hosts"] == []
+
+
+def test_run_pages_scroll_to_the_run_they_are_opened_on(client):
+    _login(client)
+    for url in ("/backup/", "/restore/"):
+        page = client.get(url).content.decode()
+        assert "scrollToRun = true" in page and '$("run").scrollIntoView' in page
+
+
+def test_manager_running_lists_every_kind(lab, monkeypatch):
+    backup = _backed_up(lab)
+    fake = FakeRestore()  # held until the test lets it go
+    monkeypatch.setattr(manager_module, "restore_guest", fake)
+    run = lab.manager.start_restore(target=None, backup=backup["path"], user="bob")
+    fake.started.wait(10)
+    [shown] = lab.manager.running()
+    assert shown["kind"] == "restore" and shown["id"] == run.id and shown["guest"]
+    fake.go.set()
+    _wait(lambda: not run.active)
+    assert lab.manager.running() == []
+
+
+# --------------------------------------------------------------------------- account
+
+
+def test_account_page_from_the_user_name(client):
+    assert client.get("/account/").status_code == 302  # signed in only
+    _login(client)
+    home = client.get("/").content.decode()
+    assert 'href="/account/" class="account-link"' in home and ">alice</a>" in home
+    page = client.get("/account/").content.decode()
+    assert "Your details" in page and 'name="first_name"' in page and 'name="email"' in page
+    assert 'name="old_password"' in page and 'name="new_password2"' in page
+    assert "at least 12 characters" in page  # the password rules, shown before typing
+    # Each form brings the page back to itself, errors included
+    assert 'action="/account/#details"' in page and 'action="/account/#password"' in page
+    assert 'href="/account/" class="account-link" title="Your details and password" aria-current="page"' in page
+
+
+def test_account_details_are_saved(client):
+    from django.contrib.auth import get_user_model
+
+    _login(client)
+    response = client.post("/account/", {"form": "profile", "first_name": "Alice", "last_name": "Martin",
+                                         "email": "alice@example.org"})
+    assert response.status_code == 302 and response["Location"] == "/account/?saved=profile#details"
+    user = get_user_model().objects.get(username="alice")
+    assert (user.first_name, user.last_name, user.email) == ("Alice", "Martin", "alice@example.org")
+    page = client.get(response["Location"]).content.decode()
+    # The confirmation shows in the section the page scrolls to (#details), under its title
+    assert '<section id="details">' in page
+    assert page.index("Your details are saved.") < page.index('<section id="password">')
+    assert ">Alice Martin</a>" in client.get("/").content.decode()  # the header shows the name
+
+    page = client.post("/account/", {"form": "profile", "first_name": "A", "last_name": "", "email": "not-an-email"})
+    assert page.status_code == 200 and "Enter a valid email address." in page.content.decode()
+    assert get_user_model().objects.get(username="alice").email == "alice@example.org"  # unchanged
+    client.post("/account/", {"form": "profile", "first_name": "", "last_name": "", "email": ""})  # back
+
+
+def test_password_change(client):
+    from django.contrib.auth import get_user_model
+    from django.test import Client
+
+    _login(client)
+    other = Client()
+    assert other.login(username="alice", password=PASSWORD)  # another session of the same user
+    new = "a-much-longer-pass-phrase-42"
+    wrong = client.post("/account/", {"form": "password", "old_password": "nope",
+                                      "new_password1": new, "new_password2": new})
+    assert "Your old password was entered incorrectly" in wrong.content.decode()
+    short = client.post("/account/", {"form": "password", "old_password": PASSWORD,
+                                      "new_password1": "short", "new_password2": "short"})
+    assert "too short" in short.content.decode()
+    response = client.post("/account/", {"form": "password", "old_password": PASSWORD,
+                                         "new_password1": new, "new_password2": new})
+    assert response["Location"] == "/account/?saved=password#password"
+    page = client.get(response["Location"]).content.decode()
+    assert page.index('<section id="password">') < page.index("Your password is changed.")
+    assert client.get("/").status_code == 200  # this session stays signed in
+    assert other.get("/").status_code == 302  # the other one is signed out
+    assert get_user_model().objects.get(username="alice").check_password(new)
+    user = get_user_model().objects.get(username="alice")
+    user.set_password(PASSWORD)  # back, for the other tests
+    user.save()
+
+
+def test_account_ignores_an_unknown_form(client):
+    _login(client)
+    assert client.post("/account/", {"form": "other"}).status_code == 200
+    assert "is changed" not in client.get("/account/?saved=nonsense").content.decode()
+    assert client.delete("/account/").status_code == 405

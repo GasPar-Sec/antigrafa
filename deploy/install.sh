@@ -130,7 +130,8 @@ Next steps (the services start at boot; start them now once configured):
      and the cluster's CA (/etc/pve/pve-root-ca.pem of a node) in $CONF_DIR/pve-root-ca.pem.
   2. On every node, add this key to /root/.ssh/authorized_keys:
        $(cat "$CONF_DIR/id_ed25519.pub")
-     then accept each node's host key, as the service account:
+     Each node's host key is recorded on the first connection
+     (StrictHostKeyChecking=accept-new in $CONF_DIR/antigrafa.toml). To test a node:
        runuser -u $ACCOUNT -- ssh -i $CONF_DIR/id_ed25519 root@<node> true
   3. The targets (local directories, NFS shares) must be writable by '$ACCOUNT'.
 EOF

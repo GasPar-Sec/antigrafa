@@ -1,0 +1,19 @@
+<header>
+  <div class="brand">
+    <h1>Antigrafa</h1>
+    <nav>
+      <a href="{% url 'home' %}" class="home-tab" aria-label="Home" title="Home"{% if page == "home" %} aria-current="page"{% endif %}>
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h5v-6h4v6h5V9.5"/>
+        </svg>
+      </a>
+      <a href="{% url 'backup_page' %}"{% if page == "backup" %} aria-current="page"{% endif %}>Backup</a>
+      <a href="{% url 'restore_page' %}"{% if page == "restore" %} aria-current="page"{% endif %}>Restore</a>
+    </nav>
+  </div>
+  <div class="who">
+    <a href="{% url 'account' %}" class="account-link" title="Your details and password"{% if page == "account" %} aria-current="page"{% endif %}>{% firstof user.get_full_name user.get_username %}</a>
+    <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button type="submit">Sign out</button></form>
+  </div>
+</header>

@@ -191,6 +191,10 @@ class VolumeSource(DiskSource):
         self.prefix = LOW_PRIORITY if low_priority else ""
         self.remote_hash = remote_hash
         self._streams: list[RemoteStream] = []
+        # The read last opened, for reopener(): "plain", "hashed" (with the reference it
+        # compares with), or "" when it cannot start mid-way
+        self._read = ""
+        self._reference: list[bytes] = []
 
     @property
     def key(self) -> str:
@@ -202,6 +206,10 @@ class VolumeSource(DiskSource):
 
     @abstractmethod
     def stream_command(self) -> str: ...
+
+    def stream_command_from(self, offset: int) -> str | None:
+        """``stream_command`` starting ``offset`` bytes in; None when this read cannot."""
+        return None
 
     @abstractmethod
     def reader_marker(self) -> str:
@@ -223,6 +231,7 @@ class VolumeSource(DiskSource):
         """Names of the snapshots of this volume (to find leftovers)."""
 
     def open_stream(self) -> RemoteStream:
+        self._read = "plain"
         return self._opened(self.ssh.stream(self.prefix + self.stream_command()))
 
     def _opened(self, stream: RemoteStream) -> RemoteStream:
@@ -238,9 +247,27 @@ class VolumeSource(DiskSource):
     def open_hashed_stream(self, reference: list[bytes], chunk_size: int) -> RemoteStream | None:
         if not self.remote_hash:
             return None
+        self._read, self._reference = "hashed", reference
         # The same read command, piped through the hashing script, at the same priority
         command = remote_command(self.stream_command(), chunk_size, self.prefix)
         return self._opened(self.ssh.stream(command, input=encode_reference(reference)))
+
+    def reopener(self, chunk_size: int) -> Callable[[int], RemoteStream] | None:
+        if not self._read or self.stream_command_from(0) is None:
+            return None
+        hashed, reference = self._read == "hashed", self._reference
+
+        def reopen(start: int) -> RemoteStream:
+            read = self.stream_command_from(start * chunk_size)
+            if read is None:  # never: checked above
+                raise RuntimeError(f"{self.key}: this read cannot start mid-way")
+            if not hashed:
+                return self._opened(self.ssh.stream(self.prefix + read))
+            # The script numbers chunks from its first one: the reference from there on
+            command = remote_command(read, chunk_size, self.prefix)
+            return self._opened(self.ssh.stream(command, input=encode_reference(reference[start:])))
+
+        return reopen
 
 
 def _wait_for_device(dev: str) -> str:
@@ -298,23 +325,31 @@ class _LogicalVolume:
             self._activated = False
 
 
-def direct_read(path: str) -> str:
+def direct_read(path: str, offset: int = 0) -> str:
     """dd that bypasses the page cache (O_DIRECT), as vzdump does.
 
     A buffered read of a whole disk fills the node's memory with data nobody reads
     again (twice on a zvol: page cache and ZFS ARC), and the kernel swaps the guests'
     memory out to make room. Block devices always accept O_DIRECT.
+
+    ``offset``: start that many bytes in (a multiple of 4096, as O_DIRECT requires).
     """
-    return f"dd if={shlex.quote(path)} bs=4M iflag=direct status=none"
+    start = f",skip_bytes skip={int(offset)}" if offset else ""
+    return f"dd if={shlex.quote(path)} bs=4M iflag=direct{start} status=none"
 
 
-def direct_read_if_supported(path: str) -> str:
-    """Same for a file: O_DIRECT if its filesystem accepts it (tested on one block)."""
+def direct_read_if_supported(path: str, offset: int = 0) -> str:
+    """Same for a file: O_DIRECT if its filesystem accepts it (tested on one block).
+
+    A single ``sh -c`` command, so that a prefix (``ionice``, ``nice``) applies to it.
+    """
     q = shlex.quote(path)
-    return (
+    start = f" iflag=skip_bytes skip={int(offset)}" if offset else ""
+    script = (
         f"if dd if={q} bs=4096 count=1 iflag=direct of=/dev/null status=none 2>/dev/null; "
-        f"then {direct_read(path)}; else dd if={q} bs=4M status=none; fi"
+        f"then {direct_read(path, offset)}; else dd if={q} bs=4M{start} status=none; fi"
     )
+    return f"sh -c {shlex.quote(script)}"
 
 
 class _BlockDevice:
@@ -328,6 +363,9 @@ class _BlockDevice:
 
     def stream_command(self) -> str:
         return direct_read(self.device)
+
+    def stream_command_from(self, offset: int) -> str | None:
+        return direct_read(self.device, offset)
 
     def reader_marker(self) -> str:
         return self.device
@@ -386,6 +424,7 @@ class ZfsZvolSource(_ZfsSnapshots, VolumeSource):
         ranges = self._changes(reference, chunk_size)
         if ranges is None:
             return super().open_hashed_stream(reference, chunk_size)
+        self._read = ""  # only the changed chunks: this read cannot start mid-way yet
         command = changed_command(self.device, chunk_size, self.size(), self.prefix)
         return self._opened(self.ssh.stream(command, input=encode_changed(reference, ranges)))
 
@@ -451,6 +490,9 @@ class ZfsZvolSource(_ZfsSnapshots, VolumeSource):
 
     def stream_command(self) -> str:
         return direct_read(self.device)
+
+    def stream_command_from(self, offset: int) -> str | None:
+        return direct_read(self.device, offset)
 
     def reader_marker(self) -> str:
         return self.device
@@ -629,6 +671,9 @@ class RawFileSource(_LiveOnly, _BlockDevice, VolumeSource):
     def stream_command(self) -> str:
         # Some filesystems refuse O_DIRECT (CIFS without cache=none, tmpfs...)
         return direct_read_if_supported(self.device)
+
+    def stream_command_from(self, offset: int) -> str | None:
+        return direct_read_if_supported(self.device, offset)
 
 
 # Storages without snapshots: read only when nothing writes to them (stopped VM)

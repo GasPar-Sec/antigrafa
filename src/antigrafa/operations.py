@@ -102,6 +102,7 @@ def report_lines(results, started: datetime, elapsed: float) -> list[str]:
             out.append(
                 f"       {d.key:<12} {human_bytes(d.size):>10}  {secs(s.elapsed):>8}  {rate:>12}  "
                 f"{s.new_chunks} new chunks, {s.reused_chunks} reused, {human_bytes(s.sent_bytes)} sent"
+                + (f", {s.reconnects} new connection{'s' if s.reconnects > 1 else ''}" if s.reconnects else "")
             )
 
     ok = sum(1 for r in results if r.ok)
