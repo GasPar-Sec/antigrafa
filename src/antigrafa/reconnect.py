@@ -15,6 +15,11 @@ destination never looks like a slow stream.
 
 Only reads that can start at a chunk are opened again (``DiskSource.reopener``); for
 the others, a collapse is logged once.
+
+A container's tar archive is made again by the new connection, not read from a fixed
+image. Two runs give the same archive, but that is checked (``check``): the new stream
+starts one chunk earlier, and that chunk must be the one already received. If not, the
+disk fails (``ResumeMismatch``) rather than mix two different archives.
 """
 
 from __future__ import annotations
@@ -50,6 +55,10 @@ class StreamWatch:
     @property
     def enabled(self) -> bool:
         return self.min_rate > 0 and self.window > 0
+
+
+class ResumeMismatch(RuntimeError):
+    """The stream opened again does not give the chunks the first one gave."""
 
 
 class Meter:
@@ -154,8 +163,10 @@ class ReconnectingReader:
 
     ``parse(stream, start)``: the records of an open stream whose first chunk is chunk
     ``start``. ``reopen(start)``: the same read on a new connection, from chunk ``start``
-    (None: this read cannot start mid-way). Used as a context manager, like the stream:
-    on exit, the stream open at that time is closed and its exit status checked.
+    (None: this read cannot start mid-way). ``check``: the new connection starts one
+    chunk earlier, whose digest must be the one received (``DiskSource.resume_check``).
+    Used as a context manager, like the stream: on exit, the stream open at that time is
+    closed and its exit status checked.
     """
 
     def __init__(
@@ -167,6 +178,7 @@ class ReconnectingReader:
         label: str,
         chunk_size: int,
         clock: Callable[[], float] = time.monotonic,
+        check: bool = False,
     ) -> None:
         self.stream = stream
         self.parse = parse
@@ -175,6 +187,7 @@ class ReconnectingReader:
         self.watch = watch
         self.label = label
         self.chunk_size = chunk_size
+        self.check = check
         self.reconnects = 0
         self.meter: Meter | None = None  # of the stream being read
         self._clock = clock
@@ -188,18 +201,32 @@ class ReconnectingReader:
 
     def records(self) -> Iterator[Record]:
         start = 0  # index of the next chunk
+        first = 0  # index of the first chunk of the open stream
+        last = b""  # digest of chunk ``start - 1``
         while True:
             meter = self.meter = Meter(self.stream.stdout, self._clock)
             dog = self._watchdog(meter) if self.watch.enabled else None
-            parsed = self.parse(meter, start)
+            parsed = self.parse(meter, first)
             try:
                 for digest, data, length in parsed:
                     if dog is not None and dog.fired:
                         break  # possibly cut short by the stop: read again
                     if data is None or data is NOT_READ:
                         meter.credit(length)
+                    if first < start:  # the chunk read again to check the new stream
+                        first = start
+                        if digest != last:
+                            raise ResumeMismatch(
+                                f"{self.label}: the new connection does not give the same data "
+                                f"(chunk {start - 1} differs): the read cannot go on"
+                            )
+                        continue
                     yield digest, data, length
                     start += 1
+                    first = start
+                    last = digest
+            except ResumeMismatch:
+                raise
             except Exception:
                 # A stream stopped in the middle of a record cannot be parsed to the end
                 if dog is None or not dog.fired:
@@ -211,8 +238,11 @@ class ReconnectingReader:
                 if close is not None:
                     close()
             if dog is None or not dog.fired:
+                if first < start:  # ended before the chunk to check
+                    raise ResumeMismatch(f"{self.label}: the new connection ended before chunk {start - 1}")
                 return
-            self._reconnect(start, dog.rate)
+            first = start - 1 if self.check and start else start
+            self._reconnect(first, start, dog.rate)
 
     def _watchdog(self, meter: Meter) -> _Watchdog:
         # kill() is only called when _decide agreed, that is for a stream that has it
@@ -230,7 +260,8 @@ class ReconnectingReader:
             return False
         return True
 
-    def _reconnect(self, start: int, rate: float) -> None:
+    def _reconnect(self, first: int, start: int, rate: float) -> None:
+        """A new connection from chunk ``first``; ``start``: the next chunk not received."""
         self.reconnects += 1
         log.warning(
             "%s: %.2f MiB/s for %g s, waiting for the node: new connection from %s (%d/%d)",
@@ -240,5 +271,5 @@ class ReconnectingReader:
         self.stream.close(abort=True)
         if self.reopen is None:  # never: _decide stops no stream that cannot be opened again
             raise RuntimeError(f"{self.label}: stream stopped but cannot be opened again")
-        self.stream = self.reopen(start)
+        self.stream = self.reopen(first)
         self.stream.__enter__()

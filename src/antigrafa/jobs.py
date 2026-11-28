@@ -308,7 +308,8 @@ class BackupRunner:
                     return raw_records(stdout, chunk_size)
 
                 reader = ReconnectingReader(
-                    stream, parse, src.reopener(chunk_size), self.watch, f"{g.label}: {src.key}", chunk_size
+                    stream, parse, src.reopener(chunk_size), self.watch, f"{g.label}: {src.key}", chunk_size,
+                    check=src.resume_check,
                 )
                 with reader:
                     store, throttle = self.repo.store, self._throttle(g.host)

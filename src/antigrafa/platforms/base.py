@@ -78,6 +78,9 @@ class DiskSource(ABC):
     format: str = "raw"  # "raw" (disk image) or "tar" (file tree)
     # How the open stream reads the disk, for the log ("incremental since ...")
     read_mode: str = ""
+    # The stream is made again by each new connection (a tar archive), not read from a
+    # fixed image: ``reopener`` streams start one chunk earlier, which must match.
+    resume_check: bool = False
 
     def manifest_extra(self) -> dict:
         """What this disk adds to its entry in the manifest (what the next backup needs)."""
